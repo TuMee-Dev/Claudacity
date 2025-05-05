@@ -31,7 +31,7 @@ from starlette.background import BackgroundTask
 
 # Configuration
 
-DEFAULT_MODEL = "claude-3-7-sonnet-latest"  # Default Claude model to report
+DEFAULT_MODEL = "anthropic/claude-3.7-sonnet"  # Default Claude model to report (must match /models endpoint)
 DEFAULT_MAX_TOKENS = 1000000  # 128k context length
 CONVERSATION_CACHE_TTL = 3600 * 3  # 3 hours in seconds
 METRICS_HISTORY_SIZE = 1000  # Number of requests to keep for metrics calculations
@@ -346,84 +346,6 @@ def debug_response(response, prefix=""):
 # Keys are conversation IDs, values are (timestamp, conversation_id) tuples
 conversation_cache = {}
 
-# Custom direct streaming response class that doesn't buffer
-
-class DirectStreamResponse(Response):
-    """
-    Custom response class that writes directly to the connection without buffering.
-    Enables immediate flushing of SSE responses to the client.
-    """
-    def __init__(self, generate_content, media_type="text/event-stream"):
-        super().__init__(background=BackgroundTask(self._cleanup), media_type=media_type)
-        self.generate_content = generate_content
-        self.started = False
-        self.conn_closed = False
-        
-    async def _cleanup(self):
-        """Clean up resources when the connection closes"""
-        self.conn_closed = True
-        
-    async def stream_response(self, scope, receive, send):
-        """Stream the response to the client directly"""
-        await send({
-            "type": "http.response.start",
-            "status": 200,
-            "headers": [
-                [b"content-type", b"text/event-stream"],
-                [b"cache-control", b"no-cache"],
-                [b"connection", b"keep-alive"],
-                [b"transfer-encoding", b"chunked"],
-            ],
-        })
-        
-        self.started = True
-        
-        try:
-            # Get generator for content
-            async for chunk in self.generate_content:
-                if self.conn_closed:
-                    logger.info("Connection closed by client, stopping stream")
-                    break
-                    
-                # Send chunk immediately
-                await send({
-                    "type": "http.response.body",
-                    "body": chunk.encode('utf-8'),
-                    "more_body": True,
-                })
-                # Short pause to allow client processing
-                await asyncio.sleep(0.001)
-                
-            # Send final empty chunk to close the stream
-            await send({
-                "type": "http.response.body",
-                "body": b"",
-                "more_body": False,
-            })
-            
-        except Exception as e:
-            logger.error(f"Error streaming response: {str(e)}", exc_info=True)
-            if not self.started:
-                await send({
-                    "type": "http.response.start",
-                    "status": 500,
-                    "headers": [
-                        [b"content-type", b"text/plain"],
-                    ],
-                })
-            
-            error_msg = f"Error streaming response: {str(e)}"
-            await send({
-                "type": "http.response.body",
-                "body": error_msg.encode("utf-8"),
-                "more_body": False,
-            })
-            
-    def __call__(self, scope, receive, send):
-        """Process the ASGI request"""
-        asyncio.create_task(self.stream_response(scope, receive, send))
-        return self
-
 # Initialize FastAPI app
 
 app = FastAPI(
@@ -453,8 +375,44 @@ async def log_requests(request: Request, call_next):
     path = request.url.path
     start_time = time.time()
     
+    # More detailed logging for chat completions (used by OpenWebUI)
+    is_chat_completion = path in ["/chat/completions", "/v1/chat/completions"]
+    
     # Log request details
     logger.info(f"Request {request_id}: {method} {url}")
+    
+    # Enhanced logging for chat completions
+    if is_chat_completion:
+        try:
+            # Log headers for debugging
+            headers = dict(request.headers.items())
+            user_agent = headers.get("user-agent", "Unknown")
+            origin = headers.get("origin", "Unknown")
+            
+            logger.info(f"Chat completion request from: UA={user_agent}, Origin={origin}")
+            
+            # Try to read the request body (without consuming it)
+            body = await request.body()
+            # Create a new request with the same body
+            request = Request(request.scope, request.receive)
+            
+            # Try to parse and log key parts of the request
+            try:
+                content = body.decode()
+                logger.debug(f"Request body: {content[:200]}...")
+                
+                # Try to parse as JSON and extract key fields
+                try:
+                    data = json.loads(content)
+                    model = data.get("model", "not-specified")
+                    stream = data.get("stream", False)
+                    logger.info(f"Chat completion details: model={model}, stream={stream}")
+                except:
+                    pass
+            except:
+                pass
+        except Exception as e:
+            logger.warning(f"Error logging chat completion details: {e}")
 
     try:
         # Process the request
@@ -465,6 +423,14 @@ async def log_requests(request: Request, call_next):
         
         # Log response code
         logger.info(f"Response {request_id}: {response.status_code} ({int(duration_ms)}ms)")
+        
+        # Enhanced logging for chat completions
+        if is_chat_completion:
+            # Log headers for debugging
+            headers = dict(response.headers.items())
+            content_type = headers.get("content-type", "Unknown")
+            logger.info(f"Chat completion response: Content-Type={content_type}")
+        
         return response
         
     except Exception as e:
@@ -618,6 +584,7 @@ async def run_claude_command(prompt: str, conversation_id: str = None) -> str:
     # Record the Claude process start in metrics
     await metrics.record_claude_start(process_id, model, conversation_id)
 
+    process = None
     try:
         process = await asyncio.create_subprocess_shell(
             cmd,
@@ -626,14 +593,54 @@ async def run_claude_command(prompt: str, conversation_id: str = None) -> str:
             stderr=asyncio.subprocess.PIPE
         )
         
+        # Track this process
+        if process and process.pid:
+            track_claude_process(str(process.pid), cmd)
+        
         # Send the prompt to Claude
         stdout, stderr = await process.communicate(input=prompt.encode())
         
         # Calculate execution duration
         duration_ms = (time.time() - start_time) * 1000
         
+        # Store the process output before untracking
+        if process and process.pid:
+            try:
+                stdout_text = stdout.decode() if stdout else ""
+                stderr_text = stderr.decode() if stderr else ""
+                # Try to parse the response as JSON
+                response_obj = None
+                try:
+                    if stdout_text and stdout_text.strip().startswith('{'):
+                        response_obj = json.loads(stdout_text)
+                except json.JSONDecodeError:
+                    response_obj = stdout_text
+                
+                # Convert to OpenAI format
+                openai_response = None
+                try:
+                    openai_response = format_to_openai_chat_completion(response_obj or stdout_text, model)
+                except Exception as e:
+                    logger.error(f"Failed to convert to OpenAI format: {e}")
+                
+                store_process_output(
+                    str(process.pid),
+                    stdout_text,
+                    stderr_text,
+                    cmd,
+                    prompt,
+                    response_obj or stdout_text,  # Original response
+                    openai_response,  # Converted response
+                    model
+                )
+            except Exception as e:
+                logger.error(f"Error storing process output: {e}")
+            
+            # Now untrack the process
+            untrack_claude_process(str(process.pid))
+        
         if process.returncode != 0:
-            error_msg = stderr.decode()
+            error_msg = stderr.decode() if stderr else "Unknown error"
             logger.error(f"Claude command failed: {error_msg}")
             
             # Record completion with error
@@ -708,8 +715,13 @@ async def run_claude_command(prompt: str, conversation_id: str = None) -> str:
             
     except Exception as e:
         # Record error in metrics
+        duration_ms = (time.time() - start_time) * 1000
         await metrics.record_claude_completion(process_id, duration_ms, error=e)
         
+        # Untrack the process if it's still tracked
+        if process and process.pid:
+            untrack_claude_process(str(process.pid))
+            
         logger.error(f"Error running Claude command: {str(e)}")
         raise
 
@@ -744,6 +756,10 @@ async def stream_claude_output(prompt: str, conversation_id: str = None):
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE
     )
+    
+    # Track this process
+    if process and process.pid:
+        track_claude_process(str(process.pid), cmd)
 
     # Write the prompt to stdin
     try:
@@ -1007,6 +1023,59 @@ async def stream_claude_output(prompt: str, conversation_id: str = None):
                             pass
             else:
                 logger.debug(f"Claude process already completed with return code {process.returncode}")
+                
+            # Store the output and then untrack the process
+            if process.pid:
+                try:
+                    # For streaming processes, collect output differently
+                    # We'll collect the response from stdout and any errors from stderr
+                    stdout_text = "Streaming process - output sent directly to client"
+                    
+                    # Try to read any stderr data
+                    stderr_data = b""
+                    try:
+                        stderr_data = await asyncio.wait_for(process.stderr.read(), timeout=0.1)
+                    except (asyncio.TimeoutError, AttributeError):
+                        pass
+                    
+                    stderr_text = stderr_data.decode() if stderr_data else ""
+                    
+                    # Store what we have
+                    store_process_output(
+                        str(process.pid),
+                        stdout_text,
+                        stderr_text,
+                        cmd,
+                        prompt,
+                        "Streaming response - output sent directly to client",
+                        {
+                            "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
+                            "object": "chat.completion",
+                            "created": int(time.time()),
+                            "model": model,
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "message": {
+                                        "role": "assistant",
+                                        "content": "Streaming response - content sent directly to client"
+                                    },
+                                    "finish_reason": "stop"
+                                }
+                            ],
+                            "usage": {
+                                "prompt_tokens": 0,
+                                "completion_tokens": 0,
+                                "total_tokens": 0
+                            },
+                            "note": "This was a streaming response where content was sent directly to the client."
+                        }
+                    )
+                except Exception as e:
+                    logger.error(f"Error storing streaming process output: {e}")
+                
+                # Now untrack the process
+                untrack_claude_process(str(process.pid))
 
 # Message formatting functions
 
@@ -1071,6 +1140,7 @@ def format_to_openai_chat_completion(claude_response, model, request_id=None):
     }
     """
     import time
+    logger.debug(f"Converting Claude response to OpenAI format: {str(claude_response)[:200]}...")
     
     # Get current timestamp
     timestamp = int(time.time())
@@ -1078,12 +1148,21 @@ def format_to_openai_chat_completion(claude_response, model, request_id=None):
     # Extract content - handle differently based on response type
     content = ""
     duration_ms = 0
+    prompt_tokens = 0
+    completion_tokens = 0
     
     if isinstance(claude_response, dict):
+        # Extract duration if available
+        duration_ms = claude_response.get("duration_ms", 0)
+        duration_api_ms = claude_response.get("duration_api_ms", duration_ms)
+        
+        # Extract token counts if available
+        if "usage" in claude_response:
+            prompt_tokens = claude_response["usage"].get("prompt_tokens", 0)
+            completion_tokens = claude_response["usage"].get("completion_tokens", 0)
+        
         # Check if it's our parsed response format
         if "role" in claude_response and claude_response["role"] == "assistant":
-            duration_ms = claude_response.get("duration_ms", 0)
-            
             # Check if we have parsed JSON
             if claude_response.get("parsed_json", False):
                 # Use the pre-parsed content
@@ -1093,23 +1172,26 @@ def format_to_openai_chat_completion(claude_response, model, request_id=None):
             else:
                 # Use the raw content
                 content = claude_response.get("content", "")
+        
+        # Check for standard Claude system response with result (most common format)
+        elif "role" in claude_response and claude_response["role"] == "system" and "result" in claude_response:
+            # This is the Claude CLI JSON response format
+            content = claude_response["result"]
+            
+            # If cost_usd is available, log it
+            if "cost_usd" in claude_response:
+                logger.info(f"Claude request cost: ${claude_response['cost_usd']:.6f} USD")
                 
-        # Check for structured content array
+        # Check for structured content array (sometimes used in Claude responses)
         elif "content" in claude_response and isinstance(claude_response["content"], list):
             for item in claude_response["content"]:
                 if item.get("type") == "text" and "text" in item:
                     content += item["text"]
-            duration_ms = claude_response.get("duration_ms", 0)
-            
-        # Check for system response with result
-        elif "role" in claude_response and claude_response["role"] == "system" and "result" in claude_response:
-            content = claude_response["result"]
-            duration_ms = claude_response.get("duration_ms", 0)
             
         # Fallback to result field
         elif "result" in claude_response:
             content = claude_response["result"]
-            duration_ms = claude_response.get("duration_ms", 0)
+            
     else:
         # Not a dict, use as string
         content = str(claude_response)
@@ -1119,12 +1201,14 @@ def format_to_openai_chat_completion(claude_response, model, request_id=None):
     if not message_id:
         message_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
     
-    # Calculate token counts (rough estimation)
-    prompt_tokens = int((duration_ms / 10) if duration_ms else 100)
-    completion_tokens = int((duration_ms / 20) if duration_ms else 50)
+    # If token counts aren't available, estimate them
+    if not prompt_tokens:
+        prompt_tokens = int((duration_ms / 10) if duration_ms else 100) 
+    if not completion_tokens:
+        completion_tokens = int((duration_ms / 20) if duration_ms else 50)
     
     # Format the response in OpenAI chat completion format
-    return {
+    openai_response = {
         "id": message_id,
         "object": "chat.completion",
         "created": timestamp,
@@ -1145,6 +1229,9 @@ def format_to_openai_chat_completion(claude_response, model, request_id=None):
             "total_tokens": prompt_tokens + completion_tokens
         }
     }
+    
+    logger.debug(f"Converted to OpenAI format: {str(openai_response)[:200]}...")
+    return openai_response
 
 # Stream response functions for both API formats
 
@@ -1397,271 +1484,18 @@ async def chat(request_body: Request):
 
     # Handle streaming vs. non-streaming responses
     if request.stream:
-        # We'll use our direct streaming response to avoid buffering
-        async def direct_openai_stream():
-            """Direct streaming generator with immediate flushing"""
-            # Use the request_id if provided, otherwise generate one
-            message_id = request.id if request.id else f"chatcmpl-{uuid.uuid4().hex}"
-            created = int(time.time())
-            is_first_chunk = True
-            full_response = ""
-            completion_sent = False
-            
-            try:
-                # Set up process to run Claude CLI
-                # Use stream-json format for true streaming
-                base_cmd = f"{CLAUDE_CMD} -p"
-                if conversation_id:
-                    base_cmd += f" -c {conversation_id}"
-                cmd = f"{base_cmd} --output-format stream-json"
-                
-                logger.info(f"Running direct stream command: {cmd}")
-                
-                # Generate a unique process ID for tracking
-                process_id = f"claude-process-{uuid.uuid4().hex[:8]}"
-                start_time = time.time()
-                model = request.model
-                
-                # Record the Claude process start in metrics
-                await metrics.record_claude_start(process_id, model, conversation_id)
-                
-                # Start the Claude process
-                process = await asyncio.create_subprocess_shell(
-                    cmd,
-                    stdin=asyncio.subprocess.PIPE,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE
-                )
-                
-                # Write the prompt to stdin and close it immediately
-                try:
-                    process.stdin.write(claude_prompt.encode())
-                    await process.stdin.drain()
-                    process.stdin.close()
-                    logger.debug("Prompt sent to Claude process")
-                except Exception as e:
-                    error_msg = f"Error writing to Claude CLI: {str(e)}"
-                    logger.error(error_msg)
-                    
-                    # Send error as SSE
-                    error_json = json.dumps({
-                        "error": {"message": error_msg, "type": "server_error", "code": 500}
-                    })
-                    yield f"data: {error_json}\n\n"
-                    yield "data: [DONE]\n\n"
-                    return
-                
-                # Process Claude output directly
-                buffer = ""
-                output_tokens = 0
-                
-                # Read output until EOF
-                while True:
-                    # Read a chunk with a short timeout
-                    try:
-                        chunk = await asyncio.wait_for(process.stdout.read(4096), timeout=0.1)
-                        if not chunk:  # EOF
-                            break
-                        
-                        buffer += chunk.decode('utf-8')
-                        
-                        # Find complete JSON objects
-                        while True:
-                            # Look for a complete JSON object by checking matched braces
-                            # This is a simple implementation that works for clean JSON
-                            open_idx = buffer.find("{")
-                            if open_idx == -1:
-                                break
-                                
-                            # Find the matching closing brace by counting
-                            level = 0
-                            close_idx = -1
-                            
-                            for i in range(open_idx, len(buffer)):
-                                if buffer[i] == "{":
-                                    level += 1
-                                elif buffer[i] == "}":
-                                    level -= 1
-                                    if level == 0:
-                                        close_idx = i + 1
-                                        break
-                            
-                            if close_idx == -1:  # No complete object found
-                                break
-                                
-                            # Extract the JSON object
-                            try:
-                                json_obj = json.loads(buffer[open_idx:close_idx])
-                                # Remove processed part from buffer
-                                buffer = buffer[close_idx:]
-                                
-                                # Process the JSON object based on its type
-                                if "type" in json_obj and json_obj["type"] == "message":
-                                    # Content chunk
-                                    if "content" in json_obj and isinstance(json_obj["content"], list):
-                                        for item in json_obj["content"]:
-                                            if item.get("type") == "text" and "text" in item:
-                                                content = item["text"]
-                                                full_response += content
-                                                output_tokens += len(content.split()) / 0.75
-                                                
-                                                # Format as OpenAI compatible response
-                                                sse_obj = {
-                                                    "id": message_id,
-                                                    "object": "chat.completion.chunk",
-                                                    "created": created,
-                                                    "model": model,
-                                                    "choices": [{
-                                                        "index": 0,
-                                                        "delta": {
-                                                            # Only include role in first chunk
-                                                            "role": "assistant" if is_first_chunk else "",
-                                                            "content": content
-                                                        },
-                                                        "finish_reason": None
-                                                    }]
-                                                }
-                                                
-                                                if is_first_chunk:
-                                                    is_first_chunk = False
-                                                
-                                                # Directly yield the SSE formatted data
-                                                sse_chunk = f"data: {json.dumps(sse_obj)}\n\n"
-                                                yield sse_chunk
-                                                
-                                elif "stop_reason" in json_obj:
-                                    # End of message - send completion
-                                    if not completion_sent:
-                                        logger.info("Sending direct completion signal")
-                                        
-                                        # Record metrics
-                                        duration_ms = (time.time() - start_time) * 1000
-                                        await metrics.record_claude_completion(
-                                            process_id, 
-                                            duration_ms,
-                                            output_tokens=int(output_tokens)
-                                        )
-                                        
-                                        # Send finish reason
-                                        completion_obj = {
-                                            "id": message_id,
-                                            "object": "chat.completion.chunk",
-                                            "created": created,
-                                            "model": model,
-                                            "choices": [{
-                                                "index": 0,
-                                                "delta": {},
-                                                "finish_reason": "stop"
-                                            }]
-                                        }
-                                        
-                                        # Send completion - critical!
-                                        yield f"data: {json.dumps(completion_obj)}\n\n"
-                                        yield "data: [DONE]\n\n"
-                                        completion_sent = True
-                                        break
-                                        
-                                elif ("role" in json_obj and json_obj["role"] == "system" and 
-                                      ("cost_usd" in json_obj or "duration_ms" in json_obj)):
-                                    # System info - indicates completion
-                                    if not completion_sent:
-                                        # Record completion metrics
-                                        duration_ms = json_obj.get("duration_ms", (time.time() - start_time) * 1000)
-                                        await metrics.record_claude_completion(
-                                            process_id, 
-                                            duration_ms,
-                                            output_tokens=int(output_tokens)
-                                        )
-                                        
-                                        # Send completion signal
-                                        logger.info("Sending system completion signal")
-                                        
-                                        # Send finish reason
-                                        completion_obj = {
-                                            "id": message_id,
-                                            "object": "chat.completion.chunk",
-                                            "created": created,
-                                            "model": model,
-                                            "choices": [{
-                                                "index": 0,
-                                                "delta": {},
-                                                "finish_reason": "stop"
-                                            }]
-                                        }
-                                        
-                                        # Send completion - critical!
-                                        yield f"data: {json.dumps(completion_obj)}\n\n"
-                                        yield "data: [DONE]\n\n"
-                                        completion_sent = True
-                                        break
-                                
-                            except json.JSONDecodeError as e:
-                                logger.warning(f"Failed to parse JSON chunk: {e}")
-                                # Skip this malformed object and try to find next valid one
-                                buffer = buffer[1:]  # Skip first char and retry
-                            except Exception as e:
-                                logger.error(f"Error processing chunk: {e}")
-                                buffer = buffer[close_idx:]  # Skip to next chunk
-                    
-                    except asyncio.TimeoutError:
-                        # No data right now, check if process is still alive
-                        if process.returncode is not None:
-                            # Process has exited
-                            logger.info(f"Claude process exited with code {process.returncode}")
-                            break
-                
-                # Final error check
-                if process.returncode is not None and process.returncode != 0:
-                    # Process failed
-                    stderr_data = await process.stderr.read()
-                    error_msg = stderr_data.decode('utf-8').strip() if stderr_data else f"Process failed with code {process.returncode}"
-                    logger.error(f"Claude CLI error: {error_msg}")
-                    
-                    if not completion_sent:
-                        error_obj = {"error": {"message": error_msg, "type": "server_error", "code": 500}}
-                        yield f"data: {json.dumps(error_obj)}\n\n"
-                        yield "data: [DONE]\n\n"
-                        completion_sent = True
-                
-                # Ensure we always send completion
-                if not completion_sent:
-                    logger.info("Sending final completion signal")
-                    
-                    # Record completion 
-                    duration_ms = (time.time() - start_time) * 1000
-                    await metrics.record_claude_completion(
-                        process_id, 
-                        duration_ms,
-                        output_tokens=int(output_tokens) if output_tokens > 0 else 0
-                    )
-                    
-                    # Send finish reason
-                    completion_obj = {
-                        "id": message_id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": model,
-                        "choices": [{
-                            "index": 0,
-                            "delta": {},
-                            "finish_reason": "stop"
-                        }]
-                    }
-                    
-                    # Send completion - critical!
-                    yield f"data: {json.dumps(completion_obj)}\n\n"
-                    yield "data: [DONE]\n\n"
-                
-            except Exception as e:
-                logger.error(f"Error in direct streaming: {str(e)}", exc_info=True)
-                
-                if not completion_sent:
-                    error_obj = {"error": {"message": str(e), "type": "server_error", "code": 500}}
-                    yield f"data: {json.dumps(error_obj)}\n\n"
-                    yield "data: [DONE]\n\n"
-        
-        # Return our direct streaming response with no buffering
-        return DirectStreamResponse(direct_openai_stream())
+        # Use standard FastAPI StreamingResponse with our generator
+        logger.info("Using standard StreamingResponse for streaming OpenAI compatibility")
+        return StreamingResponse(
+            stream_openai_response(claude_prompt, request.model, conversation_id, request.id),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "Access-Control-Allow-Origin": "*",
+                "X-Accel-Buffering": "no"  # Prevents buffering in Nginx, which helps with streaming
+            }
+        )
     else:
         try:
             # For non-streaming, get the full response at once
@@ -1724,10 +1558,130 @@ async def get_version():
         "build": "claude-ollama-server"
     }
 
+# Dictionary to track proxy-launched Claude processes
+proxy_launched_processes = {}
+# Dictionary to store outputs from recent processes (limited to last 20)
+process_outputs = collections.OrderedDict()
+MAX_STORED_OUTPUTS = 20
+
+def track_claude_process(pid, command):
+    """Track a Claude process launched by this proxy server"""
+    import time
+    proxy_launched_processes[pid] = {
+        "pid": pid,
+        "command": command,
+        "start_time": time.time(),
+        "status": "running"
+    }
+    logger.info(f"Tracking new Claude process with PID {pid}")
+
+def untrack_claude_process(pid):
+    """Remove a Claude process from tracking"""
+    if pid in proxy_launched_processes:
+        proxy_launched_processes.pop(pid, None)
+        logger.info(f"Untracked Claude process with PID {pid}")
+
+def store_process_output(pid, stdout, stderr, command, prompt, response, converted_response=None, model=DEFAULT_MODEL):
+    """Store the output from a Claude process"""
+    global process_outputs
+    timestamp = datetime.datetime.now().isoformat()
+    
+    # Create a new entry for this process
+    entry = {
+        "pid": pid,
+        "timestamp": timestamp,
+        "command": command,
+        "prompt": prompt,
+        "stdout": stdout,
+        "stderr": stderr,
+        "response": response
+    }
+    
+    # If we have a converted response, add it
+    if converted_response:
+        entry["converted_response"] = converted_response
+    # Otherwise, try to convert it now
+    elif response and isinstance(response, (dict, str)):
+        try:
+            converted = format_to_openai_chat_completion(response, model)
+            entry["converted_response"] = converted
+        except Exception as e:
+            logger.error(f"Failed to convert response for storage: {e}")
+    
+    # Store the entry
+    process_outputs[pid] = entry
+    
+    # Limit the number of stored outputs
+    while len(process_outputs) > MAX_STORED_OUTPUTS:
+        process_outputs.popitem(last=False)  # Remove oldest item (FIFO)
+    
+    logger.info(f"Stored output for process {pid}")
+
+def get_process_output(pid):
+    """Get the stored output for a process"""
+    return process_outputs.get(pid, None)
+
+def get_running_claude_processes():
+    """Get information about currently running Claude processes that were launched by this proxy"""
+    try:
+        import subprocess
+        import re
+        import time
+        import psutil
+        
+        # List of processes to return
+        active_processes = []
+        
+        # Check each tracked process to see if it's still running
+        pids_to_remove = []
+        for pid, process_info in proxy_launched_processes.items():
+            try:
+                # Check if process still exists
+                process = psutil.Process(int(pid))
+                
+                # Get process info
+                with process.oneshot():
+                    user = process.username()
+                    cpu = f"{process.cpu_percent(interval=0.1):.1f}"
+                    mem = f"{process.memory_percent():.1f}"
+                    started = time.strftime("%H:%M:%S", time.localtime(process.create_time()))
+                    command = " ".join(process.cmdline())[:80] + ("..." if len(" ".join(process.cmdline())) > 80 else "")
+                    
+                    # Calculate runtime
+                    runtime_secs = int(time.time() - process_info['start_time'])
+                    hours, remainder = divmod(runtime_secs, 3600)
+                    minutes, seconds = divmod(remainder, 60)
+                    runtime = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+                    
+                    active_processes.append({
+                        "user": user,
+                        "pid": pid,
+                        "cpu": cpu,
+                        "memory": mem,
+                        "started": started,
+                        "runtime": runtime,
+                        "command": command
+                    })
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                # Process no longer exists or can't be accessed
+                pids_to_remove.append(pid)
+                
+        # Clean up processes that no longer exist
+        for pid in pids_to_remove:
+            untrack_claude_process(pid)
+        
+        return active_processes
+    except Exception as e:
+        logger.error(f"Error getting Claude processes: {e}")
+        return []
+
 def generate_dashboard_html():
     """Generate HTML for the dashboard page"""
     # Get current metrics
     metrics_data = metrics.get_metrics()
+    
+    # Get currently running Claude processes
+    running_processes = get_running_claude_processes()
     
     # Format metrics for display
     avg_execution = f"{metrics_data['performance']['avg_execution_time_ms']:.2f}" if metrics_data['performance']['avg_execution_time_ms'] else "N/A"
@@ -1828,6 +1782,22 @@ def generate_dashboard_html():
         .reload:hover {{
             background-color: #0077ed;
         }}
+        .button {{
+            display: inline-block;
+            padding: 4px 8px;
+            border-radius: 4px;
+            text-decoration: none;
+            font-size: 13px;
+            cursor: pointer;
+            border: none;
+        }}
+        .alert {{
+            background-color: #f44336;
+            color: white;
+        }}
+        .alert:hover {{
+            background-color: #d32f2f;
+        }}
         .timestamp {{
             color: #777;
             font-size: 14px;
@@ -1854,6 +1824,18 @@ def generate_dashboard_html():
             color: #555;
             margin-top: 5px;
         }}
+        .refresh-toggle {{
+            margin-left: 10px;
+            color: #0071e3;
+            text-decoration: none;
+            font-size: 12px;
+            padding: 2px 6px;
+            border-radius: 4px;
+            background-color: #f0f7ff;
+        }}
+        .refresh-toggle:hover {{
+            background-color: #e1f0ff;
+        }}
         .chart-container {{
             height: 200px;
             margin-top: 15px;
@@ -1862,24 +1844,170 @@ def generate_dashboard_html():
             background-color: #f3f9ff;
             border-left: 4px solid #0077ed;
         }}
+        /* Modal styles */
+        .modal {{
+            display: none;
+            position: fixed;
+            z-index: 1000;
+            left: 0;
+            top: 0;
+            width: 100%;
+            height: 100%;
+            overflow: auto;
+            background-color: rgba(0,0,0,0.4);
+        }}
+        .modal-content {{
+            background-color: #fefefe;
+            margin: 5% auto;
+            padding: 20px;
+            border: 1px solid #ddd;
+            border-radius: 8px;
+            width: 80%;
+            max-width: 1000px;
+            max-height: 80vh;
+            overflow-y: auto;
+            position: relative;
+        }}
+        .modal-header {{
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-bottom: 1px solid #eee;
+            padding-bottom: 10px;
+            margin-bottom: 15px;
+        }}
+        .modal-header h3 {{
+            margin: 0;
+        }}
+        .modal-footer {{
+            margin-top: 15px;
+            padding-top: 10px;
+            border-top: 1px solid #eee;
+            text-align: right;
+        }}
+        .close-button {{
+            color: #aaa;
+            font-size: 28px;
+            font-weight: bold;
+            cursor: pointer;
+        }}
+        .close-button:hover {{
+            color: black;
+        }}
+        pre {{
+            background-color: #f5f5f5;
+            padding: 10px;
+            border-radius: 5px;
+            overflow-x: auto;
+            white-space: pre-wrap;
+            max-height: 300px;
+            overflow-y: auto;
+        }}
+        pre.error {{
+            background-color: #fff0f0;
+            border-left: 3px solid #ff6b6b;
+        }}
+        .output-table {{
+            width: 100%;
+        }}
     </style>
     <script>
-        // Auto-refresh the page every 10 seconds
-        setTimeout(function() {{
-            window.location.reload();
-        }}, 10000);
+        // Store scroll position before refresh
+        function saveScrollPosition() {{
+            sessionStorage.setItem('scrollPosition', window.scrollY);
+        }}
         
-        // Countdown timer for refresh
+        // Restore scroll position after refresh
+        function restoreScrollPosition() {{
+            const scrollPosition = sessionStorage.getItem('scrollPosition');
+            if (scrollPosition) {{
+                window.scrollTo(0, parseInt(scrollPosition));
+            }}
+        }}
+        
+        // Variables to control auto-refresh
+        let refreshTimeout;
+        let refreshEnabled = true;
+        const REFRESH_INTERVAL = 10000;  // 10 seconds
+        
+        // Function to schedule next refresh
+        function scheduleRefresh() {{
+            // Clear any existing timeout
+            if (refreshTimeout) {{
+                clearTimeout(refreshTimeout);
+            }}
+            
+            // Only schedule if refresh is enabled
+            if (refreshEnabled) {{
+                refreshTimeout = setTimeout(function() {{
+                    // Only reload if no modal is open
+                    if (document.querySelector('.modal[style*="display: block"]') === null) {{
+                        saveScrollPosition();
+                        window.location.reload();
+                    }} else {{
+                        // If modal is open, reschedule the refresh
+                        scheduleRefresh();
+                    }}
+                }}, REFRESH_INTERVAL);
+            }}
+        }}
+        
+        // Function to toggle refresh on/off
+        function toggleRefresh() {{
+            refreshEnabled = !refreshEnabled;
+            
+            // Update status text
+            const statusElement = document.getElementById('refresh-status');
+            if (statusElement) {{
+                statusElement.textContent = refreshEnabled ? 'Auto-refresh' : 'Refresh paused';
+                statusElement.style.color = refreshEnabled ? '' : '#ff6b6b';
+            }}
+            
+            // If turning refresh back on, schedule next refresh
+            if (refreshEnabled) {{
+                scheduleRefresh();
+            }} else if (refreshTimeout) {{
+                clearTimeout(refreshTimeout);
+            }}
+        }}
+        
+        // Start the refresh cycle
+        scheduleRefresh();
+        
+        // Countdown timer for refresh and restore scroll position
         window.onload = function() {{
+            // Restore scroll position on page load
+            restoreScrollPosition();
+            
+            // Setup countdown timer
             let timeLeft = 10;
             const timerElement = document.getElementById('refresh-timer');
+            const statusElement = document.getElementById('refresh-status');
             
             setInterval(function() {{
-                timeLeft -= 1;
-                if (timeLeft >= 0) {{
-                    timerElement.textContent = timeLeft;
+                // Only countdown if refresh is enabled
+                if (refreshEnabled) {{
+                    timeLeft -= 1;
+                    if (timeLeft >= 0) {{
+                        timerElement.textContent = timeLeft;
+                    }} else {{
+                        timeLeft = 10;
+                    }}
+                }} else {{
+                    // If refresh is paused, keep showing status
+                    statusElement.textContent = 'Refresh paused';
+                    statusElement.style.color = '#ff6b6b';
                 }}
             }}, 1000);
+            
+            // Make manual refresh button preserve scroll position
+            document.querySelectorAll('.reload').forEach(function(button) {{
+                button.addEventListener('click', function(e) {{
+                    e.preventDefault();
+                    saveScrollPosition();
+                    window.location.reload();
+                }});
+            }});
         }};
     </script>
 </head>
@@ -1888,7 +2016,10 @@ def generate_dashboard_html():
         <h1>Claude API Dashboard</h1>
         <div class="timestamp">
             Last updated: {datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
-            <span class="auto-refresh">(Auto-refreshes in <span id="refresh-timer">10</span>s)</span>
+            <span class="auto-refresh">
+                (<span id="refresh-status">Auto-refresh</span> in <span id="refresh-timer">10</span>s)
+                <a href="javascript:void(0)" onclick="toggleRefresh()" class="refresh-toggle">Pause/Resume</a>
+            </span>
         </div>
 
         <div class="stats-grid">
@@ -2022,7 +2153,56 @@ def generate_dashboard_html():
             </table>
         </div>
 
-        {'''
+        <div id="processes" class="card highlight">
+            <h2>Proxy-Launched Claude Processes</h2>
+            <p>This section shows Claude processes launched by this proxy server. <a href="#process-outputs" class="button">View Recent Process Outputs</a></p>
+            <table>
+                <tr>
+                    <th>PID</th>
+                    <th>User</th>
+                    <th>CPU %</th>
+                    <th>Memory %</th>
+                    <th>Started</th>
+                    <th>Runtime</th>
+                    <th>Command</th>
+                    <th>Actions</th>
+                </tr>
+"""
+    # Add process rows dynamically
+    process_rows = ""
+    if running_processes:
+        for process in running_processes:
+            process_rows += f"""                <tr>
+                    <td>{process['pid']}</td>
+                    <td>{process['user']}</td>
+                    <td>{process['cpu']}%</td>
+                    <td>{process['memory']}%</td>
+                    <td>{process['started']}</td>
+                    <td>{process['runtime']}</td>
+                    <td><code>{process['command']}</code></td>
+                    <td>
+                        <a href="javascript:void(0)" onclick="if(confirm('Are you sure you want to terminate process {process['pid']}?')) fetch('/terminate_process/{process['pid']}', {{method: 'POST'}}).then(() => window.location.reload());" class="button alert">Terminate</a>
+                    </td>
+                </tr>"""
+    else:
+        process_rows = "<tr><td colspan='8'>No proxy-launched Claude processes currently running</td></tr>"
+    
+    html += process_rows
+    
+    html += f"""            </table>
+            <p><em>Last updated: {datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")}</em></p>
+            <p><a href="#processes" class="reload">Refresh</a></p>
+        </div>"""
+
+    # Add error card if there are errors
+    if metrics_data['errors']['count'] > 0:
+        error_rows = ""
+        for error in metrics_data['errors']['recent']:
+            error_time = error['time'].replace('T', ' ').split('.')[0]
+            error_msg = error['error']
+            error_rows += f"<tr><td>{error_time}</td><td>{error_msg}</td></tr>"
+            
+        html += f"""
         <div class="card error-card">
             <h2>Recent Errors</h2>
             <div class="metric">
@@ -2034,10 +2214,199 @@ def generate_dashboard_html():
                     <th>Time</th>
                     <th>Error</th>
                 </tr>
-                {''.join([f"<tr><td>{error['time'].replace('T', ' ').split('.')[0]}</td><td>{error['error']}</td></tr>" for error in metrics_data['errors']['recent']])}
+                {error_rows}
             </table>
         </div>
-        ''' if metrics_data['errors']['count'] > 0 else ''}
+        """
+        
+    # Add section for process outputs
+    html += """
+        <div id="process-outputs" class="card">
+            <h2>Recent Process Outputs</h2>
+            <p>This section shows outputs from recently completed Claude processes (up to 20):</p>
+            <div id="process-output-list">Loading process outputs...</div>
+            
+            <script>
+                // Fetch process outputs on page load
+                async function fetchProcessOutputs() {
+                    try {
+                        const response = await fetch('/process_outputs');
+                        const data = await response.json();
+                        displayProcessOutputs(data.outputs);
+                    } catch (error) {
+                        console.error('Error fetching process outputs:', error);
+                        document.getElementById('process-output-list').textContent = 'Error loading process outputs';
+                    }
+                }
+                
+                // Display process outputs in a table
+                function displayProcessOutputs(outputs) {
+                    const container = document.getElementById('process-output-list');
+                    
+                    if (!outputs || outputs.length === 0) {
+                        container.innerHTML = '<p>No process outputs available yet.</p>';
+                        return;
+                    }
+                    
+                    let html = `
+                    <table class="output-table">
+                        <tr>
+                            <th>PID</th>
+                            <th>Timestamp</th>
+                            <th>Command</th>
+                            <th>Actions</th>
+                        </tr>
+                    `;
+                    
+                    outputs.forEach(output => {
+                        // Format timestamp
+                        const timestamp = new Date(output.timestamp).toLocaleString();
+                        
+                        html += `
+                        <tr>
+                            <td>${output.pid}</td>
+                            <td>${timestamp}</td>
+                            <td><code>${output.command}</code></td>
+                            <td>
+                                <button class="button" onclick="viewProcessOutput('${output.pid}')">View Details</button>
+                            </td>
+                        </tr>
+                        `;
+                    });
+                    
+                    html += '</table>';
+                    container.innerHTML = html;
+                }
+                
+                // Fetch and display a specific process output
+                async function viewProcessOutput(pid) {
+                    try {
+                        // Pause auto-refresh while viewing output
+                        refreshEnabled = false;
+                        
+                        const response = await fetch(`/process_output/${pid}`);
+                        const data = await response.json();
+                        
+                        // Create modal window
+                        const modal = document.createElement('div');
+                        modal.classList.add('modal');
+                        modal.setAttribute('data-pid', pid);
+                        
+                        // Format the timestamp
+                        const timestamp = new Date(data.timestamp).toLocaleString();
+                        
+                        // Format the content
+                        const promptHtml = `<pre>${escapeHtml(data.prompt)}</pre>`;
+                        const stdoutHtml = `<pre>${escapeHtml(data.stdout)}</pre>`;
+                        const stderrHtml = data.stderr ? `<pre class="error">${escapeHtml(data.stderr)}</pre>` : '<p>No errors</p>';
+                        
+                        // Format the response (original and converted)
+                        let responseHtml = '';
+                        
+                        // Check if the response is an object or string
+                        if (typeof data.response === 'object') {
+                            responseHtml = `<pre>${escapeHtml(JSON.stringify(data.response, null, 2))}</pre>`;
+                        } else {
+                            responseHtml = `<pre>${escapeHtml(data.response)}</pre>`;
+                        }
+                        
+                        // Format the converted response if available
+                        let convertedHtml = '';
+                        if (data.converted_response) {
+                            convertedHtml = `
+                                <h4>Converted OpenAI Response (Sent to OpenWebUI)</h4>
+                                <pre>${escapeHtml(JSON.stringify(data.converted_response, null, 2))}</pre>
+                            `;
+                        }
+                        
+                        modal.innerHTML = `
+                            <div class="modal-content">
+                                <div class="modal-header">
+                                    <h3>Process Output: PID ${data.pid}</h3>
+                                    <span class="close-button" onclick="closeModal(this)">&times;</span>
+                                </div>
+                                <p><strong>Timestamp:</strong> ${timestamp}</p>
+                                <p><strong>Command:</strong> <code>${escapeHtml(data.command)}</code></p>
+                                
+                                <h4>Prompt</h4>
+                                ${promptHtml}
+                                
+                                <h4>Standard Output</h4>
+                                ${stdoutHtml}
+                                
+                                <h4>Standard Error</h4>
+                                ${stderrHtml}
+                                
+                                <h4>Original Claude Response</h4>
+                                ${responseHtml}
+                                
+                                ${convertedHtml}
+                                
+                                <div class="modal-footer">
+                                    <button class="button" onclick="closeModal(this.closest('.modal-content').querySelector('.close-button'))">Close</button>
+                                </div>
+                            </div>
+                        `;
+                        
+                        document.body.appendChild(modal);
+                        modal.style.display = 'block';
+                        
+                        // Add event listener for the escape key
+                        document.addEventListener('keydown', handleEscapeKey);
+                        
+                    } catch (error) {
+                        console.error('Error fetching process output:', error);
+                        alert('Error loading process output for PID ' + pid);
+                        
+                        // Re-enable auto-refresh if there was an error
+                        refreshEnabled = true;
+                        scheduleRefresh();
+                    }
+                }
+                
+                // Handle escape key for closing modal
+                function handleEscapeKey(e) {
+                    if (e.key === 'Escape') {
+                        const modal = document.querySelector('.modal[style*="display: block"]');
+                        if (modal) {
+                            closeModal(modal.querySelector('.close-button'));
+                        }
+                    }
+                }
+                
+                // Helper function to escape HTML special characters
+                function escapeHtml(text) {
+                    if (!text) return '';
+                    return text
+                        .replace(/&/g, "&amp;")
+                        .replace(/</g, "&lt;")
+                        .replace(/>/g, "&gt;")
+                        .replace(/"/g, "&quot;")
+                        .replace(/'/g, "&#039;");
+                }
+                
+                // Close the modal when the close button is clicked
+                function closeModal(button) {
+                    const modal = button.closest('.modal');
+                    modal.style.display = 'none';
+                    modal.remove();
+                    
+                    // Remove escape key listener
+                    document.removeEventListener('keydown', handleEscapeKey);
+                    
+                    // Re-enable auto-refresh
+                    refreshEnabled = true;
+                    scheduleRefresh();
+                }
+                
+                // Fetch outputs on page load
+                document.addEventListener('DOMContentLoaded', fetchProcessOutputs);
+            </script>
+        </div>
+    """
+    
+    # Close the outer containers
+    html += """
     </div>
 </body>
 </html>
@@ -2058,6 +2427,86 @@ async def status():
 async def get_metrics():
     """JSON endpoint for metrics data"""
     return metrics.get_metrics()
+
+@app.get("/process_outputs")
+async def list_process_outputs():
+    """List all stored process outputs"""
+    # Convert OrderedDict to list for JSON serialization, newest first
+    outputs_list = []
+    for pid, output in reversed(process_outputs.items()):
+        # Create a summary without the full output text
+        summary = {
+            "pid": output["pid"],
+            "timestamp": output["timestamp"],
+            "command": output["command"][:100] + ("..." if len(output["command"]) > 100 else ""),
+            "prompt_preview": output["prompt"][:100] + ("..." if len(output["prompt"]) > 100 else ""),
+            "has_stdout": bool(output["stdout"]),
+            "has_stderr": bool(output["stderr"]),
+            "has_response": bool(output["response"])
+        }
+        outputs_list.append(summary)
+    
+    return {"outputs": outputs_list}
+
+@app.get("/process_output/{pid}")
+async def get_single_process_output(pid: str):
+    """Get the output for a specific process"""
+    output = get_process_output(pid)
+    if output:
+        return output
+    else:
+        raise HTTPException(status_code=404, detail=f"No output found for process {pid}")
+
+@app.post("/terminate_process/{pid}")
+async def terminate_process(pid: str):
+    """
+    Terminate a specific process by PID.
+    This is used for the process management UI.
+    """
+    try:
+        pid = int(pid)
+        import os
+        import signal
+        import psutil
+        
+        # Safety check - only terminate Claude-related processes
+        process = psutil.Process(pid)
+        if "claude" in process.name().lower() or any("claude" in arg.lower() for arg in process.cmdline()):
+            # First try SIGTERM for clean shutdown
+            logger.info(f"Attempting to terminate Claude process {pid} with SIGTERM")
+            process.terminate()
+            
+            # Wait up to 3 seconds for process to terminate
+            try:
+                process.wait(timeout=3)
+                return {"status": "success", "message": f"Process {pid} terminated successfully"}
+            except psutil.TimeoutExpired:
+                # If process doesn't terminate, use SIGKILL
+                logger.warning(f"Process {pid} did not terminate with SIGTERM, using SIGKILL")
+                process.kill()
+                return {"status": "success", "message": f"Process {pid} forcibly terminated with SIGKILL"}
+        else:
+            logger.warning(f"Attempted to terminate non-Claude process {pid}, request denied")
+            return JSONResponse(
+                status_code=403,
+                content={"status": "error", "message": "Can only terminate Claude-related processes"}
+            )
+    except ValueError:
+        return JSONResponse(
+            status_code=400,
+            content={"status": "error", "message": "Invalid PID format"}
+        )
+    except psutil.NoSuchProcess:
+        return JSONResponse(
+            status_code=404,
+            content={"status": "error", "message": f"Process {pid} not found"}
+        )
+    except Exception as e:
+        logger.error(f"Error terminating process {pid}: {e}")
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "message": f"Error terminating process: {str(e)}"}
+        )
 
 if __name__ == "__main__":
     import uvicorn

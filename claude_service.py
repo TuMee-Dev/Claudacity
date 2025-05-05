@@ -41,6 +41,7 @@ def install_dependencies():
         import fastapi
         import uvicorn
         import httpx
+        import psutil
         # Try to import the original claude_ollama_server module if available
         try:
             import claude_ollama_server
@@ -50,7 +51,7 @@ def install_dependencies():
         logger.info("Installing required dependencies...")
         import subprocess
         subprocess.check_call([sys.executable, "-m", "pip", "install", 
-                              "fastapi", "uvicorn", "httpx"])
+                              "fastapi", "uvicorn", "httpx", "psutil"])
         logger.info("Dependencies installed successfully.")
 
 # Try to install dependencies
