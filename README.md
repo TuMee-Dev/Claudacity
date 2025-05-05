@@ -11,6 +11,7 @@ This server allows you to use Claude Code through the Ollama API interface. It t
 - True streaming responses (using Claude's streaming JSON output)
 - Conversation tracking and memory
 - Ollama-compatible API endpoints
+- Function/Tool calling support (including OpenWebUI compatibility)
 - Cross-platform service management (Windows, macOS, Linux)
 
 ## Prerequisites
@@ -154,6 +155,8 @@ response = client.chat.completions.create(
 To connect Open WebUI to this server, set:
 - OLLAMA_BASE_URL=http://localhost:22434
 
+Note: This server includes special handling for tool/function calling with OpenWebUI. When Claude returns a JSON object with tools, the server transforms it into a text response that will prompt OpenWebUI to continue the conversation properly. See OPENWEBUI_COMPATIBILITY.md for detailed information.
+
 ## How It Works
 
 The server intercepts Ollama API requests and:
@@ -166,7 +169,10 @@ The server intercepts Ollama API requests and:
 3. Passes the user's prompt to Claude Code
 4. For streaming requests, captures Claude's streaming JSON output in real-time
 5. Formats the responses in Ollama's expected format
-6. Returns responses to the client with proper SSE formatting
+6. Checks if the response contains a tools/function call JSON structure
+   - If found, transforms it to a text prompt for OpenWebUI compatibility
+   - This ensures proper tool calling conversation flow
+7. Returns responses to the client with proper SSE formatting
 
 ## Limitations
 

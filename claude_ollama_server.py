@@ -1286,10 +1286,27 @@ def format_to_openai_chat_completion(claude_response, model, request_id=None):
                         parsed_result = json.loads(quoted_result)
                         # For structured content like tool_calls, we want to pass it through properly
                         # rather than as a string representation
-                        content = parsed_result
+                        
+                        # Check if this is a tools response (OpenWebUI compatibility)
+                        if "tools" in parsed_result:
+                            logger.info("Detected tools array in response, modifying for OpenWebUI compatibility")
+                            # Instead of returning the raw JSON with tools, return a text message
+                            # that will make OpenWebUI continue the conversation
+                            content = "I need to use a tool to answer your question. Please continue with the tool execution."
+                        else:
+                            content = parsed_result
                     else:
                         # Otherwise try to parse as-is
-                        content = json.loads(raw_result)
+                        parsed_json = json.loads(raw_result)
+                        
+                        # Check if this is a tools response (OpenWebUI compatibility)
+                        if isinstance(parsed_json, dict) and "tools" in parsed_json:
+                            logger.info("Detected tools array in response, modifying for OpenWebUI compatibility")
+                            # Instead of returning the raw JSON with tools, return a text message
+                            # that will make OpenWebUI continue the conversation
+                            content = "I need to use a tool to answer your question. Please continue with the tool execution."
+                        else:
+                            content = parsed_json
                 except json.JSONDecodeError:
                     # If parsing fails, use the raw string
                     content = raw_result
@@ -1399,7 +1416,24 @@ async def stream_openai_response(claude_prompt: str, model_name: str, conversati
                 # Skip empty content
                 if not content:
                     continue
-                    
+                
+                # Check if the content is a JSON string containing a tools array
+                if isinstance(content, str):
+                    try:
+                        # Check if it's a JSON string starting and ending with braces
+                        if content.strip().startswith('{') and content.strip().endswith('}'):
+                            # Try to parse as JSON
+                            parsed_content = json.loads(content)
+                            
+                            # Check if it contains a tools array
+                            if isinstance(parsed_content, dict) and "tools" in parsed_content:
+                                logger.info("Detected tools array in streaming response, modifying for OpenWebUI compatibility")
+                                # Replace the JSON with a text message to make OpenWebUI continue the conversation
+                                content = "I need to use a tool to answer your question. Please continue with the tool execution."
+                    except json.JSONDecodeError:
+                        # Not valid JSON, proceed with original content
+                        pass
+                
                 # Accumulate full response for logging
                 full_response += content
                 
@@ -1799,6 +1833,7 @@ async def openai_list_models():
 @app.options("/chat/completions")
 @app.options("/v1/chat/completions")
 @app.options("/openwebui_test")
+@app.options("/test_openwebui")
 async def options_chat():
     """Handle OPTIONS requests for API endpoints."""
     return JSONResponse(
@@ -1818,6 +1853,94 @@ async def get_version():
         "version": "0.1.0",
         "build": "claude-ollama-server"
     }
+
+@app.post("/test_openwebui")
+async def test_openwebui(request: Request):
+    """Test endpoint for OpenWebUI compatibility, especially for tool/function calling."""
+    body = await request.json()
+    response_type = body.get("response_type", "tool")  # tool, text, or error
+    
+    logger.info(f"Testing tool response with type: {response_type}")
+    
+    if response_type == "tool":
+        # Simulate a tool response
+        tool_response = {
+            "id": f"test-{uuid.uuid4().hex[:8]}",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": "anthropic/claude-3.7-sonnet",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": json.dumps({
+                            "tools": [
+                                {
+                                    "type": "function",
+                                    "function": {
+                                        "name": "get_weather",
+                                        "arguments": json.dumps({
+                                            "location": "San Francisco, CA",
+                                            "unit": "celsius"
+                                        })
+                                    }
+                                }
+                            ]
+                        })
+                    },
+                    "finish_reason": "tool_calls"
+                }
+            ],
+            "usage": {
+                "prompt_tokens": 50,
+                "completion_tokens": 20,
+                "total_tokens": 70
+            }
+        }
+        
+        # Our enhanced handler should detect the tools array and replace it with text
+        response = format_to_openai_chat_completion(
+            {"role": "system", "result": json.dumps(tool_response["choices"][0]["message"]["content"])},
+            "anthropic/claude-3.7-sonnet"
+        )
+        
+        return JSONResponse(content=response)
+    elif response_type == "text":
+        # Return a simple text response
+        return JSONResponse(content={
+            "id": f"test-{uuid.uuid4().hex[:8]}",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": "anthropic/claude-3.7-sonnet",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": "This is a test text response."
+                    },
+                    "finish_reason": "stop"
+                }
+            ],
+            "usage": {
+                "prompt_tokens": 50,
+                "completion_tokens": 20,
+                "total_tokens": 70
+            }
+        })
+    else:
+        # Simulate an error response
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": {
+                    "message": "This is a test error response.",
+                    "type": "test_error",
+                    "code": "test_error_code"
+                }
+            }
+        )
 
 @app.post("/openwebui_test")
 async def openwebui_test(request: Request):
