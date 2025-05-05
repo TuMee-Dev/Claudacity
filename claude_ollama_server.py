@@ -355,13 +355,16 @@ app = FastAPI(
 )
 
 # Add CORS middleware to allow requests from any origin
+# This is critical for working with web-based clients like OpenWebUI
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allow all origins
-    allow_credentials=True,
-    allow_methods=["*"],  # Allow all methods
+    allow_origins=["*"],  # Allow all origins - change to specific domains in production
+    allow_credentials=False,  # Changed to False to avoid conflicts when allow_origins=["*"]
+    allow_methods=["GET", "POST", "OPTIONS", "HEAD"],  # Explicitly specify allowed methods
     allow_headers=["*"],  # Allow all headers
+    expose_headers=["Content-Type", "X-Request-ID", "Content-Length"],  # Expose specific headers
+    max_age=86400  # Cache preflight requests for 24 hours
 )
 
 # Add middleware for global exception and request logging
@@ -1498,25 +1501,134 @@ async def chat(request_body: Request):
         )
     else:
         try:
+            # Start timing the non-streaming request
+            start_time = time.time()
+            request_id = f"req-{uuid.uuid4().hex[:8]}"
+            
+            logger.info(f"Processing non-streaming request {request_id} for model: {request.model}")
+            
             # For non-streaming, get the full response at once
             claude_response = await run_claude_command(claude_prompt, conversation_id=conversation_id)
-            logger.debug(f"Full claude_response from run_claude_command: {claude_response}")
+            
+            # Log the raw Claude response at debug level
+            if isinstance(claude_response, dict):
+                logger.debug(f"Raw Claude response: {json.dumps(claude_response)[:500]}...")
+            else:
+                logger.debug(f"Raw Claude response: {str(claude_response)[:500]}...")
+                
+            # Log information about the client
+            user_agent = request_body.headers.get("user-agent", "Unknown")
+            referer = request_body.headers.get("referer", "Unknown")
+            origin = request_body.headers.get("origin", "Unknown")
+            host = request_body.headers.get("host", "Unknown")
+            
+            # Detect OpenWebUI specifically
+            is_openwebui = (
+                "OpenWebUI" in user_agent or 
+                "openwebui" in str(referer).lower() or 
+                "openwebui" in str(origin).lower()
+            )
+            
+            logger.info(f"Client info for {request_id}: UA={user_agent}, Referer={referer}, Origin={origin}, Host={host}")
+            if is_openwebui:
+                logger.info(f"Detected OpenWebUI client for request {request_id}")
             
             # Format as OpenAI chat completion
             openai_response = format_to_openai_chat_completion(claude_response, request.model, request.id)
             
-            logger.debug(f"Final OpenAI-format response: {json.dumps(openai_response)}")
+            # Log the formatted response
+            logger.info(f"Formatted OpenAI response for request {request_id}")
+            logger.debug(f"OpenAI-format response: {json.dumps(openai_response)[:500]}...")
             
-            # Return explicitly as JSONResponse with application/json content type
-            return JSONResponse(
+            # Create minimal set of headers that are compatible with all clients
+            headers = {
+                # Essential CORS headers
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
+                "Access-Control-Allow-Headers": "Content-Type, Authorization",
+                
+                # Basic cache control
+                "Cache-Control": "no-cache",
+                
+                # Add a unique request ID for tracking
+                "X-Request-ID": request_id
+            }
+            
+            # Log if we detected OpenWebUI
+            if is_openwebui:
+                logger.info(f"Detected OpenWebUI client for request {request_id}")
+            
+            # Create the JSONResponse with the headers we just built
+            response = JSONResponse(
                 content=openai_response,
                 media_type="application/json",
-                headers={"Content-Type": "application/json"}
+                headers=headers
             )
+            
+            # Log the response being returned
+            duration_ms = int((time.time() - start_time) * 1000)
+            logger.info(f"Returning non-streaming response for {request_id} (duration: {duration_ms}ms)")
+            
+            # No artificial delay - let FastAPI/Starlette handle the request normally
+            # This avoids potential issues with event loop and response handling
+            
+            # Log detailed timing information
+            logger.info(f"Request {request_id} timing: total={duration_ms}ms")
+            logger.info(f"Sending response for {request_id} to client: approx {len(json.dumps(openai_response))} bytes")
+            
+            # Return the response directly
+            return response
         except Exception as e:
-            logger.error(f"Error calling Claude: {str(e)}", exc_info=True)
+            # Enhanced error handling with better client response
+            error_id = f"err-{uuid.uuid4().hex[:8]}"
+            logger.error(f"Error processing non-streaming request {error_id}: {str(e)}", exc_info=True)
             logger.error(traceback.format_exc())
-            raise HTTPException(status_code=500, detail=f"Error calling Claude: {str(e)}")
+            
+            # Create a proper OpenAI-compatible error response
+            error_response = {
+                "error": {
+                    "message": f"Error processing request: {str(e)}",
+                    "type": "server_error",
+                    "param": None,
+                    "code": "internal_error",
+                    "error_id": error_id
+                }
+            }
+            
+            # Use minimal error headers for better compatibility
+            error_headers = {
+                # Essential CORS headers
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
+                "Access-Control-Allow-Headers": "Content-Type, Authorization",
+                
+                # Basic tracking and content info
+                "X-Request-ID": error_id,
+                "Content-Type": "application/json"
+            }
+            
+            # Detect OpenWebUI for logging purposes
+            try:
+                user_agent = request_body.headers.get("user-agent", "Unknown")
+                origin = request_body.headers.get("origin", "Unknown")
+                
+                is_openwebui = (
+                    "OpenWebUI" in user_agent or 
+                    "openwebui" in str(request_body.headers.get("referer", "")).lower() or 
+                    "openwebui" in str(origin).lower()
+                )
+                
+                if is_openwebui:
+                    logger.info(f"Detected OpenWebUI client for error response {error_id}")
+            except Exception as header_err:
+                logger.warning(f"Could not check for OpenWebUI in error response: {header_err}")
+            
+            # Return error with proper headers
+            return JSONResponse(
+                status_code=500,
+                content=error_response,
+                headers=error_headers
+            )
 
 @app.post("/v1/chat/completions")
 async def openai_chat_completions(request_body: Request):
@@ -1550,6 +1662,22 @@ async def openai_list_models():
     # Reuse the same implementation as the main models endpoint
     return await list_models()
 
+# Add explicit OPTIONS handlers for critical endpoints to ensure CORS is working
+@app.options("/chat/completions")
+@app.options("/v1/chat/completions")
+@app.options("/openwebui_test")
+async def options_chat():
+    """Handle OPTIONS requests for API endpoints."""
+    return JSONResponse(
+        content={"status": "ok"},
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
+            "Access-Control-Allow-Headers": "*",  # Allow all headers for maximum compatibility
+            "Access-Control-Max-Age": "86400",
+        }
+    )
+
 @app.get("/version")
 async def get_version():
     """Get API version info (OpenAI-compatible version endpoint)."""
@@ -1557,6 +1685,61 @@ async def get_version():
         "version": "0.1.0",
         "build": "claude-ollama-server"
     }
+
+@app.post("/openwebui_test")
+async def openwebui_test(request: Request):
+    """Special endpoint for diagnosing OpenWebUI compatibility issues."""
+    body = await request.json()
+    test_message = body.get("message", "This is a test response for OpenWebUI")
+    
+    # Log information about the client
+    user_agent = request.headers.get("user-agent", "Unknown")
+    referer = request.headers.get("referer", "Unknown")
+    origin = request.headers.get("origin", "Unknown")
+    host = request.headers.get("host", "Unknown")
+    
+    # Detect if request is from OpenWebUI
+    is_openwebui = (
+        "OpenWebUI" in user_agent or 
+        "openwebui" in str(referer).lower() or 
+        "openwebui" in str(origin).lower()
+    )
+    
+    logger.info(f"OpenWebUI test request from: UA={user_agent}, Referer={referer}, Origin={origin}, Host={host}")
+    if is_openwebui:
+        logger.info("Confirmed request is from OpenWebUI")
+    
+    # Create a simple test response
+    test_response = {
+        "id": f"test-{uuid.uuid4().hex[:8]}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": "anthropic/claude-3.7-sonnet",
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": test_message
+                },
+                "finish_reason": "stop"
+            }
+        ],
+        "usage": {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0
+        }
+    }
+    
+    # Minimal headers for maximum compatibility
+    headers = {
+        "Access-Control-Allow-Origin": "*",
+        "Content-Type": "application/json"
+    }
+    
+    logger.info(f"Sending test response: {json.dumps(test_response)[:100]}...")
+    return JSONResponse(content=test_response, headers=headers)
 
 # Dictionary to track proxy-launched Claude processes
 proxy_launched_processes = {}
