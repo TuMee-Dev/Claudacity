@@ -15,13 +15,16 @@ import shlex
 import time
 import traceback
 import uuid
-from typing import Dict, List, Optional, Any, Union
+import collections
+import statistics
+import datetime
+from typing import Dict, List, Optional, Any, Union, Deque
 from pydantic import BaseModel, Field
 import httpx
 import asyncio
 import fastapi
 from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
-from fastapi.responses import StreamingResponse, JSONResponse, PlainTextResponse
+from fastapi.responses import StreamingResponse, JSONResponse, PlainTextResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 # Configuration
@@ -29,6 +32,7 @@ from fastapi.middleware.cors import CORSMiddleware
 DEFAULT_MODEL = "claude-3-7-sonnet-latest"  # Default Claude model to report
 DEFAULT_MAX_TOKENS = 128000  # 128k context length
 CONVERSATION_CACHE_TTL = 3600 * 3  # 3 hours in seconds
+METRICS_HISTORY_SIZE = 1000  # Number of requests to keep for metrics calculations
 
 # Configure logging with more details
 
@@ -38,6 +42,292 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 logger = logging.getLogger(__name__)
+
+# Metrics tracking class
+
+class ClaudeMetrics:
+    """
+    Tracks metrics for Claude CLI process invocations.
+    Collects data on Claude usage patterns, run times, and resource usage.
+    """
+    def __init__(self, history_size=METRICS_HISTORY_SIZE):
+        # Claude invocation timestamps (ISO format)
+        self.first_invocation_time = None
+        self.last_invocation_time = None
+        self.last_completion_time = None
+        
+        # Claude process performance tracking
+        self.execution_durations = collections.deque(maxlen=history_size)  # in milliseconds
+        self.invocation_times = collections.deque(maxlen=history_size)
+        self.completion_times = collections.deque(maxlen=history_size)
+        
+        # Claude invocation volume
+        self.total_invocations = 0
+        self.invocations_by_minute = collections.defaultdict(int)
+        self.invocations_by_hour = collections.defaultdict(int)
+        self.invocations_by_day = collections.defaultdict(int)
+        
+        # Memory usage tracking (in MB)
+        self.memory_usage = collections.deque(maxlen=history_size)
+        
+        # Claude tracking by type
+        self.invocations_by_model = collections.defaultdict(int)
+        self.invocations_by_conversation = collections.defaultdict(int)
+        
+        # Conversation tracking
+        self.unique_conversations = set()
+        self.active_conversations = set()  # Conversations seen in the last hour
+        
+        # File size totals
+        self.total_prompt_tokens = 0
+        self.total_completion_tokens = 0
+        
+        # Current concurrent Claude processes
+        self.current_processes = 0
+        self.max_concurrent_processes = 0
+        
+        # Error tracking
+        self.errors = collections.deque(maxlen=50)  # Keep last 50 errors
+        self.error_count = 0
+        
+        # Starting timestamp
+        self.start_time = datetime.datetime.now()
+        
+        # Track system resource impact
+        self.cpu_usage = collections.deque(maxlen=history_size)  # percentage
+        
+        # Track total Claude processes started during this server run
+        self.total_claude_processes = 0
+        
+        # Synchronization lock for updating concurrent process count
+        self._lock = asyncio.Lock() if 'asyncio' in globals() else None
+    
+    async def record_claude_start(self, process_id, model=None, conversation_id=None, memory_mb=None, cpu_percent=None):
+        """Record a new Claude CLI process start"""
+        now = datetime.datetime.now()
+        iso_now = now.isoformat()
+        
+        # Update invocation timestamps
+        if self.first_invocation_time is None:
+            self.first_invocation_time = iso_now
+        self.last_invocation_time = iso_now
+        
+        # Record invocation time
+        self.invocation_times.append(now)
+        
+        # Update counters
+        self.total_invocations += 1
+        self.total_claude_processes += 1
+        
+        # Update time-based metrics
+        minute_key = now.strftime("%Y-%m-%d %H:%M")
+        hour_key = now.strftime("%Y-%m-%d %H")
+        day_key = now.strftime("%Y-%m-%d")
+        
+        self.invocations_by_minute[minute_key] += 1
+        self.invocations_by_hour[hour_key] += 1
+        self.invocations_by_day[day_key] += 1
+        
+        # Update model metrics
+        if model:
+            self.invocations_by_model[model] += 1
+        
+        # Update conversation metrics
+        if conversation_id:
+            self.unique_conversations.add(conversation_id)
+            self.active_conversations.add(conversation_id)
+            self.invocations_by_conversation[conversation_id] += 1
+        
+        # Update resource usage metrics if available
+        if memory_mb is not None:
+            self.memory_usage.append(memory_mb)
+        
+        if cpu_percent is not None:
+            self.cpu_usage.append(cpu_percent)
+        
+        # Update concurrent process count
+        if self._lock:
+            async with self._lock:
+                self.current_processes += 1
+                if self.current_processes > self.max_concurrent_processes:
+                    self.max_concurrent_processes = self.current_processes
+        else:
+            self.current_processes += 1
+            if self.current_processes > self.max_concurrent_processes:
+                self.max_concurrent_processes = self.current_processes
+    
+    async def record_claude_completion(self, process_id, duration_ms, output_tokens=None, memory_mb=None, error=None):
+        """Record completion of a Claude CLI process"""
+        now = datetime.datetime.now()
+        self.last_completion_time = now.isoformat()
+        
+        # Store the execution duration
+        self.completion_times.append(now)
+        self.execution_durations.append(duration_ms)
+        
+        # Update token counts if available
+        if output_tokens is not None:
+            self.total_completion_tokens += output_tokens
+        
+        # Update resource usage metrics if available
+        if memory_mb is not None:
+            self.memory_usage.append(memory_mb)
+        
+        # Record errors if any
+        if error:
+            self.errors.append({
+                'time': now.isoformat(),
+                'error': str(error)
+            })
+            self.error_count += 1
+        
+        # Update concurrent process count
+        if self._lock:
+            async with self._lock:
+                if self.current_processes > 0:
+                    self.current_processes -= 1
+        else:
+            if self.current_processes > 0:
+                self.current_processes -= 1
+    
+    def prune_old_data(self):
+        """Remove old data from time-based metrics"""
+        now = datetime.datetime.now()
+        
+        # Remove old conversation data (older than 1 hour)
+        one_hour_ago = now - datetime.timedelta(hours=1)
+        
+        # Prune old active conversations
+        old_conversation_ids = set()
+        for conversation_id in self.active_conversations:
+            # In a real implementation, we would have per-conversation timestamp tracking
+            old_conversation_ids.add(conversation_id)
+        
+        for conversation_id in old_conversation_ids:
+            self.active_conversations.discard(conversation_id)
+    
+    def get_avg_execution_time(self):
+        """Get the average execution time in milliseconds"""
+        if not self.execution_durations:
+            return 0
+        return statistics.mean(self.execution_durations)
+    
+    def get_median_execution_time(self):
+        """Get the median execution time in milliseconds"""
+        if not self.execution_durations:
+            return 0
+        return statistics.median(self.execution_durations)
+    
+    def get_invocations_per_minute(self, minutes=5):
+        """Get the average invocations per minute over the last N minutes"""
+        now = datetime.datetime.now()
+        count = 0
+        
+        # Count invocations in the window
+        for inv_time in self.invocation_times:
+            if (now - inv_time).total_seconds() <= (minutes * 60):
+                count += 1
+        
+        # Avoid division by zero
+        if minutes == 0:
+            return 0
+        
+        return count / minutes
+    
+    def get_invocations_per_hour(self):
+        """Get the average invocations per hour over the last hour"""
+        return self.get_invocations_per_minute(60)
+    
+    def get_avg_memory_usage(self):
+        """Get the average memory usage in MB"""
+        if not self.memory_usage:
+            return 0
+        return statistics.mean(self.memory_usage)
+    
+    def get_peak_memory_usage(self):
+        """Get the peak memory usage in MB"""
+        if not self.memory_usage:
+            return 0
+        return max(self.memory_usage)
+    
+    def get_avg_cpu_usage(self):
+        """Get the average CPU usage percentage"""
+        if not self.cpu_usage:
+            return 0
+        return statistics.mean(self.cpu_usage)
+    
+    def get_uptime(self):
+        """Get the uptime in seconds"""
+        return (datetime.datetime.now() - self.start_time).total_seconds()
+    
+    def get_uptime_formatted(self):
+        """Get the uptime as a formatted string (e.g., '2 days, 3 hours, 4 minutes')"""
+        uptime_seconds = self.get_uptime()
+        
+        days, remainder = divmod(uptime_seconds, 86400)
+        hours, remainder = divmod(remainder, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        
+        parts = []
+        if days > 0:
+            parts.append(f"{int(days)} days")
+        if hours > 0 or days > 0:
+            parts.append(f"{int(hours)} hours")
+        if minutes > 0 or hours > 0 or days > 0:
+            parts.append(f"{int(minutes)} minutes")
+        if not parts:
+            parts.append(f"{int(seconds)} seconds")
+        
+        return ", ".join(parts)
+    
+    def get_metrics(self):
+        """Get all metrics as a dictionary"""
+        return {
+            'uptime': {
+                'seconds': self.get_uptime(),
+                'formatted': self.get_uptime_formatted(),
+                'start_time': self.start_time.isoformat()
+            },
+            'claude_invocations': {
+                'total': self.total_invocations,
+                'per_minute': self.get_invocations_per_minute(),
+                'per_hour': self.get_invocations_per_hour(),
+                'current_running': self.current_processes,
+                'max_concurrent': self.max_concurrent_processes
+            },
+            'timestamps': {
+                'first_invocation': self.first_invocation_time,
+                'last_invocation': self.last_invocation_time,
+                'last_completion': self.last_completion_time
+            },
+            'performance': {
+                'avg_execution_time_ms': self.get_avg_execution_time(),
+                'median_execution_time_ms': self.get_median_execution_time()
+            },
+            'resources': {
+                'avg_memory_mb': self.get_avg_memory_usage(),
+                'peak_memory_mb': self.get_peak_memory_usage(),
+                'avg_cpu_percent': self.get_avg_cpu_usage()
+            },
+            'conversations': {
+                'unique_count': len(self.unique_conversations),
+                'active_count': len(self.active_conversations)
+            },
+            'tokens': {
+                'total_completion': self.total_completion_tokens
+            },
+            'errors': {
+                'count': self.error_count,
+                'recent': list(self.errors)
+            },
+            'distribution': {
+                'by_model': dict(self.invocations_by_model),
+                'by_conversation': dict(self.invocations_by_conversation)
+            }
+        }
+
+# Initialize metrics
+metrics = ClaudeMetrics()
 
 def debug_response(response, prefix=""):
     """Helper to log response details for debugging"""
@@ -80,34 +370,27 @@ async def log_requests(request: Request, call_next):
     request_id = str(id(request))
     method = request.method
     url = str(request.url)
-
+    path = request.url.path
+    start_time = time.time()
+    
     # Log request details
     logger.info(f"Request {request_id}: {method} {url}")
 
     try:
-        # Log request body for non-GET requests
-        if method != "GET":
-            try:
-                body = await request.body()
-                if body:
-                    body_str = body.decode()
-                    # Truncate long bodies to avoid log flood
-                    if len(body_str) > 1000:
-                        body_str = body_str[:1000] + "..."
-                    logger.debug(f"Request {request_id} body: {body_str}")
-            except Exception as e:
-                logger.warning(f"Could not log request body: {str(e)}")
-                
         # Process the request
         response = await call_next(request)
         
+        # Calculate request duration
+        duration_ms = (time.time() - start_time) * 1000
+        
         # Log response code
-        logger.info(f"Response {request_id}: {response.status_code}")
+        logger.info(f"Response {request_id}: {response.status_code} ({int(duration_ms)}ms)")
         return response
         
     except Exception as e:
         # Log any uncaught exceptions
         logger.error(f"Uncaught exception in {method} {url}: {str(e)}", exc_info=True)
+        
         # Return a 500 response
         return JSONResponse(
             status_code=500,
@@ -246,6 +529,14 @@ async def run_claude_command(prompt: str, conversation_id: str = None) -> str:
     cmd = f"{base_cmd} --output-format json"
 
     logger.info(f"Running command: {cmd}")
+    
+    # Generate a unique process ID for tracking
+    process_id = f"claude-process-{uuid.uuid4().hex[:8]}"
+    start_time = time.time()
+    model = DEFAULT_MODEL
+    
+    # Record the Claude process start in metrics
+    await metrics.record_claude_start(process_id, model, conversation_id)
 
     try:
         process = await asyncio.create_subprocess_shell(
@@ -258,9 +549,17 @@ async def run_claude_command(prompt: str, conversation_id: str = None) -> str:
         # Send the prompt to Claude
         stdout, stderr = await process.communicate(input=prompt.encode())
         
+        # Calculate execution duration
+        duration_ms = (time.time() - start_time) * 1000
+        
         if process.returncode != 0:
-            logger.error(f"Claude command failed: {stderr.decode()}")
-            raise Exception(f"Claude command failed: {stderr.decode()}")
+            error_msg = stderr.decode()
+            logger.error(f"Claude command failed: {error_msg}")
+            
+            # Record completion with error
+            await metrics.record_claude_completion(process_id, duration_ms, error=error_msg)
+            
+            raise Exception(f"Claude command failed: {error_msg}")
         
         output = stdout.decode()
         logger.debug(f"Raw Claude response: {output}")
@@ -270,11 +569,20 @@ async def run_claude_command(prompt: str, conversation_id: str = None) -> str:
             response = json.loads(output)
             logger.debug(f"Parsed Claude response: {response}")
             
+            # Extract token count if available
+            output_tokens = None
+            if isinstance(response, dict) and "usage" in response:
+                output_tokens = response["usage"].get("completion_tokens", None)
+            
             # If we have a system response with a result, use that content
             if isinstance(response, dict) and "role" in response and response["role"] == "system" and "result" in response:
-                duration_ms = response.get("duration_ms", 0)
+                # Use duration from response if available, otherwise use our calculated duration
+                response_duration_ms = response.get("duration_ms", duration_ms)
                 cost_usd = response.get("cost_usd", 0)
                 result = response["result"]
+                
+                # Record completion metrics
+                await metrics.record_claude_completion(process_id, response_duration_ms, output_tokens)
                 
                 # Try to parse as JSON if it looks like JSON
                 try:
@@ -287,7 +595,7 @@ async def run_claude_command(prompt: str, conversation_id: str = None) -> str:
                             "parsed_json": True,
                             "content": parsed_result,
                             "raw_content": result,
-                            "duration_ms": duration_ms,
+                            "duration_ms": response_duration_ms,
                             "cost_usd": cost_usd
                         }
                 except json.JSONDecodeError:
@@ -300,18 +608,28 @@ async def run_claude_command(prompt: str, conversation_id: str = None) -> str:
                     "role": "assistant",
                     "parsed_json": False,
                     "content": result,
-                    "duration_ms": duration_ms,
+                    "duration_ms": response_duration_ms,
                     "cost_usd": cost_usd
                 }
+            
+            # Record completion metrics using our calculated duration
+            await metrics.record_claude_completion(process_id, duration_ms, output_tokens)
             
             # Return the response as-is if it doesn't match expected format
             return response
             
         except json.JSONDecodeError:
             logger.warning("Failed to parse JSON response, returning raw output")
+            
+            # Record completion metrics
+            await metrics.record_claude_completion(process_id, duration_ms)
+            
             return output
             
     except Exception as e:
+        # Record error in metrics
+        await metrics.record_claude_completion(process_id, duration_ms, error=e)
+        
         logger.error(f"Error running Claude command: {str(e)}")
         raise
 
@@ -331,6 +649,14 @@ async def stream_claude_output(prompt: str, conversation_id: str = None):
     cmd = f"{base_cmd} --output-format stream-json"
 
     logger.info(f"Running command for streaming: {cmd}")
+    
+    # Generate a unique process ID for tracking
+    process_id = f"claude-process-{uuid.uuid4().hex[:8]}"
+    start_time = time.time()
+    model = DEFAULT_MODEL
+    
+    # Record the Claude process start in metrics
+    await metrics.record_claude_start(process_id, model, conversation_id)
 
     process = await asyncio.create_subprocess_shell(
         cmd,
@@ -346,12 +672,19 @@ async def stream_claude_output(prompt: str, conversation_id: str = None):
         process.stdin.close()
     except Exception as e:
         logger.error(f"Error writing to stdin: {str(e)}")
+        
+        # Record error in metrics
+        duration_ms = (time.time() - start_time) * 1000
+        await metrics.record_claude_completion(process_id, duration_ms, error=e)
+        
         raise
 
     # Read the output
     try:
         # Buffer for collecting complete JSON objects
         buffer = ""
+        output_tokens = 0
+        streaming_complete = False
         
         # Read the output in chunks
         while True:
@@ -387,13 +720,25 @@ async def stream_claude_output(prompt: str, conversation_id: str = None):
                                         if item.get("type") == "text" and "text" in item:
                                             content = item["text"]
                                             logger.info(f"Extracted text content: {content[:50]}...")
+                                            output_tokens += len(content.split()) / 0.75  # Rough token count estimate
                                             yield {"content": content}
                             elif "stop_reason" in json_obj:
                                 # End of message
+                                streaming_complete = True
                                 yield {"done": True}
                             # Additional handling for system messages with cost info
                             elif "role" in json_obj and json_obj["role"] == "system" and "cost_usd" in json_obj:
-                                # This is a system message with cost info
+                                # This is a system message with cost info - extract execution duration if available
+                                duration_ms = json_obj.get("duration_ms", (time.time() - start_time) * 1000)
+                                streaming_complete = True
+                                
+                                # Record completion in metrics
+                                await metrics.record_claude_completion(
+                                    process_id, 
+                                    duration_ms, 
+                                    output_tokens=int(output_tokens)
+                                )
+                                
                                 yield {"done": True}
                             
                         except json.JSONDecodeError as e:
@@ -416,8 +761,10 @@ async def stream_claude_output(prompt: str, conversation_id: str = None):
                             if item.get("type") == "text" and "text" in item:
                                 content = item["text"]
                                 logger.info(f"Extracted final text content: {content[:50]}...")
+                                output_tokens += len(content.split()) / 0.75  # Rough token count estimate
                                 yield {"content": content}
                 elif "stop_reason" in json_obj:
+                    streaming_complete = True
                     yield {"done": True}
             except json.JSONDecodeError:
                 logger.warning(f"Failed to parse final buffer: {buffer[:200]}...")
@@ -428,10 +775,25 @@ async def stream_claude_output(prompt: str, conversation_id: str = None):
             stderr_str = stderr_data.decode('utf-8').strip()
             if stderr_str:
                 logger.error(f"Error from Claude: {stderr_str}")
+                
+                # Record error in metrics
+                duration_ms = (time.time() - start_time) * 1000
+                await metrics.record_claude_completion(process_id, duration_ms, error=stderr_str)
+                
                 yield {"error": stderr_str}
+        
+        # If we didn't see an explicit completion, record it now
+        if not streaming_complete:
+            duration_ms = (time.time() - start_time) * 1000
+            await metrics.record_claude_completion(process_id, duration_ms, output_tokens=int(output_tokens))
                 
     except Exception as e:
         logger.error(f"Error processing Claude output stream: {str(e)}", exc_info=True)
+        
+        # Record error in metrics
+        duration_ms = (time.time() - start_time) * 1000
+        await metrics.record_claude_completion(process_id, duration_ms, error=e)
+        
         yield {"error": str(e)}
         
     finally:
@@ -861,10 +1223,340 @@ async def get_version():
         "build": "claude-ollama-server"
     }
 
-@app.get("/", response_class=PlainTextResponse)
+def generate_dashboard_html():
+    """Generate HTML for the dashboard page"""
+    # Get current metrics
+    metrics_data = metrics.get_metrics()
+    
+    # Format metrics for display
+    avg_execution = f"{metrics_data['performance']['avg_execution_time_ms']:.2f}" if metrics_data['performance']['avg_execution_time_ms'] else "N/A"
+    median_execution = f"{metrics_data['performance']['median_execution_time_ms']:.2f}" if metrics_data['performance']['median_execution_time_ms'] else "N/A"
+    
+    # Memory metrics formatting
+    avg_memory = f"{metrics_data['resources']['avg_memory_mb']:.2f}" if metrics_data['resources']['avg_memory_mb'] else "N/A"
+    peak_memory = f"{metrics_data['resources']['peak_memory_mb']:.2f}" if metrics_data['resources']['peak_memory_mb'] else "N/A"
+    avg_cpu = f"{metrics_data['resources']['avg_cpu_percent']:.2f}%" if metrics_data['resources']['avg_cpu_percent'] else "N/A"
+    
+    # Create the HTML
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Claude Ollama API Dashboard</title>
+    <style>
+        body {{
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, 'Open Sans', 'Helvetica Neue', sans-serif;
+            line-height: 1.6;
+            color: #333;
+            margin: 0;
+            padding: 20px;
+            background-color: #f5f5f7;
+        }}
+        .container {{
+            max-width: 1200px;
+            margin: 0 auto;
+        }}
+        h1, h2, h3 {{
+            color: #000;
+        }}
+        h1 {{
+            margin-bottom: 10px;
+            border-bottom: 1px solid #ddd;
+            padding-bottom: 10px;
+        }}
+        .stats-grid {{
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }}
+        .card {{
+            background: white;
+            border-radius: 10px;
+            padding: 20px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        }}
+        .metric {{
+            margin-bottom: 15px;
+        }}
+        .metric-name {{
+            font-weight: bold;
+            margin-bottom: 5px;
+            color: #555;
+        }}
+        .metric-value {{
+            font-size: 24px;
+            font-weight: 500;
+        }}
+        .metric-unit {{
+            font-size: 14px;
+            color: #777;
+        }}
+        .error-card {{
+            background-color: #fff8f8;
+            border-left: 4px solid #e53935;
+        }}
+        table {{
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 10px;
+        }}
+        th, td {{
+            padding: 12px;
+            text-align: left;
+            border-bottom: 1px solid #ddd;
+        }}
+        th {{
+            background-color: #f2f2f2;
+            font-weight: 600;
+        }}
+        tr:hover {{
+            background-color: #f5f5f5;
+        }}
+        .reload {{
+            display: inline-block;
+            background-color: #0071e3;
+            color: white;
+            padding: 8px 16px;
+            border-radius: 6px;
+            text-decoration: none;
+            margin-top: 10px;
+            transition: background-color 0.2s;
+        }}
+        .reload:hover {{
+            background-color: #0077ed;
+        }}
+        .timestamp {{
+            color: #777;
+            font-size: 14px;
+            margin-bottom: 20px;
+        }}
+        .badge {{
+            display: inline-block;
+            padding: 3px 8px;
+            border-radius: 12px;
+            font-size: 12px;
+            font-weight: 500;
+            margin-left: 8px;
+        }}
+        .badge-success {{
+            background-color: #e3f2fd;
+            color: #0277bd;
+        }}
+        .badge-primary {{
+            background-color: #e8f5e9;
+            color: #2e7d32;
+        }}
+        .auto-refresh {{
+            font-size: 14px;
+            color: #555;
+            margin-top: 5px;
+        }}
+        .chart-container {{
+            height: 200px;
+            margin-top: 15px;
+        }}
+        .highlight {{
+            background-color: #f3f9ff;
+            border-left: 4px solid #0077ed;
+        }}
+    </style>
+    <script>
+        // Auto-refresh the page every 10 seconds
+        setTimeout(function() {{
+            window.location.reload();
+        }}, 10000);
+        
+        // Countdown timer for refresh
+        window.onload = function() {{
+            let timeLeft = 10;
+            const timerElement = document.getElementById('refresh-timer');
+            
+            setInterval(function() {{
+                timeLeft -= 1;
+                if (timeLeft >= 0) {{
+                    timerElement.textContent = timeLeft;
+                }}
+            }}, 1000);
+        }};
+    </script>
+</head>
+<body>
+    <div class="container">
+        <h1>Claude API Dashboard</h1>
+        <div class="timestamp">
+            Last updated: {datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+            <span class="auto-refresh">(Auto-refreshes in <span id="refresh-timer">10</span>s)</span>
+        </div>
+
+        <div class="stats-grid">
+            <div class="card">
+                <h2>Server Status</h2>
+                <div class="metric">
+                    <div class="metric-name">Uptime</div>
+                    <div class="metric-value">{metrics_data['uptime']['formatted']}</div>
+                </div>
+                <div class="metric">
+                    <div class="metric-name">Server Started</div>
+                    <div class="metric-value" style="font-size: 16px;">{metrics_data['uptime']['start_time'].replace('T', ' ').split('.')[0]}</div>
+                </div>
+            </div>
+
+            <div class="card highlight">
+                <h2>Claude Invocations</h2>
+                <div class="metric">
+                    <div class="metric-name">Total Claude Processes</div>
+                    <div class="metric-value">{metrics_data['claude_invocations']['total']}</div>
+                </div>
+                <div class="metric">
+                    <div class="metric-name">Currently Running</div>
+                    <div class="metric-value">{metrics_data['claude_invocations']['current_running']}</div>
+                </div>
+                <div class="metric">
+                    <div class="metric-name">Max Concurrent</div>
+                    <div class="metric-value">{metrics_data['claude_invocations']['max_concurrent']}</div>
+                </div>
+            </div>
+
+            <div class="card">
+                <h2>Claude Usage</h2>
+                <div class="metric">
+                    <div class="metric-name">Invocations Per Minute</div>
+                    <div class="metric-value">{metrics_data['claude_invocations']['per_minute']:.2f}</div>
+                </div>
+                <div class="metric">
+                    <div class="metric-name">Invocations Per Hour</div>
+                    <div class="metric-value">{metrics_data['claude_invocations']['per_hour']:.2f}</div>
+                </div>
+                <div class="metric">
+                    <div class="metric-name">Total Output Tokens</div>
+                    <div class="metric-value">{metrics_data['tokens']['total_completion']}</div>
+                </div>
+            </div>
+
+            <div class="card highlight">
+                <h2>Performance</h2>
+                <div class="metric">
+                    <div class="metric-name">Average Execution Time</div>
+                    <div class="metric-value">{avg_execution} <span class="metric-unit">ms</span></div>
+                </div>
+                <div class="metric">
+                    <div class="metric-name">Median Execution Time</div>
+                    <div class="metric-value">{median_execution} <span class="metric-unit">ms</span></div>
+                </div>
+            </div>
+
+            <div class="card">
+                <h2>System Resources</h2>
+                <div class="metric">
+                    <div class="metric-name">Average Memory</div>
+                    <div class="metric-value">{avg_memory} <span class="metric-unit">MB</span></div>
+                </div>
+                <div class="metric">
+                    <div class="metric-name">Peak Memory</div>
+                    <div class="metric-value">{peak_memory} <span class="metric-unit">MB</span></div>
+                </div>
+                <div class="metric">
+                    <div class="metric-name">Average CPU</div>
+                    <div class="metric-value">{avg_cpu}</div>
+                </div>
+            </div>
+
+            <div class="card">
+                <h2>Conversations</h2>
+                <div class="metric">
+                    <div class="metric-name">Unique Conversations</div>
+                    <div class="metric-value">{metrics_data['conversations']['unique_count']}</div>
+                </div>
+                <div class="metric">
+                    <div class="metric-name">Active Conversations</div>
+                    <div class="metric-value">{metrics_data['conversations']['active_count']}</div>
+                </div>
+            </div>
+        </div>
+
+        <div class="card">
+            <h2>Timeline</h2>
+            <table>
+                <tr>
+                    <th>Event</th>
+                    <th>Timestamp</th>
+                </tr>
+                <tr>
+                    <td>First Claude Invocation</td>
+                    <td>{metrics_data['timestamps']['first_invocation'].replace('T', ' ').split('.')[0] if metrics_data['timestamps']['first_invocation'] else 'N/A'}</td>
+                </tr>
+                <tr>
+                    <td>Last Claude Invocation</td>
+                    <td>{metrics_data['timestamps']['last_invocation'].replace('T', ' ').split('.')[0] if metrics_data['timestamps']['last_invocation'] else 'N/A'}</td>
+                </tr>
+                <tr>
+                    <td>Last Claude Completion</td>
+                    <td>{metrics_data['timestamps']['last_completion'].replace('T', ' ').split('.')[0] if metrics_data['timestamps']['last_completion'] else 'N/A'}</td>
+                </tr>
+            </table>
+        </div>
+
+        <div class="card">
+            <h2>Invocations by Model</h2>
+            <table>
+                <tr>
+                    <th>Model</th>
+                    <th>Count</th>
+                </tr>
+                {''.join([f"<tr><td>{model}</td><td>{count}</td></tr>" for model, count in metrics_data['distribution']['by_model'].items()])}
+            </table>
+        </div>
+
+        <div class="card">
+            <h2>Invocations by Conversation</h2>
+            <table>
+                <tr>
+                    <th>Conversation ID</th>
+                    <th>Count</th>
+                </tr>
+                {''.join([f"<tr><td>{conv_id}</td><td>{count}</td></tr>" for conv_id, count in list(metrics_data['distribution']['by_conversation'].items())[:25]])}
+                {f"<tr><td colspan='2'>...and {len(metrics_data['distribution']['by_conversation']) - 25} more conversations</td></tr>" if len(metrics_data['distribution']['by_conversation']) > 25 else ""}
+            </table>
+        </div>
+
+        {'''
+        <div class="card error-card">
+            <h2>Recent Errors</h2>
+            <div class="metric">
+                <div class="metric-name">Total Errors</div>
+                <div class="metric-value">{metrics_data['errors']['count']}</div>
+            </div>
+            <table>
+                <tr>
+                    <th>Time</th>
+                    <th>Error</th>
+                </tr>
+                {''.join([f"<tr><td>{error['time'].replace('T', ' ').split('.')[0]}</td><td>{error['error']}</td></tr>" for error in metrics_data['errors']['recent']])}
+            </table>
+        </div>
+        ''' if metrics_data['errors']['count'] > 0 else ''}
+    </div>
+</body>
+</html>
+"""
+    return html
+
+@app.get("/", response_class=HTMLResponse)
 async def root():
-    """Root endpoint that mimics Ollama's root response."""
+    """Dashboard endpoint that displays API metrics."""
+    return generate_dashboard_html()
+
+@app.get("/status", response_class=PlainTextResponse)
+async def status():
+    """Simple status endpoint that mimics Ollama's root response."""
     return "Ollama is running"
+
+@app.get("/metrics", response_class=JSONResponse)
+async def get_metrics():
+    """JSON endpoint for metrics data"""
+    return metrics.get_metrics()
 
 if __name__ == "__main__":
     import uvicorn
