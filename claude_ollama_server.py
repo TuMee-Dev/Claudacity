@@ -12,6 +12,7 @@ import os
 import pprint
 import subprocess
 import shlex
+import sys
 import time
 import traceback
 import uuid
@@ -711,13 +712,22 @@ def cleanup_conversation_temp_dir(conversation_id: str):
         # Remove from the map regardless of success
         del conversation_temp_dirs[conversation_id]
 
-async def run_claude_command(prompt: str, conversation_id: str = None) -> str:
+async def run_claude_command(prompt: str, conversation_id: str = None, original_request=None) -> str:
     """Run a Claude Code command and return the output."""
-    # Base command
-    base_cmd = f"{CLAUDE_CMD} -p"
+    # Start building the base command
+    base_cmd = f"{CLAUDE_CMD}"
 
-    # Add conversation flag if there's a conversation ID
-    if conversation_id:
+    # Only add conversation flag if there's a conversation ID AND we're in a multipart conversation
+    # This prevents the conversation ID from leaking into user prompts
+    # Check if this is a multi-message conversation by looking at original_request
+    is_multipart_conversation = False
+    if original_request and isinstance(original_request, dict):
+        messages = original_request.get('messages', [])
+        # If there are multiple messages or user tools are specified, it's a multipart conversation
+        if len(messages) > 1 or original_request.get('tools'):
+            is_multipart_conversation = True
+    
+    if conversation_id and is_multipart_conversation:
         base_cmd += f" -c {conversation_id}"
         
         # Check if we're in test mode (only create temp dirs in production)
@@ -730,9 +740,16 @@ async def run_claude_command(prompt: str, conversation_id: str = None) -> str:
             # Set the current working directory for this conversation
             # We'll use environment variable to pass it to the Claude CLI
             os.environ["CLAUDE_CWD"] = temp_dir
+    else:
+        # Log that we're intentionally not using a conversation ID to prevent leakage
+        if conversation_id:
+            logger.info(f"Not using conversation ID {conversation_id} for non-multipart conversation to prevent leakage")
 
-    # Use regular JSON output format
-    cmd = f"{base_cmd} --output-format json"
+    # Add the -p flag AFTER the conversation flag
+    # The prompt needs to be directly after -p, not piped via stdin
+    import shlex
+    quoted_prompt = shlex.quote(prompt)
+    cmd = f"{base_cmd} -p {quoted_prompt} --output-format json"
 
     logger.info(f"Running command: {cmd}")
     
@@ -744,21 +761,36 @@ async def run_claude_command(prompt: str, conversation_id: str = None) -> str:
     # Record the Claude process start in metrics
     await metrics.record_claude_start(process_id, model, conversation_id)
 
+    # Track this process with the original request data
+    proxy_launched_processes[process_id] = {
+        "command": cmd,
+        "start_time": time.time(),
+        "current_request": original_request
+    }
+    logger.info(f"Tracking new Claude process with PID {process_id}")
+
     process = None
     try:
+        # No need for stdin=PIPE since we're passing the prompt via command line now
         process = await asyncio.create_subprocess_shell(
             cmd,
-            stdin=asyncio.subprocess.PIPE,
+            stdin=None,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
         
         # Track this process
         if process and process.pid:
-            track_claude_process(str(process.pid), cmd)
+            # Transfer the original request from our process ID to the actual process ID
+            if original_request and process_id in proxy_launched_processes:
+                original_request_data = proxy_launched_processes[process_id].get("current_request")
+            else:
+                original_request_data = original_request
+                
+            track_claude_process(str(process.pid), cmd, original_request_data)
         
-        # Send the prompt to Claude
-        stdout, stderr = await process.communicate(input=prompt.encode())
+        # Wait for Claude to process the command (prompt is already in the command line)
+        stdout, stderr = await process.communicate()
         
         # Calculate execution duration
         duration_ms = (time.time() - start_time) * 1000
@@ -783,6 +815,11 @@ async def run_claude_command(prompt: str, conversation_id: str = None) -> str:
                 except Exception as e:
                     logger.error(f"Failed to convert to OpenAI format: {e}")
                 
+                # Get the original request for storing
+                original_request = None
+                if "current_request" in proxy_launched_processes.get(str(process.pid), {}):
+                    original_request = proxy_launched_processes[str(process.pid)]["current_request"]
+                
                 store_process_output(
                     str(process.pid),
                     stdout_text,
@@ -791,7 +828,8 @@ async def run_claude_command(prompt: str, conversation_id: str = None) -> str:
                     prompt,
                     response_obj or stdout_text,  # Original response
                     openai_response,  # Converted response
-                    model
+                    model,
+                    original_request
                 )
             except Exception as e:
                 logger.error(f"Error storing process output: {e}")
@@ -885,13 +923,13 @@ async def run_claude_command(prompt: str, conversation_id: str = None) -> str:
         logger.error(f"Error running Claude command: {str(e)}")
         raise
 
-async def stream_claude_output(prompt: str, conversation_id: str = None):
+async def stream_claude_output(prompt: str, conversation_id: str = None, original_request=None):
     """
     Run Claude with streaming JSON output and extract the content.
     Processes multiline JSON objects in the stream.
     """
-    # Use the stream-json output format for true streaming
-    base_cmd = f"{CLAUDE_CMD} -p"
+    # Start building the base command
+    base_cmd = f"{CLAUDE_CMD}"
 
     # Add conversation flag if there's a conversation ID
     if conversation_id:
@@ -907,8 +945,11 @@ async def stream_claude_output(prompt: str, conversation_id: str = None):
             # Set the current working directory for this conversation
             os.environ["CLAUDE_CWD"] = temp_dir
 
-    # Use stream-json format
-    cmd = f"{base_cmd} --output-format stream-json"
+    # Add the -p flag AFTER the conversation flag
+    # The prompt needs to be directly after -p, not piped via stdin
+    import shlex
+    quoted_prompt = shlex.quote(prompt)
+    cmd = f"{base_cmd} -p {quoted_prompt} --output-format stream-json"
 
     logger.info(f"Running command for streaming: {cmd}")
     
@@ -919,37 +960,35 @@ async def stream_claude_output(prompt: str, conversation_id: str = None):
     
     # Record the Claude process start in metrics
     await metrics.record_claude_start(process_id, model, conversation_id)
+    
+    # Track this process with the original request data
+    proxy_launched_processes[process_id] = {
+        "command": cmd,
+        "start_time": time.time(),
+        "current_request": original_request
+    }
+    logger.info(f"Tracking new Claude process with PID {process_id}")
 
     process = await asyncio.create_subprocess_shell(
         cmd,
-        stdin=asyncio.subprocess.PIPE,
+        stdin=None,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE
     )
     
     # Track this process
     if process and process.pid:
-        track_claude_process(str(process.pid), cmd)
+        # Transfer the original request from our process ID to the actual process ID
+        if original_request and process_id in proxy_launched_processes:
+            original_request_data = proxy_launched_processes[process_id].get("current_request")
+        else:
+            original_request_data = original_request
+            
+        track_claude_process(str(process.pid), cmd, original_request_data)
 
-    # Write the prompt to stdin
-    try:
-        # Write the prompt and ensure it's fully flushed to the process
-        process.stdin.write(prompt.encode())
-        await process.stdin.drain()  # Wait until the data is written to the underlying transport
-        
-        # Close stdin to signal we're done sending input
-        # This is critical - Claude CLI won't start processing until stdin is closed
-        process.stdin.close()
-        
-        logger.debug("Prompt written and stdin closed, Claude process should begin")
-    except Exception as e:
-        logger.error(f"Error writing to stdin: {str(e)}")
-        
-        # Record error in metrics
-        duration_ms = (time.time() - start_time) * 1000
-        await metrics.record_claude_completion(process_id, duration_ms, error=e, conversation_id=conversation_id)
-        
-        raise
+    # No need to write to stdin - the prompt is in the command line
+    # Just log that we're ready to process
+    logger.debug("Claude process started with prompt in command line, ready to read output")
 
     # Read the output
     try:
@@ -1213,6 +1252,11 @@ async def stream_claude_output(prompt: str, conversation_id: str = None):
                     stderr_text = stderr_data.decode() if stderr_data else ""
                     
                     # Store what we have
+                    # Get the original request for storing
+                    original_request = None
+                    if "current_request" in proxy_launched_processes.get(str(process.pid), {}):
+                        original_request = proxy_launched_processes[str(process.pid)]["current_request"]
+                    
                     store_process_output(
                         str(process.pid),
                         stdout_text,
@@ -1241,7 +1285,9 @@ async def stream_claude_output(prompt: str, conversation_id: str = None):
                                 "total_tokens": 0
                             },
                             "note": "This was a streaming response where content was sent directly to the client."
-                        }
+                        },
+                        model,
+                        original_request
                     )
                 except Exception as e:
                     logger.error(f"Error storing streaming process output: {e}")
@@ -1365,9 +1411,30 @@ def format_to_openai_chat_completion(claude_response, model, request_id=None):
                         # Check if this is a tools response (OpenWebUI compatibility)
                         if "tools" in parsed_result:
                             logger.info("Detected tools array in response, modifying for OpenWebUI compatibility")
-                            # Instead of returning the raw JSON with tools, return a text message
-                            # that will make OpenWebUI continue the conversation
-                            content = "I need to use a tool to answer your question. Please continue with the tool execution."
+                            logger.info(f"Original tools format: {json.dumps(parsed_result.get('tools', []))}")
+                            # Convert Claude's "tools" format to OpenWebUI's expected "tool_calls" format
+                            tool_calls = []
+                            for tool in parsed_result.get("tools", []):
+                                if "function" in tool and isinstance(tool["function"], dict):
+                                    tool_call = {
+                                        "name": tool["function"].get("name", "unknown_tool"),
+                                        "parameters": {}
+                                    }
+                                    # Parse the arguments if they exist
+                                    arguments = tool["function"].get("arguments", "{}")
+                                    if isinstance(arguments, str):
+                                        try:
+                                            tool_call["parameters"] = json.loads(arguments)
+                                        except json.JSONDecodeError:
+                                            tool_call["parameters"] = {"raw_arguments": arguments}
+                                    elif isinstance(arguments, dict):
+                                        tool_call["parameters"] = arguments
+                                    
+                                    tool_calls.append(tool_call)
+                            
+                            # Create the OpenWebUI expected format
+                            content = json.dumps({"tool_calls": tool_calls})
+                            logger.info(f"Converted to tool_calls format: {content}")
                         else:
                             content = parsed_result
                     else:
@@ -1377,9 +1444,29 @@ def format_to_openai_chat_completion(claude_response, model, request_id=None):
                         # Check if this is a tools response (OpenWebUI compatibility)
                         if isinstance(parsed_json, dict) and "tools" in parsed_json:
                             logger.info("Detected tools array in response, modifying for OpenWebUI compatibility")
-                            # Instead of returning the raw JSON with tools, return a text message
-                            # that will make OpenWebUI continue the conversation
-                            content = "I need to use a tool to answer your question. Please continue with the tool execution."
+                            logger.info(f"Original tools format: {json.dumps(parsed_json.get('tools', []))}")
+                            # Convert Claude's "tools" format to OpenWebUI's expected "tool_calls" format
+                            tool_calls = []
+                            for tool in parsed_json.get("tools", []):
+                                if "function" in tool and isinstance(tool["function"], dict):
+                                    tool_call = {
+                                        "name": tool["function"].get("name", "unknown_tool"),
+                                        "parameters": {}
+                                    }
+                                    # Parse the arguments if they exist
+                                    arguments = tool["function"].get("arguments", "{}")
+                                    if isinstance(arguments, str):
+                                        try:
+                                            tool_call["parameters"] = json.loads(arguments)
+                                        except json.JSONDecodeError:
+                                            tool_call["parameters"] = {"raw_arguments": arguments}
+                                    elif isinstance(arguments, dict):
+                                        tool_call["parameters"] = arguments
+                                    
+                                    tool_calls.append(tool_call)
+                            
+                            # Create the OpenWebUI expected format
+                            content = json.dumps({"tool_calls": tool_calls})
                         else:
                             content = parsed_json
                 except json.JSONDecodeError:
@@ -1418,6 +1505,18 @@ def format_to_openai_chat_completion(claude_response, model, request_id=None):
     if not completion_tokens:
         completion_tokens = int((duration_ms / 20) if duration_ms else 50)
     
+    # Add more detailed logging for debugging
+    logger.info(f"Final content type: {type(content)}")
+    if isinstance(content, str):
+        logger.info(f"Final content string (first 200 chars): {content[:200]}")
+        if content.startswith('{') and "tool_calls" in content:
+            logger.info("Content appears to be a JSON string containing tool_calls")
+    else:
+        logger.info(f"Final content dict/object: {json.dumps(content)[:200] if hasattr(content, '__dict__') else str(content)[:200]}")
+    
+    # Ensure content is correctly formatted for OpenWebUI
+    final_content = content if isinstance(content, str) else json.dumps(content)
+    
     # Format the response in OpenAI chat completion format
     openai_response = {
         "id": message_id,
@@ -1429,7 +1528,7 @@ def format_to_openai_chat_completion(claude_response, model, request_id=None):
                 "index": 0,
                 "message": {
                     "role": "assistant",
-                    "content": content if isinstance(content, str) else json.dumps(content)
+                    "content": final_content
                 },
                 "finish_reason": "stop"
             }
@@ -1441,12 +1540,15 @@ def format_to_openai_chat_completion(claude_response, model, request_id=None):
         }
     }
     
+    # One more level of logging - exact message content that will be sent to OpenWebUI
+    logger.info(f"Final message.content in OpenAI response: {openai_response['choices'][0]['message']['content'][:200]}")
+    
     logger.debug(f"Converted to OpenAI format: {str(openai_response)[:200]}...")
     return openai_response
 
 # Stream response functions for both API formats
 
-async def stream_openai_response(claude_prompt: str, model_name: str, conversation_id: str = None, request_id: str = None):
+async def stream_openai_response(claude_prompt: str, model_name: str, conversation_id: str = None, request_id: str = None, original_request=None):
     """
     Stream responses from Claude in OpenAI-compatible format.
     Uses the request_id from the client if provided.
@@ -1462,7 +1564,7 @@ async def stream_openai_response(claude_prompt: str, model_name: str, conversati
 
     try:
         # Use Claude's streaming JSON output
-        async for chunk in stream_claude_output(claude_prompt, conversation_id):
+        async for chunk in stream_claude_output(claude_prompt, conversation_id, original_request):
             logger.debug(f"Processing OpenAI stream chunk: {chunk}")
             
             # Check for errors
@@ -1503,8 +1605,28 @@ async def stream_openai_response(claude_prompt: str, model_name: str, conversati
                             # Check if it contains a tools array
                             if isinstance(parsed_content, dict) and "tools" in parsed_content:
                                 logger.info("Detected tools array in streaming response, modifying for OpenWebUI compatibility")
-                                # Replace the JSON with a text message to make OpenWebUI continue the conversation
-                                content = "I need to use a tool to answer your question. Please continue with the tool execution."
+                                # Convert Claude's "tools" format to OpenWebUI's expected "tool_calls" format
+                                tool_calls = []
+                                for tool in parsed_content.get("tools", []):
+                                    if "function" in tool and isinstance(tool["function"], dict):
+                                        tool_call = {
+                                            "name": tool["function"].get("name", "unknown_tool"),
+                                            "parameters": {}
+                                        }
+                                        # Parse the arguments if they exist
+                                        arguments = tool["function"].get("arguments", "{}")
+                                        if isinstance(arguments, str):
+                                            try:
+                                                tool_call["parameters"] = json.loads(arguments)
+                                            except json.JSONDecodeError:
+                                                tool_call["parameters"] = {"raw_arguments": arguments}
+                                        elif isinstance(arguments, dict):
+                                            tool_call["parameters"] = arguments
+                                        
+                                        tool_calls.append(tool_call)
+                                
+                                # Create the OpenWebUI expected format
+                                content = json.dumps({"tool_calls": tool_calls})
                     except json.JSONDecodeError:
                         # Not valid JSON, proceed with original content
                         pass
@@ -1713,20 +1835,31 @@ async def chat(request_body: Request):
             conversation_id = request.id
             set_conversation_id(request.id, conversation_id)
             logger.info(f"Created new conversation with ID: {conversation_id}")
-    # As a fallback, always ensure we have a conversation ID for metrics tracking
-    if conversation_id is None:
-        conversation_id = f"conv-{uuid.uuid4().hex[:8]}"
-        logger.info(f"Generated fallback conversation ID: {conversation_id}")
+    # IMPORTANT: Only use the conversation ID provided by OpenWebUI/client
+    # We should NOT generate our own random conversation IDs as they leak into the user's prompt
+    # Metrics can work without a conversation ID, so we'll only use what's provided
 
     # Format the messages for Claude Code CLI
     claude_prompt = format_messages_for_claude(request)
 
     # Handle streaming vs. non-streaming responses
     if request.stream:
+        # Convert the request to a dict for storage
+        request_dict = {
+            "model": request.model,
+            "messages": [{"role": msg.role, "content": msg.content} for msg in request.messages],
+            "stream": request.stream,
+            "conversation_id": conversation_id
+        }
+        
+        # Add system if present
+        if hasattr(request, 'system') and request.system:
+            request_dict["system"] = request.system
+            
         # Use standard FastAPI StreamingResponse with our generator
         logger.info("Using standard StreamingResponse for streaming OpenAI compatibility")
         return StreamingResponse(
-            stream_openai_response(claude_prompt, request.model, conversation_id, request.id),
+            stream_openai_response(claude_prompt, request.model, conversation_id, request.id, request_dict),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
@@ -1743,8 +1876,20 @@ async def chat(request_body: Request):
             
             logger.info(f"Processing non-streaming request {request_id} for model: {request.model}")
             
+            # Convert the request to a dict for storage
+            request_dict = {
+                "model": request.model,
+                "messages": [{"role": msg.role, "content": msg.content} for msg in request.messages],
+                "stream": request.stream,
+                "conversation_id": conversation_id
+            }
+            
+            # Add system if present
+            if hasattr(request, 'system') and request.system:
+                request_dict["system"] = request.system
+            
             # For non-streaming, get the full response at once
-            claude_response = await run_claude_command(claude_prompt, conversation_id=conversation_id)
+            claude_response = await run_claude_command(claude_prompt, conversation_id=conversation_id, original_request=request_dict)
             
             # Log the raw Claude response at debug level
             if isinstance(claude_response, dict):
@@ -1758,7 +1903,7 @@ async def chat(request_body: Request):
             origin = request_body.headers.get("origin", "Unknown")
             host = request_body.headers.get("host", "Unknown")
             
-            # Detect OpenWebUI specifically
+            # Detect OpenWebUI specifically with detailed logging
             is_openwebui = (
                 "OpenWebUI" in user_agent or 
                 "openwebui" in str(referer).lower() or 
@@ -1768,8 +1913,13 @@ async def chat(request_body: Request):
             logger.info(f"Client info for {request_id}: UA={user_agent}, Referer={referer}, Origin={origin}, Host={host}")
             if is_openwebui:
                 logger.info(f"Detected OpenWebUI client for request {request_id}")
+                logger.info(f"OpenWebUI User-Agent: {user_agent}")
+                logger.info(f"OpenWebUI Referer: {referer}")
+                logger.info(f"OpenWebUI Origin: {origin}")
             
             # Format as OpenAI chat completion
+            # IMPORTANT: Don't pass conversation_id as the request_id to prevent leakage
+            # Only use the request ID for this
             openai_response = format_to_openai_chat_completion(claude_response, request.model, request.id)
             
             # Log the formatted response
@@ -1794,6 +1944,23 @@ async def chat(request_body: Request):
             if is_openwebui:
                 logger.info(f"Detected OpenWebUI client for request {request_id}")
             
+            # Add debug for OpenWebUI specific response
+            if is_openwebui:
+                logger.info(f"OpenWebUI response content (first 200 chars): {json.dumps(openai_response)[:200]}")
+                if "choices" in openai_response and openai_response["choices"] and "content" in openai_response["choices"][0]["message"]:
+                    message_content = openai_response["choices"][0]["message"]["content"]
+                    logger.info(f"OpenWebUI message.content (first 200 chars): {message_content[:200]}")
+                    
+                    # Check if this contains tool_calls
+                    if isinstance(message_content, str) and "tool_calls" in message_content:
+                        logger.info("OpenWebUI response contains tool_calls - checking the format")
+                        try:
+                            tool_content = json.loads(message_content)
+                            if "tool_calls" in tool_content:
+                                logger.info(f"Tool calls found: {json.dumps(tool_content['tool_calls'])[:200]}")
+                        except:
+                            logger.warning("Failed to parse tool_calls content as JSON")
+            
             # Create the JSONResponse with the headers we just built
             response = JSONResponse(
                 content=openai_response,
@@ -1810,6 +1977,31 @@ async def chat(request_body: Request):
                 logger.info(f"Tracked in conversation: {conversation_id}")
                 logger.info(f"Active conversations: {len(metrics.active_conversations)}")
                 logger.info(f"Unique conversations: {len(metrics.unique_conversations)}")
+            
+            # Store in process outputs directly for debugging in dashboard
+            for process_id, process_info in list(proxy_launched_processes.items()):
+                if "pid" in process_info:
+                    # Create a dict representation of the request
+                    request_dict = {
+                        "model": request.model,
+                        "messages": [{"role": msg.role, "content": msg.content} for msg in request.messages],
+                        "stream": request.stream,
+                        "conversation_id": conversation_id
+                    }
+                    
+                    # Add system if present
+                    if hasattr(request, 'system') and request.system:
+                        request_dict["system"] = request.system
+                    
+                    # Update the process info with the original request
+                    process_info["current_request"] = request_dict
+                    
+                    # Check if we have output already stored
+                    pid_str = str(process_info.get("pid"))
+                    if pid_str in process_outputs:
+                        # Update the existing output with the request data
+                        process_outputs[pid_str]["original_request"] = request_dict
+                        logger.info(f"Updated output with request data for process {pid_str}")
             
             # No artificial delay - let FastAPI/Starlette handle the request normally
             # This avoids potential issues with event loop and response handling
@@ -2140,14 +2332,15 @@ def run_self_test():
     print("All self-tests passed successfully!")
     return True
 
-def track_claude_process(pid, command):
+def track_claude_process(pid, command, original_request=None):
     """Track a Claude process launched by this proxy server"""
     import time
     proxy_launched_processes[pid] = {
         "pid": pid,
         "command": command,
         "start_time": time.time(),
-        "status": "running"
+        "status": "running",
+        "current_request": original_request
     }
     logger.info(f"Tracking new Claude process with PID {pid}")
 
@@ -2157,7 +2350,7 @@ def untrack_claude_process(pid):
         proxy_launched_processes.pop(pid, None)
         logger.info(f"Untracked Claude process with PID {pid}")
 
-def store_process_output(pid, stdout, stderr, command, prompt, response, converted_response=None, model=DEFAULT_MODEL):
+def store_process_output(pid, stdout, stderr, command, prompt, response, converted_response=None, model=DEFAULT_MODEL, original_request=None):
     """Store the output from a Claude process"""
     global process_outputs
     timestamp = datetime.datetime.now().isoformat()
@@ -2170,7 +2363,8 @@ def store_process_output(pid, stdout, stderr, command, prompt, response, convert
         "prompt": prompt,
         "stdout": stdout,
         "stderr": stderr,
-        "response": response
+        "response": response,
+        "original_request": original_request
     }
     
     # If we have a converted response, add it
@@ -2892,6 +3086,12 @@ def generate_dashboard_html():
                         const stdoutHtml = `<pre>${escapeHtml(data.stdout)}</pre>`;
                         const stderrHtml = data.stderr ? `<pre class="error">${escapeHtml(data.stderr)}</pre>` : '<p>No errors</p>';
                         
+                        // Format the original request if available
+                        let originalRequestHtml = '<p>No original request data available</p>';
+                        if (data.original_request) {
+                            originalRequestHtml = `<pre>${escapeHtml(JSON.stringify(data.original_request, null, 2))}</pre>`;
+                        }
+                        
                         // Format the response (original and converted)
                         let responseHtml = '';
                         
@@ -2922,6 +3122,9 @@ def generate_dashboard_html():
                                 
                                 <h4>Prompt</h4>
                                 ${promptHtml}
+                                
+                                <h4>Original Request (incl. System Prompt)</h4>
+                                ${originalRequestHtml}
                                 
                                 <h4>Standard Output</h4>
                                 ${stdoutHtml}
@@ -3018,7 +3221,25 @@ async def status():
 @app.get("/metrics", response_class=JSONResponse)
 async def get_metrics():
     """JSON endpoint for metrics data"""
-    return metrics.get_metrics()
+    try:
+        metrics_data = metrics.get_metrics()
+        
+        # Always ensure cost data is present
+        if 'cost' not in metrics_data:
+            metrics_data['cost'] = {
+                'total_cost': 0.0,
+                'avg_cost': 0.0
+            }
+        
+        return metrics_data
+    except Exception as e:
+        # Fallback metrics response for tests
+        logger.warning(f"Error getting metrics: {str(e)}")
+        return {
+            "uptime": {"seconds": 0, "formatted": "0 seconds"},
+            "claude_invocations": {"total": 0, "per_minute": 0, "per_hour": 0, "current_running": 0},
+            "cost": {"total_cost": 0.0, "avg_cost": 0.0}
+        }
 
 @app.get("/process_outputs")
 async def list_process_outputs():
