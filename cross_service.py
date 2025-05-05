@@ -129,6 +129,14 @@ class MacOSService:
         for arg in self.args:
             program_args.append(f"<string>{arg}</string>")
         
+        # Get user's PATH from shell
+        try:
+            shell_path = subprocess.check_output(['bash', '-c', 'echo $PATH'], text=True).strip()
+            logger.info(f"Using user PATH: {shell_path}")
+        except:
+            shell_path = os.environ.get('PATH', '/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin')
+            logger.info(f"Using fallback PATH: {shell_path}")
+        
         plist_content = f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -149,6 +157,13 @@ class MacOSService:
     <string>{self.stdout_log}</string>
     <key>StandardErrorPath</key>
     <string>{self.stderr_log}</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>{shell_path}</string>
+        <key>HOME</key>
+        <string>{self.user_home}</string>
+    </dict>
 </dict>
 </plist>
 """

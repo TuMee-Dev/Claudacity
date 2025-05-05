@@ -123,7 +123,45 @@ def get_iso_timestamp():
 
 # Command to interact with Claude Code CLI
 
-CLAUDE_CMD = "claude"  # Assumes claude is in PATH
+# Try to find claude executable
+def find_claude_command():
+    """Find the claude command executable path"""
+    try:
+        # First try the simple case - claude in PATH
+        if subprocess.run(['which', 'claude'], capture_output=True, text=True, check=False).returncode == 0:
+            return "claude"
+        
+        # Next, try common installation locations
+        common_paths = [
+            "/opt/homebrew/bin/claude",
+            "/usr/local/bin/claude",
+            os.path.expanduser("~/.local/bin/claude")
+        ]
+        
+        for path in common_paths:
+            if os.path.exists(path) and os.access(path, os.X_OK):
+                logger.info(f"Found claude at: {path}")
+                return path
+        
+        # Last resort: try to run command discovery via shell
+        try:
+            result = subprocess.run(['bash', '-c', 'which claude'], 
+                                   capture_output=True, text=True, check=False)
+            if result.returncode == 0 and result.stdout.strip():
+                path = result.stdout.strip()
+                logger.info(f"Found claude via shell at: {path}")
+                return path
+        except:
+            pass
+            
+        # If we're here, we couldn't find claude
+        logger.warning("Could not find claude command. Default to 'claude' and hope for the best.")
+        return "claude"
+    except Exception as e:
+        logger.error(f"Error finding claude command: {e}")
+        return "claude"  # Fallback to simple command name
+
+CLAUDE_CMD = find_claude_command()
 
 # Conversation management functions
 
