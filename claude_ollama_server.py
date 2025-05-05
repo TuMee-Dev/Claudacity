@@ -136,8 +136,18 @@ class ClaudeMetrics:
         
         # Update conversation metrics
         if conversation_id:
+            # Ensure we have the tracking dictionary
+            if not hasattr(self, 'conversation_last_seen'):
+                self.conversation_last_seen = {}
+                
+            # Add to sets for tracking
             self.unique_conversations.add(conversation_id)
             self.active_conversations.add(conversation_id)
+            
+            # Update conversation activity timestamp
+            self.conversation_last_seen[conversation_id] = now
+            
+            # Increment counter
             self.invocations_by_conversation[conversation_id] += 1
         
         # Update resource usage metrics if available
@@ -158,7 +168,7 @@ class ClaudeMetrics:
             if self.current_processes > self.max_concurrent_processes:
                 self.max_concurrent_processes = self.current_processes
     
-    async def record_claude_completion(self, process_id, duration_ms, output_tokens=None, memory_mb=None, error=None):
+    async def record_claude_completion(self, process_id, duration_ms, output_tokens=None, memory_mb=None, error=None, conversation_id=None):
         """Record completion of a Claude CLI process"""
         now = datetime.datetime.now()
         self.last_completion_time = now.isoformat()
@@ -191,22 +201,82 @@ class ClaudeMetrics:
         else:
             if self.current_processes > 0:
                 self.current_processes -= 1
+        
+        # Update conversation activity timestamp if provided
+        if conversation_id:
+            # Ensure we have the tracking dictionary
+            if not hasattr(self, 'conversation_last_seen'):
+                self.conversation_last_seen = {}
+                
+            # Update activity timestamp
+            self.conversation_last_seen[conversation_id] = now
+            
+        # Note: We don't remove from active_conversations here because
+        # a conversation can have multiple processes. Instead, we have
+        # a separate pruning mechanism that removes old conversations.
     
     def prune_old_data(self):
-        """Remove old data from time-based metrics"""
+        """Remove old data from time-based metrics to prevent memory leaks"""
         now = datetime.datetime.now()
         
-        # Remove old conversation data (older than 1 hour)
+        # Track conversation last activity times in a separate dictionary
+        # We'll use this if we don't already have a tracking mechanism
+        if not hasattr(self, 'conversation_last_seen'):
+            self.conversation_last_seen = {}
+            # Initialize with current conversations
+            for conv_id in self.active_conversations:
+                self.conversation_last_seen[conv_id] = now
+        
+        # Update timestamps for all active conversations
+        for conv_id in list(self.active_conversations):
+            self.conversation_last_seen[conv_id] = now
+            
+        # Remove conversations inactive for more than 1 hour
         one_hour_ago = now - datetime.timedelta(hours=1)
         
-        # Prune old active conversations
-        old_conversation_ids = set()
-        for conversation_id in self.active_conversations:
-            # In a real implementation, we would have per-conversation timestamp tracking
-            old_conversation_ids.add(conversation_id)
+        # Find conversations to remove
+        inactive_conversations = []
+        for conv_id, last_seen in self.conversation_last_seen.items():
+            # Check if it's older than our retention period
+            if isinstance(last_seen, datetime.datetime) and last_seen < one_hour_ago:
+                inactive_conversations.append(conv_id)
         
-        for conversation_id in old_conversation_ids:
-            self.active_conversations.discard(conversation_id)
+        # Clean up old conversations
+        for conv_id in inactive_conversations:
+            # Remove from active set
+            self.active_conversations.discard(conv_id)
+            # Remove from tracking
+            self.conversation_last_seen.pop(conv_id, None)
+            
+        # Also clean up old invocation tracking data to prevent memory leaks
+        # Only keep data from the last day
+        cutoff_date = now - datetime.timedelta(days=1)
+        date_cutoff = cutoff_date.strftime("%Y-%m-%d")
+        
+        # Clean up by-minute metrics (keep last 2 hours)
+        two_hours_ago = now - datetime.timedelta(hours=2)
+        minute_cutoff = two_hours_ago.strftime("%Y-%m-%d %H:%M")
+        
+        # Clean up data by removing old keys
+        for minute_key in list(self.invocations_by_minute.keys()):
+            if minute_key < minute_cutoff:
+                del self.invocations_by_minute[minute_key]
+                
+        # Clean up by-hour metrics (keep last day)
+        hour_cutoff = cutoff_date.strftime("%Y-%m-%d %H")
+        for hour_key in list(self.invocations_by_hour.keys()):
+            if hour_key < hour_cutoff:
+                del self.invocations_by_hour[hour_key]
+                
+        # Clean up by-day metrics (keep last month)
+        month_ago = now - datetime.timedelta(days=30)
+        day_cutoff = month_ago.strftime("%Y-%m-%d")
+        for day_key in list(self.invocations_by_day.keys()):
+            if day_key < day_cutoff:
+                del self.invocations_by_day[day_key]
+                
+        # Log cleanup metrics
+        logger.debug(f"Pruned {len(inactive_conversations)} inactive conversations, {len(self.active_conversations)} remain active")
     
     def get_avg_execution_time(self):
         """Get the average execution time in milliseconds"""
@@ -353,6 +423,26 @@ app = FastAPI(
     description="OpenAI-compatible API server for Claude Code",
     version="0.1.0",
 )
+
+# Background task for cleanup
+@app.on_event("startup")
+async def startup_event():
+    """Run background tasks when the server starts."""
+    # Start background cleanup task
+    asyncio.create_task(periodic_cleanup())
+
+async def periodic_cleanup():
+    """Periodically clean up old data to prevent memory leaks."""
+    while True:
+        try:
+            # Clean up every 5 minutes
+            await asyncio.sleep(5 * 60)  # 5 minutes
+            metrics.prune_old_data()
+            logger.debug("Performed periodic cleanup of old metrics data")
+        except Exception as e:
+            logger.error(f"Error in periodic cleanup: {e}")
+            # Don't let the background task die
+            await asyncio.sleep(60)
 
 # Add CORS middleware to allow requests from any origin
 # This is critical for working with web-based clients like OpenWebUI
@@ -649,7 +739,7 @@ async def run_claude_command(prompt: str, conversation_id: str = None) -> str:
             logger.error(f"Claude command failed: {error_msg}")
             
             # Record completion with error
-            await metrics.record_claude_completion(process_id, duration_ms, error=error_msg)
+            await metrics.record_claude_completion(process_id, duration_ms, error=error_msg, conversation_id=conversation_id)
             
             raise Exception(f"Claude command failed: {error_msg}")
         
@@ -674,7 +764,7 @@ async def run_claude_command(prompt: str, conversation_id: str = None) -> str:
                 result = response["result"]
                 
                 # Record completion metrics
-                await metrics.record_claude_completion(process_id, response_duration_ms, output_tokens)
+                await metrics.record_claude_completion(process_id, response_duration_ms, output_tokens, conversation_id=conversation_id)
                 
                 # Try to parse as JSON if it looks like JSON
                 try:
@@ -705,7 +795,7 @@ async def run_claude_command(prompt: str, conversation_id: str = None) -> str:
                 }
             
             # Record completion metrics using our calculated duration
-            await metrics.record_claude_completion(process_id, duration_ms, output_tokens)
+            await metrics.record_claude_completion(process_id, duration_ms, output_tokens, conversation_id=conversation_id)
             
             # Return the response as-is if it doesn't match expected format
             return response
@@ -714,14 +804,14 @@ async def run_claude_command(prompt: str, conversation_id: str = None) -> str:
             logger.warning("Failed to parse JSON response, returning raw output")
             
             # Record completion metrics
-            await metrics.record_claude_completion(process_id, duration_ms)
+            await metrics.record_claude_completion(process_id, duration_ms, conversation_id=conversation_id)
             
             return output
             
     except Exception as e:
         # Record error in metrics
         duration_ms = (time.time() - start_time) * 1000
-        await metrics.record_claude_completion(process_id, duration_ms, error=e)
+        await metrics.record_claude_completion(process_id, duration_ms, error=e, conversation_id=conversation_id)
         
         # Untrack the process if it's still tracked
         if process and process.pid:
@@ -782,7 +872,7 @@ async def stream_claude_output(prompt: str, conversation_id: str = None):
         
         # Record error in metrics
         duration_ms = (time.time() - start_time) * 1000
-        await metrics.record_claude_completion(process_id, duration_ms, error=e)
+        await metrics.record_claude_completion(process_id, duration_ms, error=e, conversation_id=conversation_id)
         
         raise
 
@@ -845,7 +935,8 @@ async def stream_claude_output(prompt: str, conversation_id: str = None):
                                     await metrics.record_claude_completion(
                                         process_id, 
                                         duration_ms, 
-                                        output_tokens=int(output_tokens)
+                                        output_tokens=int(output_tokens),
+                                        conversation_id=conversation_id
                                     )
                                     
                                     # Immediately send completion signal
@@ -865,7 +956,8 @@ async def stream_claude_output(prompt: str, conversation_id: str = None):
                                         await metrics.record_claude_completion(
                                             process_id, 
                                             duration_ms, 
-                                            output_tokens=int(output_tokens)
+                                            output_tokens=int(output_tokens),
+                                            conversation_id=conversation_id
                                         )
                                         
                                         # Immediately send completion signal
@@ -945,7 +1037,7 @@ async def stream_claude_output(prompt: str, conversation_id: str = None):
                 
                 # Record error in metrics
                 duration_ms = (time.time() - start_time) * 1000
-                await metrics.record_claude_completion(process_id, duration_ms, error=stderr_str)
+                await metrics.record_claude_completion(process_id, duration_ms, error=stderr_str, conversation_id=conversation_id)
                 
                 yield {"error": stderr_str}
                 return
@@ -989,7 +1081,7 @@ async def stream_claude_output(prompt: str, conversation_id: str = None):
         if not streaming_complete:
             logger.info("No explicit completion signal received, sending completion")
             duration_ms = (time.time() - start_time) * 1000
-            await metrics.record_claude_completion(process_id, duration_ms, output_tokens=int(output_tokens))
+            await metrics.record_claude_completion(process_id, duration_ms, output_tokens=int(output_tokens), conversation_id=conversation_id)
             yield {"done": True}
                 
     except Exception as e:
@@ -997,7 +1089,7 @@ async def stream_claude_output(prompt: str, conversation_id: str = None):
         
         # Record error in metrics
         duration_ms = (time.time() - start_time) * 1000
-        await metrics.record_claude_completion(process_id, duration_ms, error=e)
+        await metrics.record_claude_completion(process_id, duration_ms, error=e, conversation_id=conversation_id)
         
         yield {"error": str(e)}
         
@@ -1181,7 +1273,29 @@ def format_to_openai_chat_completion(claude_response, model, request_id=None):
         # Check for standard Claude system response with result (most common format)
         elif "role" in claude_response and claude_response["role"] == "system" and "result" in claude_response:
             # This is the Claude CLI JSON response format
-            content = claude_response["result"]
+            raw_result = claude_response["result"]
+            
+            # Handle the case where result is a string that looks like a Python dict
+            # (which happens with tool_calls and other structured outputs)
+            if isinstance(raw_result, str) and raw_result.startswith("{") and raw_result.endswith("}"):
+                try:
+                    # Try to parse it properly as JSON if it's a string that looks like JSON
+                    if "'" in raw_result and not '"' in raw_result:
+                        # Convert Python single quotes to JSON double quotes
+                        quoted_result = raw_result.replace("'", '"')
+                        parsed_result = json.loads(quoted_result)
+                        # For structured content like tool_calls, we want to pass it through properly
+                        # rather than as a string representation
+                        content = parsed_result
+                    else:
+                        # Otherwise try to parse as-is
+                        content = json.loads(raw_result)
+                except json.JSONDecodeError:
+                    # If parsing fails, use the raw string
+                    content = raw_result
+                    logger.warning(f"Failed to parse result as JSON: {raw_result[:100]}...")
+            else:
+                content = raw_result
             
             # If cost_usd is available, log it
             if "cost_usd" in claude_response:
@@ -1223,7 +1337,7 @@ def format_to_openai_chat_completion(claude_response, model, request_id=None):
                 "index": 0,
                 "message": {
                     "role": "assistant",
-                    "content": content
+                    "content": content if isinstance(content, str) else json.dumps(content)
                 },
                 "finish_reason": "stop"
             }
@@ -1490,6 +1604,10 @@ async def chat(request_body: Request):
             conversation_id = request.id
             set_conversation_id(request.id, conversation_id)
             logger.info(f"Created new conversation with ID: {conversation_id}")
+    # As a fallback, always ensure we have a conversation ID for metrics tracking
+    if conversation_id is None:
+        conversation_id = f"conv-{uuid.uuid4().hex[:8]}"
+        logger.info(f"Generated fallback conversation ID: {conversation_id}")
 
     # Format the messages for Claude Code CLI
     claude_prompt = format_messages_for_claude(request)
@@ -1577,6 +1695,12 @@ async def chat(request_body: Request):
             # Log the response being returned
             duration_ms = int((time.time() - start_time) * 1000)
             logger.info(f"Returning non-streaming response for {request_id} (duration: {duration_ms}ms)")
+            
+            # Log conversation tracking info
+            if conversation_id:
+                logger.info(f"Tracked in conversation: {conversation_id}")
+                logger.info(f"Active conversations: {len(metrics.active_conversations)}")
+                logger.info(f"Unique conversations: {len(metrics.unique_conversations)}")
             
             # No artificial delay - let FastAPI/Starlette handle the request normally
             # This avoids potential issues with event loop and response handling
@@ -1755,6 +1879,68 @@ proxy_launched_processes = {}
 # Dictionary to store outputs from recent processes (limited to last 20)
 process_outputs = collections.OrderedDict()
 MAX_STORED_OUTPUTS = 20
+
+# Self-test function for basic health checks
+def run_self_test():
+    """Run quick self-tests to verify functionality."""
+    print("Running Claude Ollama API self-tests...")
+    
+    # Test 1: Check metrics initialization
+    print("Test 1: Checking metrics initialization...")
+    try:
+        # Just check if metrics exists and has basic attributes
+        if not hasattr(metrics, 'total_invocations'):
+            print("FAIL: metrics does not have total_invocations attribute")
+            return False
+        if not hasattr(metrics, 'active_conversations'):
+            print("FAIL: metrics does not have active_conversations attribute")
+            return False
+        print("PASS: Metrics initialized correctly")
+    except Exception as e:
+        print(f"FAIL: Error checking metrics: {e}")
+        return False
+    
+    # Test 2: Check dashboard HTML generation
+    print("Test 2: Checking dashboard HTML generation...")
+    try:
+        html = generate_dashboard_html()
+        if not html or not isinstance(html, str):
+            print("FAIL: generate_dashboard_html() did not return a string")
+            return False
+        if not "<!DOCTYPE html>" in html:
+            print("FAIL: Dashboard HTML does not contain DOCTYPE declaration")
+            return False
+        if not "Claude Usage" in html:
+            print("FAIL: Dashboard HTML does not contain 'Claude Usage' section")
+            return False
+        print("PASS: Dashboard HTML generated correctly")
+    except Exception as e:
+        print(f"FAIL: Error generating dashboard HTML: {e}")
+        return False
+    
+    # Test 3: Check conversation ID tracking
+    print("Test 3: Checking conversation ID tracking...")
+    try:
+        test_req_id = "test-request-id"
+        test_conv_id = "test-conv-id"
+        
+        # Store a conversation ID
+        set_conversation_id(test_req_id, test_conv_id)
+        
+        # Retrieve it
+        retrieved_id = get_conversation_id(test_req_id)
+        
+        if retrieved_id != test_conv_id:
+            print(f"FAIL: Retrieved conversation ID '{retrieved_id}' does not match stored ID '{test_conv_id}'")
+            return False
+        
+        print("PASS: Conversation ID tracking works correctly")
+    except Exception as e:
+        print(f"FAIL: Error testing conversation ID tracking: {e}")
+        return False
+    
+    print("All self-tests passed successfully!")
+    return True
 
 def track_claude_process(pid, command):
     """Track a Claude process launched by this proxy server"""
@@ -2719,17 +2905,31 @@ async def terminate_process(pid: str):
 if __name__ == "__main__":
     import uvicorn
     import sys
-
+    import argparse
+    
+    # Parse command-line arguments
+    parser = argparse.ArgumentParser(description="Claude Ollama API Server")
+    parser.add_argument("--test", action="store_true", help="Run self-tests and exit")
+    parser.add_argument("--host", type=str, help="Host to bind to (default: from env var or 0.0.0.0)")
+    parser.add_argument("--port", type=int, help="Port to run on (default: from env var or 22434)")
+    parser.add_argument("port_pos", nargs="?", type=int, help="Port (legacy positional argument)")
+    
+    args = parser.parse_args()
+    
+    # Run self-tests if requested
+    if args.test:
+        print("Running self-tests...")
+        success = run_self_test()
+        sys.exit(0 if success else 1)
+    
     # Setup server config
-    host = os.environ.get("HOST", "0.0.0.0")  # Listen on all network interfaces by default
-
-    # Check if port is provided as command-line argument
-    if len(sys.argv) > 1:
-        try:
-            port = int(sys.argv[1])
-        except ValueError:
-            print(f"Invalid port: {sys.argv[1]}")
-            sys.exit(1)
+    host = args.host or os.environ.get("HOST", "0.0.0.0")
+    
+    # Determine port (positional arg takes precedence, then --port, then env var, then default)
+    if args.port_pos is not None:
+        port = args.port_pos
+    elif args.port is not None:
+        port = args.port
     else:
         port = int(os.environ.get("PORT", 22434))  # Custom port to avoid conflicts with Ollama
 
