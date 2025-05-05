@@ -24,13 +24,15 @@ import httpx
 import asyncio
 import fastapi
 from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
-from fastapi.responses import StreamingResponse, JSONResponse, PlainTextResponse, HTMLResponse
+from fastapi.responses import StreamingResponse, JSONResponse, PlainTextResponse, HTMLResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
+import asyncio
+from starlette.background import BackgroundTask
 
 # Configuration
 
 DEFAULT_MODEL = "claude-3-7-sonnet-latest"  # Default Claude model to report
-DEFAULT_MAX_TOKENS = 128000  # 128k context length
+DEFAULT_MAX_TOKENS = 1000000  # 128k context length
 CONVERSATION_CACHE_TTL = 3600 * 3  # 3 hours in seconds
 METRICS_HISTORY_SIZE = 1000  # Number of requests to keep for metrics calculations
 
@@ -343,6 +345,84 @@ def debug_response(response, prefix=""):
 # Conversation cache to track active conversations
 # Keys are conversation IDs, values are (timestamp, conversation_id) tuples
 conversation_cache = {}
+
+# Custom direct streaming response class that doesn't buffer
+
+class DirectStreamResponse(Response):
+    """
+    Custom response class that writes directly to the connection without buffering.
+    Enables immediate flushing of SSE responses to the client.
+    """
+    def __init__(self, generate_content, media_type="text/event-stream"):
+        super().__init__(background=BackgroundTask(self._cleanup), media_type=media_type)
+        self.generate_content = generate_content
+        self.started = False
+        self.conn_closed = False
+        
+    async def _cleanup(self):
+        """Clean up resources when the connection closes"""
+        self.conn_closed = True
+        
+    async def stream_response(self, scope, receive, send):
+        """Stream the response to the client directly"""
+        await send({
+            "type": "http.response.start",
+            "status": 200,
+            "headers": [
+                [b"content-type", b"text/event-stream"],
+                [b"cache-control", b"no-cache"],
+                [b"connection", b"keep-alive"],
+                [b"transfer-encoding", b"chunked"],
+            ],
+        })
+        
+        self.started = True
+        
+        try:
+            # Get generator for content
+            async for chunk in self.generate_content:
+                if self.conn_closed:
+                    logger.info("Connection closed by client, stopping stream")
+                    break
+                    
+                # Send chunk immediately
+                await send({
+                    "type": "http.response.body",
+                    "body": chunk.encode('utf-8'),
+                    "more_body": True,
+                })
+                # Short pause to allow client processing
+                await asyncio.sleep(0.001)
+                
+            # Send final empty chunk to close the stream
+            await send({
+                "type": "http.response.body",
+                "body": b"",
+                "more_body": False,
+            })
+            
+        except Exception as e:
+            logger.error(f"Error streaming response: {str(e)}", exc_info=True)
+            if not self.started:
+                await send({
+                    "type": "http.response.start",
+                    "status": 500,
+                    "headers": [
+                        [b"content-type", b"text/plain"],
+                    ],
+                })
+            
+            error_msg = f"Error streaming response: {str(e)}"
+            await send({
+                "type": "http.response.body",
+                "body": error_msg.encode("utf-8"),
+                "more_body": False,
+            })
+            
+    def __call__(self, scope, receive, send):
+        """Process the ASGI request"""
+        asyncio.create_task(self.stream_response(scope, receive, send))
+        return self
 
 # Initialize FastAPI app
 
@@ -667,9 +747,15 @@ async def stream_claude_output(prompt: str, conversation_id: str = None):
 
     # Write the prompt to stdin
     try:
+        # Write the prompt and ensure it's fully flushed to the process
         process.stdin.write(prompt.encode())
-        await process.stdin.drain()
+        await process.stdin.drain()  # Wait until the data is written to the underlying transport
+        
+        # Close stdin to signal we're done sending input
+        # This is critical - Claude CLI won't start processing until stdin is closed
         process.stdin.close()
+        
+        logger.debug("Prompt written and stdin closed, Claude process should begin")
     except Exception as e:
         logger.error(f"Error writing to stdin: {str(e)}")
         
@@ -685,75 +771,135 @@ async def stream_claude_output(prompt: str, conversation_id: str = None):
         buffer = ""
         output_tokens = 0
         streaming_complete = False
+        last_chunk_time = time.time()
         
         # Read the output in chunks
         while True:
-            chunk = await process.stdout.read(1024)
-            if not chunk:
-                break
+            try:
+                # Use a timeout to detect stalled output
+                chunk = await asyncio.wait_for(process.stdout.read(1024), timeout=2.0)
+                if not chunk:
+                    # End of stream reached
+                    logger.debug("End of stream reached from Claude CLI")
+                    break
                 
-            buffer += chunk.decode('utf-8')
-            
-            # Try to find and parse complete JSON objects in the buffer
-            # We're looking for matching braces to identify complete objects
-            open_braces = 0
-            start_pos = None
-            
-            for i, char in enumerate(buffer):
-                if char == '{':
-                    if open_braces == 0:
-                        start_pos = i
-                    open_braces += 1
-                elif char == '}':
-                    open_braces -= 1
-                    if open_braces == 0 and start_pos is not None:
-                        # We've found a complete JSON object
-                        json_str = buffer[start_pos:i+1]
-                        try:
-                            json_obj = json.loads(json_str)
-                            logger.debug(f"Parsed complete JSON object: {str(json_obj)[:200]}...")
-                            
-                            # Process the JSON object based on its structure
-                            if "type" in json_obj and json_obj["type"] == "message":
-                                if "content" in json_obj and isinstance(json_obj["content"], list):
-                                    for item in json_obj["content"]:
-                                        if item.get("type") == "text" and "text" in item:
-                                            content = item["text"]
-                                            logger.info(f"Extracted text content: {content[:50]}...")
-                                            output_tokens += len(content.split()) / 0.75  # Rough token count estimate
-                                            yield {"content": content}
-                            elif "stop_reason" in json_obj:
-                                # End of message
-                                streaming_complete = True
-                                yield {"done": True}
-                            # Additional handling for system messages with cost info
-                            elif "role" in json_obj and json_obj["role"] == "system" and "cost_usd" in json_obj:
-                                # This is a system message with cost info - extract execution duration if available
-                                duration_ms = json_obj.get("duration_ms", (time.time() - start_time) * 1000)
-                                streaming_complete = True
+                last_chunk_time = time.time()  # Update last chunk time
+                buffer += chunk.decode('utf-8')
+                
+                # Try to find and parse complete JSON objects in the buffer
+                # We're looking for matching braces to identify complete objects
+                open_braces = 0
+                start_pos = None
+                
+                for i, char in enumerate(buffer):
+                    if char == '{':
+                        if open_braces == 0:
+                            start_pos = i
+                        open_braces += 1
+                    elif char == '}':
+                        open_braces -= 1
+                        if open_braces == 0 and start_pos is not None:
+                            # We've found a complete JSON object
+                            json_str = buffer[start_pos:i+1]
+                            try:
+                                json_obj = json.loads(json_str)
+                                logger.debug(f"Parsed complete JSON object: {str(json_obj)[:200]}...")
                                 
-                                # Record completion in metrics
-                                await metrics.record_claude_completion(
-                                    process_id, 
-                                    duration_ms, 
-                                    output_tokens=int(output_tokens)
-                                )
+                                # Process the JSON object based on its structure
+                                if "type" in json_obj and json_obj["type"] == "message":
+                                    if "content" in json_obj and isinstance(json_obj["content"], list):
+                                        for item in json_obj["content"]:
+                                            if item.get("type") == "text" and "text" in item:
+                                                content = item["text"]
+                                                logger.info(f"Extracted text content: {content[:50]}...")
+                                                output_tokens += len(content.split()) / 0.75  # Rough token count estimate
+                                                yield {"content": content}
+                                elif "stop_reason" in json_obj:
+                                    # End of message - this is an explicit completion signal
+                                    logger.info("Received explicit stop_reason from Claude")
+                                    streaming_complete = True
+                                    
+                                    # Record completion in metrics
+                                    duration_ms = (time.time() - start_time) * 1000
+                                    await metrics.record_claude_completion(
+                                        process_id, 
+                                        duration_ms, 
+                                        output_tokens=int(output_tokens)
+                                    )
+                                    
+                                    # Immediately send completion signal
+                                    yield {"done": True}
+                                    
+                                    # Break out of the main loop after completion
+                                    break
+                                # Additional handling for system messages with cost info
+                                elif "role" in json_obj and json_obj["role"] == "system":
+                                    # This is a system message with additional info
+                                    if "cost_usd" in json_obj or "duration_ms" in json_obj:
+                                        # Extract execution duration if available
+                                        duration_ms = json_obj.get("duration_ms", (time.time() - start_time) * 1000)
+                                        streaming_complete = True
+                                        
+                                        # Record completion in metrics
+                                        await metrics.record_claude_completion(
+                                            process_id, 
+                                            duration_ms, 
+                                            output_tokens=int(output_tokens)
+                                        )
+                                        
+                                        # Immediately send completion signal
+                                        logger.info("Received system message with completion info from Claude")
+                                        yield {"done": True}
+                                        
+                                        # Break out of the main loop after completion
+                                        break
                                 
-                                yield {"done": True}
+                            except json.JSONDecodeError as e:
+                                logger.warning(f"Failed to parse JSON: {e}")
                             
-                        except json.JSONDecodeError as e:
-                            logger.warning(f"Failed to parse JSON: {e}")
+                            # Remove the processed object from the buffer
+                            buffer = buffer[i+1:]
+                            # Reset to scan the buffer from the beginning
+                            break
+                            
+                # Check if we've received a completion signal to break the main loop
+                if streaming_complete:
+                    break
+                
+            except asyncio.TimeoutError:
+                # No data received within timeout - check if process is still running
+                if process.returncode is not None:
+                    logger.info(f"Claude process completed with return code {process.returncode}")
+                    break
+                
+                # Check if we've gone too long without output
+                if time.time() - last_chunk_time > 5.0:
+                    logger.warning("No output from Claude for 5 seconds, checking if process is still active")
+                    
+                    # Try to get process status without killing it
+                    try:
+                        # On Unix systems we can check if the process exists without affecting it
+                        if os.name != 'nt':  # Not Windows
+                            try:
+                                os.kill(process.pid, 0)  # This just checks if the process exists
+                                logger.info(f"Claude process {process.pid} still exists, continuing to wait")
+                            except ProcessLookupError:
+                                logger.info(f"Claude process {process.pid} no longer exists")
+                                break
                         
-                        # Remove the processed object from the buffer
-                        buffer = buffer[i+1:]
-                        # Reset to scan the buffer from the beginning
-                        break
+                        # If we're still waiting, check if it's been too long since the last chunk
+                        if time.time() - last_chunk_time > 15.0:  # 15 seconds total waiting time
+                            logger.warning("No output for 15 seconds, assuming Claude is finished")
+                            break
+                    except Exception as e:
+                        logger.warning(f"Error checking process status: {e}")
+                        # Continue waiting
         
         # If any data remains in the buffer, try to parse it
-        if buffer:
+        if buffer and not streaming_complete:
             try:
                 json_obj = json.loads(buffer)
-                logger.debug(f"Parsed final JSON object: {str(json_obj)[:200]}...")
+                logger.debug(f"Parsed final JSON object from buffer: {str(json_obj)[:200]}...")
                 
                 if "type" in json_obj and json_obj["type"] == "message":
                     if "content" in json_obj and isinstance(json_obj["content"], list):
@@ -781,11 +927,49 @@ async def stream_claude_output(prompt: str, conversation_id: str = None):
                 await metrics.record_claude_completion(process_id, duration_ms, error=stderr_str)
                 
                 yield {"error": stderr_str}
+                return
         
-        # If we didn't see an explicit completion, record it now
+        # Ensure we've read all available output before completing
+        # This is important to prevent any buffered data from being lost
+        try:
+            # Set a short timeout to get any remaining data without blocking too long
+            remaining_output = await asyncio.wait_for(process.stdout.read(), timeout=0.5)
+            if remaining_output:
+                logger.info(f"Found additional {len(remaining_output)} bytes in stdout before completion")
+                buffer = remaining_output.decode('utf-8')
+                
+                # Try to parse any complete JSON objects in the buffer
+                try:
+                    json_obj = json.loads(buffer)
+                    logger.debug(f"Parsed final JSON object: {str(json_obj)[:200]}...")
+                    
+                    # Check for content or completion messages
+                    if ("type" in json_obj and json_obj["type"] == "message" and 
+                        "content" in json_obj and isinstance(json_obj["content"], list)):
+                        for item in json_obj["content"]:
+                            if item.get("type") == "text" and "text" in item:
+                                content = item["text"]
+                                logger.info(f"Extracted final buffered content: {content[:50]}...")
+                                yield {"content": content}
+                    elif "stop_reason" in json_obj:
+                        streaming_complete = True
+                        yield {"done": True}
+                        return
+                except json.JSONDecodeError:
+                    # Not a complete JSON object, see if we can extract any text
+                    logger.warning(f"Final buffer couldn't be parsed as JSON: {buffer[:100]}...")
+                    # Just continue to completion 
+        except asyncio.TimeoutError:
+            logger.debug("No additional output available in stdout buffer")
+        except Exception as e:
+            logger.warning(f"Error reading final output buffer: {e}")
+        
+        # If we didn't see an explicit completion, record it now and send completion
         if not streaming_complete:
+            logger.info("No explicit completion signal received, sending completion")
             duration_ms = (time.time() - start_time) * 1000
             await metrics.record_claude_completion(process_id, duration_ms, output_tokens=int(output_tokens))
+            yield {"done": True}
                 
     except Exception as e:
         logger.error(f"Error processing Claude output stream: {str(e)}", exc_info=True)
@@ -797,17 +981,32 @@ async def stream_claude_output(prompt: str, conversation_id: str = None):
         yield {"error": str(e)}
         
     finally:
-        # Ensure the process is terminated
-        if process and process.returncode is None:
-            try:
-                process.terminate()
-                await asyncio.wait_for(process.wait(), timeout=1.0)
-            except (asyncio.TimeoutError, ProcessLookupError):
-                logger.warning("Had to force kill Claude process")
+        # Wait for process to complete normally if it hasn't already
+        if process:
+            if process.returncode is None:
                 try:
-                    process.kill()
-                except ProcessLookupError:
-                    pass
+                    # First try to wait for graceful completion (may already be done)
+                    logger.debug("Waiting for Claude process to complete...")
+                    await asyncio.wait_for(process.wait(), timeout=1.0)
+                    logger.debug(f"Claude process completed with return code {process.returncode}")
+                except asyncio.TimeoutError:
+                    # If still running, try to terminate gracefully
+                    logger.info("Claude process still running, sending SIGTERM")
+                    try:
+                        process.terminate()
+                        await asyncio.wait_for(process.wait(), timeout=1.0)
+                        logger.debug("Claude process terminated cleanly")
+                    except (asyncio.TimeoutError, ProcessLookupError):
+                        # If still doesn't exit, force kill it
+                        logger.warning("Claude process didn't terminate, forcing kill")
+                        try:
+                            process.kill()
+                            logger.debug("Claude process killed")
+                        except ProcessLookupError:
+                            logger.debug("Claude process already gone")
+                            pass
+            else:
+                logger.debug(f"Claude process already completed with return code {process.returncode}")
 
 # Message formatting functions
 
@@ -961,6 +1160,7 @@ async def stream_openai_response(claude_prompt: str, model_name: str, conversati
     created = int(time.time())
     is_first_chunk = True
     full_response = ""
+    completion_sent = False
 
     try:
         # Use Claude's streaming JSON output
@@ -977,19 +1177,63 @@ async def stream_openai_response(claude_prompt: str, model_name: str, conversati
                         "code": 500
                     }
                 }
+                # Send error response
                 yield f"data: {json.dumps(error_response)}\n\n"
+                # Immediately follow with DONE marker
                 yield "data: [DONE]\n\n"
+                completion_sent = True
                 return
                 
             # Extract content based on chunk format
             content = ""
-            is_final = False
             
             if "content" in chunk:
                 content = chunk["content"]
+                
+                # Skip empty content
+                if not content:
+                    continue
+                    
+                # Accumulate full response for logging
+                full_response += content
+                
+                # For the first real content, log it specially
+                if content and is_first_chunk:
+                    logger.info(f"First OpenAI content chunk received: {content[:50]}...")
+                    
+                # Format in OpenAI delta format
+                response = {
+                    "id": message_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model_name,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {
+                                # Only include role in the first chunk
+                                "role": "assistant" if is_first_chunk else "",
+                                "content": content
+                            },
+                            "finish_reason": None
+                        }
+                    ]
+                }
+                
+                if is_first_chunk:
+                    is_first_chunk = False
+                    
+                # Send the SSE chunk
+                sse_data = f"data: {json.dumps(response)}\n\n"
+                logger.debug(f"Sending OpenAI SSE chunk: {sse_data[:100]}...")
+                yield sse_data
+                
             elif "done" in chunk and chunk["done"]:
-                # Send final chunk with finish_reason
-                logger.info("Sending final OpenAI chunk")
+                # This is the completion signal - send final chunk with finish_reason
+                # CRITICAL: This is a completion marker from Claude
+                logger.info("Received completion signal from Claude, sending final chunks")
+                
+                # Send the completion message with finish_reason
                 final_response = {
                     "id": message_id,
                     "object": "chat.completion.chunk",
@@ -998,37 +1242,36 @@ async def stream_openai_response(claude_prompt: str, model_name: str, conversati
                     "choices": [
                         {
                             "index": 0,
-                            "delta": {},
+                            "delta": {},  # Empty delta for the final chunk
                             "finish_reason": "stop"
                         }
                     ]
                 }
                 yield f"data: {json.dumps(final_response)}\n\n"
+                
+                # Immediately follow with the DONE marker
+                # This is critical - clients wait for this marker
                 yield "data: [DONE]\n\n"
+                completion_sent = True
                 
                 # Log complete response summary
                 logger.info(f"Complete OpenAI response length: {len(full_response)} chars")
                 if len(full_response) < 500:
                     logger.debug(f"Complete OpenAI response: {full_response}")
-                return
+                
+                return  # Exit the generator after sending completion
             else:
                 # Log unrecognized format but don't interrupt the stream
                 logger.warning(f"Unrecognized OpenAI chunk format: {chunk}")
                 continue
-                
-            # Skip empty content
-            if not content:
-                continue
-                
-            # Accumulate full response for logging
-            full_response += content
+        
+        # If we reached here, the stream ended without a formal "done" marker
+        # This is a safeguard - we should always properly terminate the stream
+        if not completion_sent:
+            logger.warning("Stream ended without completion signal, sending final markers")
             
-            # For the first real content, log it specially
-            if content and is_first_chunk:
-                logger.info(f"First OpenAI content chunk received: {content[:50]}...")
-                
-            # Format in OpenAI delta format
-            response = {
+            # Send the completion message with finish_reason
+            final_response = {
                 "id": message_id,
                 "object": "chat.completion.chunk",
                 "created": created,
@@ -1036,29 +1279,25 @@ async def stream_openai_response(claude_prompt: str, model_name: str, conversati
                 "choices": [
                     {
                         "index": 0,
-                        "delta": {
-                            # Only include role in the first chunk
-                            "role": "assistant" if is_first_chunk else "",
-                            "content": content
-                        },
-                        "finish_reason": None
+                        "delta": {},  # Empty delta for the final chunk
+                        "finish_reason": "stop"
                     }
                 ]
             }
+            yield f"data: {json.dumps(final_response)}\n\n"
             
-            if is_first_chunk:
-                is_first_chunk = False
-                
-            # Send the SSE chunk
-            sse_data = f"data: {json.dumps(response)}\n\n"
-            logger.debug(f"Sending OpenAI SSE chunk: {sse_data[:100]}...")
-            yield sse_data
+            # Immediately follow with the DONE marker
+            yield "data: [DONE]\n\n"
             
-        # Ensure we send the final [DONE] marker
-        yield "data: [DONE]\n\n"
+            # Log complete response summary
+            logger.info(f"Complete OpenAI response length: {len(full_response)} chars")
+            if len(full_response) < 500:
+                logger.debug(f"Complete OpenAI response: {full_response}")
             
     except Exception as e:
         logger.error(f"Error streaming from Claude with OpenAI format: {str(e)}", exc_info=True)
+        
+        # Send error response
         error_response = {
             "error": {
                 "message": f"Streaming error: {str(e)}",
@@ -1067,6 +1306,8 @@ async def stream_openai_response(claude_prompt: str, model_name: str, conversati
             }
         }
         yield f"data: {json.dumps(error_response)}\n\n"
+        
+        # Immediately follow with DONE marker (critical)
         yield "data: [DONE]\n\n"
 
 # Unified function to parse request body
@@ -1156,11 +1397,271 @@ async def chat(request_body: Request):
 
     # Handle streaming vs. non-streaming responses
     if request.stream:
-        # For streaming, use the OpenAI streaming format
-        return StreamingResponse(
-            stream_openai_response(claude_prompt, request.model, conversation_id, request.id),
-            media_type="text/event-stream"
-        )
+        # We'll use our direct streaming response to avoid buffering
+        async def direct_openai_stream():
+            """Direct streaming generator with immediate flushing"""
+            # Use the request_id if provided, otherwise generate one
+            message_id = request.id if request.id else f"chatcmpl-{uuid.uuid4().hex}"
+            created = int(time.time())
+            is_first_chunk = True
+            full_response = ""
+            completion_sent = False
+            
+            try:
+                # Set up process to run Claude CLI
+                # Use stream-json format for true streaming
+                base_cmd = f"{CLAUDE_CMD} -p"
+                if conversation_id:
+                    base_cmd += f" -c {conversation_id}"
+                cmd = f"{base_cmd} --output-format stream-json"
+                
+                logger.info(f"Running direct stream command: {cmd}")
+                
+                # Generate a unique process ID for tracking
+                process_id = f"claude-process-{uuid.uuid4().hex[:8]}"
+                start_time = time.time()
+                model = request.model
+                
+                # Record the Claude process start in metrics
+                await metrics.record_claude_start(process_id, model, conversation_id)
+                
+                # Start the Claude process
+                process = await asyncio.create_subprocess_shell(
+                    cmd,
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                
+                # Write the prompt to stdin and close it immediately
+                try:
+                    process.stdin.write(claude_prompt.encode())
+                    await process.stdin.drain()
+                    process.stdin.close()
+                    logger.debug("Prompt sent to Claude process")
+                except Exception as e:
+                    error_msg = f"Error writing to Claude CLI: {str(e)}"
+                    logger.error(error_msg)
+                    
+                    # Send error as SSE
+                    error_json = json.dumps({
+                        "error": {"message": error_msg, "type": "server_error", "code": 500}
+                    })
+                    yield f"data: {error_json}\n\n"
+                    yield "data: [DONE]\n\n"
+                    return
+                
+                # Process Claude output directly
+                buffer = ""
+                output_tokens = 0
+                
+                # Read output until EOF
+                while True:
+                    # Read a chunk with a short timeout
+                    try:
+                        chunk = await asyncio.wait_for(process.stdout.read(4096), timeout=0.1)
+                        if not chunk:  # EOF
+                            break
+                        
+                        buffer += chunk.decode('utf-8')
+                        
+                        # Find complete JSON objects
+                        while True:
+                            # Look for a complete JSON object by checking matched braces
+                            # This is a simple implementation that works for clean JSON
+                            open_idx = buffer.find("{")
+                            if open_idx == -1:
+                                break
+                                
+                            # Find the matching closing brace by counting
+                            level = 0
+                            close_idx = -1
+                            
+                            for i in range(open_idx, len(buffer)):
+                                if buffer[i] == "{":
+                                    level += 1
+                                elif buffer[i] == "}":
+                                    level -= 1
+                                    if level == 0:
+                                        close_idx = i + 1
+                                        break
+                            
+                            if close_idx == -1:  # No complete object found
+                                break
+                                
+                            # Extract the JSON object
+                            try:
+                                json_obj = json.loads(buffer[open_idx:close_idx])
+                                # Remove processed part from buffer
+                                buffer = buffer[close_idx:]
+                                
+                                # Process the JSON object based on its type
+                                if "type" in json_obj and json_obj["type"] == "message":
+                                    # Content chunk
+                                    if "content" in json_obj and isinstance(json_obj["content"], list):
+                                        for item in json_obj["content"]:
+                                            if item.get("type") == "text" and "text" in item:
+                                                content = item["text"]
+                                                full_response += content
+                                                output_tokens += len(content.split()) / 0.75
+                                                
+                                                # Format as OpenAI compatible response
+                                                sse_obj = {
+                                                    "id": message_id,
+                                                    "object": "chat.completion.chunk",
+                                                    "created": created,
+                                                    "model": model,
+                                                    "choices": [{
+                                                        "index": 0,
+                                                        "delta": {
+                                                            # Only include role in first chunk
+                                                            "role": "assistant" if is_first_chunk else "",
+                                                            "content": content
+                                                        },
+                                                        "finish_reason": None
+                                                    }]
+                                                }
+                                                
+                                                if is_first_chunk:
+                                                    is_first_chunk = False
+                                                
+                                                # Directly yield the SSE formatted data
+                                                sse_chunk = f"data: {json.dumps(sse_obj)}\n\n"
+                                                yield sse_chunk
+                                                
+                                elif "stop_reason" in json_obj:
+                                    # End of message - send completion
+                                    if not completion_sent:
+                                        logger.info("Sending direct completion signal")
+                                        
+                                        # Record metrics
+                                        duration_ms = (time.time() - start_time) * 1000
+                                        await metrics.record_claude_completion(
+                                            process_id, 
+                                            duration_ms,
+                                            output_tokens=int(output_tokens)
+                                        )
+                                        
+                                        # Send finish reason
+                                        completion_obj = {
+                                            "id": message_id,
+                                            "object": "chat.completion.chunk",
+                                            "created": created,
+                                            "model": model,
+                                            "choices": [{
+                                                "index": 0,
+                                                "delta": {},
+                                                "finish_reason": "stop"
+                                            }]
+                                        }
+                                        
+                                        # Send completion - critical!
+                                        yield f"data: {json.dumps(completion_obj)}\n\n"
+                                        yield "data: [DONE]\n\n"
+                                        completion_sent = True
+                                        break
+                                        
+                                elif ("role" in json_obj and json_obj["role"] == "system" and 
+                                      ("cost_usd" in json_obj or "duration_ms" in json_obj)):
+                                    # System info - indicates completion
+                                    if not completion_sent:
+                                        # Record completion metrics
+                                        duration_ms = json_obj.get("duration_ms", (time.time() - start_time) * 1000)
+                                        await metrics.record_claude_completion(
+                                            process_id, 
+                                            duration_ms,
+                                            output_tokens=int(output_tokens)
+                                        )
+                                        
+                                        # Send completion signal
+                                        logger.info("Sending system completion signal")
+                                        
+                                        # Send finish reason
+                                        completion_obj = {
+                                            "id": message_id,
+                                            "object": "chat.completion.chunk",
+                                            "created": created,
+                                            "model": model,
+                                            "choices": [{
+                                                "index": 0,
+                                                "delta": {},
+                                                "finish_reason": "stop"
+                                            }]
+                                        }
+                                        
+                                        # Send completion - critical!
+                                        yield f"data: {json.dumps(completion_obj)}\n\n"
+                                        yield "data: [DONE]\n\n"
+                                        completion_sent = True
+                                        break
+                                
+                            except json.JSONDecodeError as e:
+                                logger.warning(f"Failed to parse JSON chunk: {e}")
+                                # Skip this malformed object and try to find next valid one
+                                buffer = buffer[1:]  # Skip first char and retry
+                            except Exception as e:
+                                logger.error(f"Error processing chunk: {e}")
+                                buffer = buffer[close_idx:]  # Skip to next chunk
+                    
+                    except asyncio.TimeoutError:
+                        # No data right now, check if process is still alive
+                        if process.returncode is not None:
+                            # Process has exited
+                            logger.info(f"Claude process exited with code {process.returncode}")
+                            break
+                
+                # Final error check
+                if process.returncode is not None and process.returncode != 0:
+                    # Process failed
+                    stderr_data = await process.stderr.read()
+                    error_msg = stderr_data.decode('utf-8').strip() if stderr_data else f"Process failed with code {process.returncode}"
+                    logger.error(f"Claude CLI error: {error_msg}")
+                    
+                    if not completion_sent:
+                        error_obj = {"error": {"message": error_msg, "type": "server_error", "code": 500}}
+                        yield f"data: {json.dumps(error_obj)}\n\n"
+                        yield "data: [DONE]\n\n"
+                        completion_sent = True
+                
+                # Ensure we always send completion
+                if not completion_sent:
+                    logger.info("Sending final completion signal")
+                    
+                    # Record completion 
+                    duration_ms = (time.time() - start_time) * 1000
+                    await metrics.record_claude_completion(
+                        process_id, 
+                        duration_ms,
+                        output_tokens=int(output_tokens) if output_tokens > 0 else 0
+                    )
+                    
+                    # Send finish reason
+                    completion_obj = {
+                        "id": message_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model,
+                        "choices": [{
+                            "index": 0,
+                            "delta": {},
+                            "finish_reason": "stop"
+                        }]
+                    }
+                    
+                    # Send completion - critical!
+                    yield f"data: {json.dumps(completion_obj)}\n\n"
+                    yield "data: [DONE]\n\n"
+                
+            except Exception as e:
+                logger.error(f"Error in direct streaming: {str(e)}", exc_info=True)
+                
+                if not completion_sent:
+                    error_obj = {"error": {"message": str(e), "type": "server_error", "code": 500}}
+                    yield f"data: {json.dumps(error_obj)}\n\n"
+                    yield "data: [DONE]\n\n"
+        
+        # Return our direct streaming response with no buffering
+        return DirectStreamResponse(direct_openai_stream())
     else:
         try:
             # For non-streaming, get the full response at once
