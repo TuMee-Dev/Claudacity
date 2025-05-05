@@ -545,7 +545,8 @@ class ChatRequest(BaseModel):
     format: Optional[str] = None
     template: Optional[str] = None
     keep_alive: Optional[str] = None
-    id: Optional[str] = None  # Conversation ID
+    id: Optional[str] = None  # Request ID
+    conversation_id: Optional[str] = None  # Explicit conversation ID
 
 # OpenAI-compatible models for request validation
 
@@ -560,8 +561,9 @@ class OpenAIChatRequest(BaseModel):
     max_tokens: Optional[int] = None
     temperature: Optional[float] = None
     top_p: Optional[float] = None
-    id: Optional[str] = None  # Conversation ID
-    user: Optional[str] = None  # OpenAI field, can also be used for conversation ID if id is not provided
+    id: Optional[str] = None  # Request ID
+    user: Optional[str] = None  # OpenAI field
+    conversation_id: Optional[str] = None  # Explicit conversation ID
 
 # Utility functions for working with Claude Code CLI
 
@@ -1473,7 +1475,13 @@ async def chat(request_body: Request):
 
     # Get or create conversation ID
     conversation_id = None
-    if request.id:
+    
+    # First check if the client supplied a conversation_id in the request JSON
+    if hasattr(request, 'conversation_id') and request.conversation_id:
+        conversation_id = request.conversation_id
+        logger.info(f"Using client-provided conversation_id: {conversation_id}")
+    # Otherwise use the request ID for tracking conversations
+    elif request.id:
         # Check if we have this conversation in our cache
         conversation_id = get_conversation_id(request.id)
         if conversation_id is None and len(request.messages) > 0:
@@ -1481,6 +1489,7 @@ async def chat(request_body: Request):
             # Generate a unique conversation ID for Claude (use the request ID itself)
             conversation_id = request.id
             set_conversation_id(request.id, conversation_id)
+            logger.info(f"Created new conversation with ID: {conversation_id}")
 
     # Format the messages for Claude Code CLI
     claude_prompt = format_messages_for_claude(request)
@@ -1866,9 +1875,17 @@ def generate_dashboard_html():
     # Get currently running Claude processes
     running_processes = get_running_claude_processes()
     
-    # Format metrics for display
-    avg_execution = f"{metrics_data['performance']['avg_execution_time_ms']:.2f}" if metrics_data['performance']['avg_execution_time_ms'] else "N/A"
-    median_execution = f"{metrics_data['performance']['median_execution_time_ms']:.2f}" if metrics_data['performance']['median_execution_time_ms'] else "N/A"
+    # Format metrics for display - convert from ms to minutes and seconds
+    def format_time_ms(time_ms):
+        if not time_ms:
+            return "N/A"
+        total_seconds = time_ms / 1000
+        minutes = int(total_seconds // 60)
+        seconds = total_seconds % 60
+        return f"{minutes}m {seconds:.1f}s"
+    
+    avg_execution = format_time_ms(metrics_data['performance']['avg_execution_time_ms'])
+    median_execution = format_time_ms(metrics_data['performance']['median_execution_time_ms'])
     
     # Memory metrics formatting
     avg_memory = f"{metrics_data['resources']['avg_memory_mb']:.2f}" if metrics_data['resources']['avg_memory_mb'] else "N/A"
@@ -2245,6 +2262,14 @@ def generate_dashboard_html():
                     <div class="metric-value">{metrics_data['claude_invocations']['per_hour']:.2f}</div>
                 </div>
                 <div class="metric">
+                    <div class="metric-name">Active Conversations</div>
+                    <div class="metric-value">{len(metrics.active_conversations)}</div>
+                </div>
+                <div class="metric">
+                    <div class="metric-name">Total Conversations</div>
+                    <div class="metric-value">{len(metrics.unique_conversations)}</div>
+                </div>
+                <div class="metric">
                     <div class="metric-name">Total Output Tokens</div>
                     <div class="metric-value">{metrics_data['tokens']['total_completion']}</div>
                 </div>
@@ -2254,11 +2279,11 @@ def generate_dashboard_html():
                 <h2>Performance</h2>
                 <div class="metric">
                     <div class="metric-name">Average Execution Time</div>
-                    <div class="metric-value">{avg_execution} <span class="metric-unit">ms</span></div>
+                    <div class="metric-value">{avg_execution}</div>
                 </div>
                 <div class="metric">
                     <div class="metric-name">Median Execution Time</div>
-                    <div class="metric-value">{median_execution} <span class="metric-unit">ms</span></div>
+                    <div class="metric-value">{median_execution}</div>
                 </div>
             </div>
 
