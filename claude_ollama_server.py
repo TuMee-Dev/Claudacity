@@ -18,6 +18,8 @@ import uuid
 import collections
 import statistics
 import datetime
+import tempfile
+import shutil
 from typing import Dict, List, Optional, Any, Union, Deque
 from pydantic import BaseModel, Field
 import httpx
@@ -416,6 +418,13 @@ def debug_response(response, prefix=""):
 # Keys are conversation IDs, values are (timestamp, conversation_id) tuples
 conversation_cache = {}
 
+# Directory for storing temporary conversation directories
+CONV_TEMP_ROOT = os.path.join(tempfile.gettempdir(), "claude_conversations")
+os.makedirs(CONV_TEMP_ROOT, exist_ok=True)
+
+# Map of conversation IDs to their temporary directories
+conversation_temp_dirs = {}
+
 # Initialize FastAPI app
 
 app = FastAPI(
@@ -437,8 +446,25 @@ async def periodic_cleanup():
         try:
             # Clean up every 5 minutes
             await asyncio.sleep(5 * 60)  # 5 minutes
+            
+            # Clean up old metrics data
             metrics.prune_old_data()
             logger.debug("Performed periodic cleanup of old metrics data")
+            
+            # Clean up old conversation temp directories that are no longer active
+            try:
+                active_conversations = set()
+                # Get active conversations from cache
+                for request_id, (_, conv_id) in conversation_cache.items():
+                    active_conversations.add(conv_id)
+                
+                # Clean up temp directories for inactive conversations
+                for conv_id in list(conversation_temp_dirs.keys()):
+                    if conv_id not in active_conversations:
+                        cleanup_conversation_temp_dir(conv_id)
+                        logger.debug(f"Cleaned up temp directory for inactive conversation: {conv_id}")
+            except Exception as e:
+                logger.error(f"Error cleaning up conversation temp dirs: {e}")
         except Exception as e:
             logger.error(f"Error in periodic cleanup: {e}")
             # Don't let the background task die
@@ -657,6 +683,34 @@ class OpenAIChatRequest(BaseModel):
 
 # Utility functions for working with Claude Code CLI
 
+def get_conversation_temp_dir(conversation_id: str) -> str:
+    """Get or create a temporary directory for a conversation."""
+    if conversation_id in conversation_temp_dirs:
+        # Return existing temp dir
+        temp_dir = conversation_temp_dirs[conversation_id]
+        if os.path.exists(temp_dir):
+            return temp_dir
+    
+    # Create a new temp dir for this conversation
+    temp_dir = os.path.join(CONV_TEMP_ROOT, f"conv_{conversation_id}_{uuid.uuid4().hex[:8]}")
+    os.makedirs(temp_dir, exist_ok=True)
+    conversation_temp_dirs[conversation_id] = temp_dir
+    logger.info(f"Created temporary directory for conversation {conversation_id}: {temp_dir}")
+    return temp_dir
+
+def cleanup_conversation_temp_dir(conversation_id: str):
+    """Clean up the temporary directory for a conversation."""
+    if conversation_id in conversation_temp_dirs:
+        temp_dir = conversation_temp_dirs[conversation_id]
+        if os.path.exists(temp_dir):
+            try:
+                shutil.rmtree(temp_dir)
+                logger.info(f"Cleaned up temporary directory for conversation {conversation_id}: {temp_dir}")
+            except Exception as e:
+                logger.error(f"Failed to clean up temporary directory {temp_dir}: {e}")
+        # Remove from the map regardless of success
+        del conversation_temp_dirs[conversation_id]
+
 async def run_claude_command(prompt: str, conversation_id: str = None) -> str:
     """Run a Claude Code command and return the output."""
     # Base command
@@ -665,6 +719,17 @@ async def run_claude_command(prompt: str, conversation_id: str = None) -> str:
     # Add conversation flag if there's a conversation ID
     if conversation_id:
         base_cmd += f" -c {conversation_id}"
+        
+        # Check if we're in test mode (only create temp dirs in production)
+        is_test = 'unittest' in sys.modules or os.environ.get('TESTING') == '1'
+        
+        if not is_test:
+            # Create or get a temporary directory for this conversation
+            temp_dir = get_conversation_temp_dir(conversation_id)
+            
+            # Set the current working directory for this conversation
+            # We'll use environment variable to pass it to the Claude CLI
+            os.environ["CLAUDE_CWD"] = temp_dir
 
     # Use regular JSON output format
     cmd = f"{base_cmd} --output-format json"
@@ -831,6 +896,16 @@ async def stream_claude_output(prompt: str, conversation_id: str = None):
     # Add conversation flag if there's a conversation ID
     if conversation_id:
         base_cmd += f" -c {conversation_id}"
+        
+        # Check if we're in test mode (only create temp dirs in production)
+        is_test = 'unittest' in sys.modules or os.environ.get('TESTING') == '1'
+        
+        if not is_test:
+            # Create or get a temporary directory for this conversation
+            temp_dir = get_conversation_temp_dir(conversation_id)
+            
+            # Set the current working directory for this conversation
+            os.environ["CLAUDE_CWD"] = temp_dir
 
     # Use stream-json format
     cmd = f"{base_cmd} --output-format stream-json"
