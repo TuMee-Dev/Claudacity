@@ -9,6 +9,7 @@ Usage:
   python claude_service.py --install  # Install as a service
   python claude_service.py --start    # Start the service
   python claude_service.py --stop     # Stop the service
+  python claude_service.py --restart  # Restart the service
   python claude_service.py --status   # Check service status
   python claude_service.py --uninstall # Uninstall the service
   python claude_service.py            # Run directly (not as a service)
@@ -129,6 +130,15 @@ def main():
             logger.info("Stopping service...")
             service_manager.stop()
             logger.info("Service stopped.")
+        elif sys.argv[1] == "--restart":
+            logger.info("Restarting service...")
+            service_manager.stop()
+            logger.info("Service stopped. Waiting for full shutdown...")
+            # Wait a moment to ensure the service has fully stopped
+            import time
+            time.sleep(2)
+            service_manager.start()
+            logger.info("Service restarted.")
         elif sys.argv[1] == "--status":
             status = service_manager.status()
             logger.info(f"Service status: {status}")
@@ -139,6 +149,7 @@ def main():
             print("  --uninstall : Uninstall the service")
             print("  --start     : Start the service")
             print("  --stop      : Stop the service")
+            print("  --restart   : Restart the service")
             print("  --status    : Check service status")
             print("  --run       : Run as a service (internal use)")
             print("  (no args)   : Run directly (not as a service)")

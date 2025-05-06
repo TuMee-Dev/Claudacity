@@ -40,6 +40,10 @@ from starlette.background import BackgroundTask
 
 # Configuration
 
+# Process and streaming response timeouts
+CLAUDE_STREAM_CHUNK_TIMEOUT = 18.0  # Seconds without output before checking process status (was 10, originally 5)
+CLAUDE_STREAM_MAX_SILENCE = 180.0  # Maximum seconds to wait with no output before assuming process hung (was 60, originally 15)
+
 # Version information
 API_VERSION = "0.1.0"
 BUILD_NAME = "claude-ollama-server"
@@ -757,8 +761,14 @@ def cleanup_conversation_temp_dir(conversation_id: str):
         # Remove from the map regardless of success
         del conversation_temp_dirs[conversation_id]
 
-async def run_claude_command(prompt: str, conversation_id: str = None, original_request=None) -> str:
+async def run_claude_command(prompt: str, conversation_id: str = None, original_request=None, timeout: float = CLAUDE_STREAM_MAX_SILENCE) -> str:
     """Run a Claude Code command and return the output."""
+    # Log the request details for debugging
+    logger.info(f"run_claude_command called with:")
+    logger.info(f"  - prompt length: {len(prompt)}")
+    logger.info(f"  - conversation_id: {conversation_id}")
+    logger.info(f"  - timeout: {timeout}s")
+    
     # Start building the base command
     base_cmd = f"{CLAUDE_CMD}"
 
@@ -807,6 +817,16 @@ async def run_claude_command(prompt: str, conversation_id: str = None, original_
         "start_time": time.time(),
         "current_request": original_request
     }
+    
+    # Set appropriate timeout parameters based on prompt complexity
+    # The longer/more complex the prompt, the more time Claude might need
+    current_chunk_timeout = CLAUDE_STREAM_CHUNK_TIMEOUT
+    current_max_silence = CLAUDE_STREAM_MAX_SILENCE
+    
+    # Adjust timeout based on prompt length or complexity if needed
+    proxy_launched_processes[process_id]['chunk_timeout'] = current_chunk_timeout
+    proxy_launched_processes[process_id]['max_silence'] = current_max_silence
+    
     logger.info(f"Tracking new Claude process with PID {process_id}")
 
     process = None
@@ -839,13 +859,71 @@ async def run_claude_command(prompt: str, conversation_id: str = None, original_
             track_claude_process(str(process.pid), cmd, original_request_data)
         
         # Wait for Claude to process the command (prompt is already in the command line)
-        stdout, stderr = await process.communicate()
-        
-        # Log any stderr output for debugging
-        if stderr:
-            stderr_text = stderr.decode() if stderr else ""
-            if stderr_text:
-                logger.error(f"[TOOLS] Claude process stderr output: {stderr_text}")
+        # Add timeout handling for non-streaming mode
+        try:
+            # Get process-specific timeout if available (or use the default)
+            process_info = proxy_launched_processes.get(str(process.pid), {})
+            max_silence = process_info.get('max_silence', timeout)
+            logger.info(f"Using timeout of {max_silence} seconds for non-streaming request")
+            logger.info(f"Process ID: {process.pid}, Command: {cmd}")
+            
+            # Use asyncio.wait_for to add a timeout to communicate()
+            logger.info(f"Starting process.communicate() with timeout={max_silence}s")
+            try:
+                logger.info(f"Non-streaming pid is: {process.pid}")
+                stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=max_silence)
+                logger.info("process.communicate() completed successfully")
+            except Exception as comm_error:
+                logger.error(f"Error in process.communicate(): {comm_error}")
+                import traceback
+                logger.error(f"Traceback: {traceback.format_exc()}")
+                raise
+            
+            # Log any stderr output for debugging
+            if stderr:
+                stderr_text = stderr.decode() if stderr else ""
+                if stderr_text:
+                    logger.error(f"[TOOLS] Claude process stderr output: {stderr_text}")
+            else:
+                logger.info("No stderr output from Claude process")
+                
+            if stdout:
+                stdout_text = stdout.decode() if stdout else ""
+                logger.info(f"stdout length: {len(stdout_text)} bytes")
+                logger.info(f"stdout preview: {stdout_text[:100]}...")
+            else:
+                logger.warning("No stdout output from Claude process!")
+                
+        except asyncio.TimeoutError:
+            # Process is taking too long - likely hung
+            logger.warning(f"Non-streaming Claude process {process.pid} timed out after {max_silence} seconds")
+            logger.warning(f"Command that may have hung: {cmd}")
+            logger.warning(f"Process state: {process}")
+            # Try to get process info
+            import psutil
+            try:
+                p = psutil.Process(process.pid)
+                logger.warning(f"Process status: {p.status()}")
+                logger.warning(f"Process creation time: {p.create_time()}")
+                logger.warning(f"Process CPU times: {p.cpu_times()}")
+            except Exception as psutil_error:
+                logger.warning(f"Could not get psutil info for process: {psutil_error}")
+            
+            # Try to terminate the process
+            try:
+                logger.warning(f"Attempting to terminate hung Claude process {process.pid}")
+                process.kill()
+                # If successful, untrack this process
+                untrack_claude_process(str(process.pid))
+            except Exception as kill_error:
+                logger.error(f"Failed to kill hung process: {kill_error}")
+            
+            # Record timeout error in metrics
+            duration_ms = (time.time() - start_time) * 1000
+            await metrics.record_claude_completion(process_id, duration_ms, error="Process timeout", conversation_id=conversation_id)
+            
+            # Raise a specific timeout exception
+            raise Exception(f"Claude command timed out after {timeout} seconds")
         
         # Calculate execution duration
         duration_ms = (time.time() - start_time) * 1000
@@ -996,6 +1074,14 @@ async def stream_claude_output(prompt: str, conversation_id: str = None, origina
     """
     # Start building the base command
     base_cmd = f"{CLAUDE_CMD}"
+    
+    # Extract model if available
+    model = None
+    if original_request and isinstance(original_request, dict) and 'model' in original_request:
+        model = original_request.get('model')
+        if model:
+            logger.info(f"[TOOLS] Using model from request: {model}")
+            base_cmd += f" --model {model}"
 
     # Log if tools are present for debugging purposes only
     if original_request and isinstance(original_request, dict) and original_request.get('tools'):
@@ -1045,6 +1131,17 @@ async def stream_claude_output(prompt: str, conversation_id: str = None, origina
 
     logger.info(f"[TOOLS] About to start Claude process with command: {cmd}")
     try:
+        # Set appropriate timeout parameters based on prompt complexity
+        # The longer/more complex the prompt, the more time Claude might need
+        current_chunk_timeout = CLAUDE_STREAM_CHUNK_TIMEOUT
+        current_max_silence = CLAUDE_STREAM_MAX_SILENCE
+        
+        # Store these in the process info for reference during streaming
+        process_info = proxy_launched_processes.get(process_id, {})
+        if process_info:
+            process_info['chunk_timeout'] = current_chunk_timeout
+            process_info['max_silence'] = current_max_silence
+        
         process = await asyncio.create_subprocess_shell(
             cmd,
             stdin=None,
@@ -1185,9 +1282,13 @@ async def stream_claude_output(prompt: str, conversation_id: str = None, origina
                     logger.info(f"Claude process completed with return code {process.returncode}")
                     break
                 
-                # Check if we've gone too long without output
-                if time.time() - last_chunk_time > 5.0:
-                    logger.warning("No output from Claude for 5 seconds, checking if process is still active")
+                # Get process-specific timeout if available (or use the default)
+                process_info = proxy_launched_processes.get(process.pid, {})
+                chunk_timeout = process_info.get('chunk_timeout', CLAUDE_STREAM_CHUNK_TIMEOUT)
+                
+                # Check if we've gone too long without output - using the process-specific timeout
+                if time.time() - last_chunk_time > chunk_timeout:
+                    logger.warning(f"No output from Claude for {chunk_timeout} seconds, checking if process is still active")
                     
                     # Try to get process status without killing it
                     try:
@@ -1201,8 +1302,21 @@ async def stream_claude_output(prompt: str, conversation_id: str = None, origina
                                 break
                         
                         # If we're still waiting, check if it's been too long since the last chunk
-                        if time.time() - last_chunk_time > 15.0:  # 15 seconds total waiting time
-                            logger.warning("No output for 15 seconds, assuming Claude is finished")
+                        # For complex prompts, Claude may need more time between chunks
+                        if time.time() - last_chunk_time > CLAUDE_STREAM_MAX_SILENCE:
+                            logger.warning(f"No output for {CLAUDE_STREAM_MAX_SILENCE} seconds, assuming Claude is finished or hung")
+                            # Log the command to help diagnose hanging issues
+                            logger.warning(f"Command that may have hung: {command}")
+                            
+                            # Try to terminate the process if it's hung
+                            try:
+                                logger.warning(f"Attempting to terminate hung Claude process {process.pid}")
+                                process.kill()
+                                # If successful, untrack this process
+                                untrack_claude_process(process.pid)
+                            except Exception as kill_error:
+                                logger.error(f"Failed to kill hung process: {kill_error}")
+                            
                             break
                     except Exception as e:
                         logger.warning(f"Error checking process status: {e}")
@@ -2185,14 +2299,34 @@ async def chat(request_body: Request):
                 request_dict["tools"] = request.tools
                 logger.info(f"[TOOLS] Request includes tools: {len(request.tools)} tool(s)")
             
-            # For non-streaming, get the full response at once
-            claude_response = await run_claude_command(claude_prompt, conversation_id=conversation_id, original_request=request_dict)
-            
-            # Log the raw Claude response at debug level
-            if isinstance(claude_response, dict):
-                logger.debug(f"Raw Claude response: {json.dumps(claude_response)[:500]}...")
-            else:
-                logger.debug(f"Raw Claude response: {str(claude_response)[:500]}...")
+            # For non-streaming, get the full response
+            try:
+                logger.info(f"Starting non-streaming request via run_claude_command for prompt of length {len(claude_prompt)}")
+                
+                # Log the actual command that will be run (important for debugging)
+                # Start building the base command
+                base_cmd = f"{CLAUDE_CMD}"
+                if request.model:
+                    base_cmd += f" --model {request.model}"
+                import shlex
+                quoted_prompt = shlex.quote(claude_prompt)
+                cmd = f"{base_cmd} -p {quoted_prompt} --output-format json"
+                logger.info(f"Non-streaming command: {cmd}")
+                
+                # Actually run the command
+                claude_response = await run_claude_command(claude_prompt, conversation_id=conversation_id, original_request=request_dict)
+                
+                # Log the raw Claude response at debug level
+                if isinstance(claude_response, dict):
+                    logger.debug(f"Raw Claude response: {json.dumps(claude_response)[:500]}...")
+                else:
+                    logger.debug(f"Raw Claude response: {str(claude_response)[:500]}...")
+            except asyncio.TimeoutError as e:
+                logger.error(f"Timeout error in non-streaming request: {str(e)}")
+                raise Exception(f"Request timed out: The response took too long to generate. This may happen with complex prompts. Please try using streaming mode for this prompt.") 
+            except Exception as e:
+                logger.error(f"Error in run_claude_command: {str(e)}")
+                raise
                 
             # Log information about the client
             user_agent = request_body.headers.get("user-agent", "Unknown")
@@ -2582,19 +2716,58 @@ async def ollama_chat(request: OllamaChatRequest):
         )
     else:
         # For non-streaming, get the full response
-        claude_response = await run_claude_command(claude_prompt, conversation_id=None, original_request=request_dict)
-        
-        # Format as Ollama response
-        ollama_model = get_ollama_model_name(model)
-        ollama_response = {
-            "model": ollama_model,
-            "created_at": datetime.datetime.now().isoformat() + "Z",
-            "message": {
-                "role": "assistant",
-                "content": claude_response.get("content", "")
-            },
-            "done": True
-        }
+        try:
+            logger.info(f"Starting non-streaming request via run_claude_command for prompt of length {len(claude_prompt)}")
+            
+            # Log the actual command that will be run (important for debugging)
+            # Start building the base command
+            base_cmd = f"{CLAUDE_CMD}"
+            if model:
+                base_cmd += f" --model {model}"
+            import shlex
+            quoted_prompt = shlex.quote(claude_prompt)
+            cmd = f"{base_cmd} -p {quoted_prompt} --output-format json"
+            logger.info(f"Non-streaming command: {cmd}")
+            
+            # Actually run the command
+            claude_response = await run_claude_command(claude_prompt, conversation_id=None, original_request=request_dict)
+            
+            # Log the successful response
+            logger.info(f"Non-streaming request completed successfully, response type: {type(claude_response)}")
+            if isinstance(claude_response, dict):
+                logger.info(f"Response keys: {list(claude_response.keys())}")
+            else:
+                logger.info(f"Response (not a dict): {str(claude_response)[:100]}...")
+            
+            # Format as Ollama response
+            ollama_model = get_ollama_model_name(model)
+            ollama_response = {
+                "model": ollama_model,
+                "created_at": datetime.datetime.now().isoformat() + "Z",
+                "message": {
+                    "role": "assistant",
+                    "content": claude_response.get("content", "")
+                },
+                "done": True
+            }
+        except Exception as e:
+            # Return a graceful error response with detailed info
+            logger.error(f"ERROR in non-streaming response: {str(e)}")
+            logger.error(f"Error type: {type(e)}")
+            import traceback
+            logger.error(f"Traceback: {traceback.format_exc()}")
+            
+            ollama_model = get_ollama_model_name(model)
+            ollama_response = {
+                "model": ollama_model,
+                "created_at": datetime.datetime.now().isoformat() + "Z",
+                "message": {
+                    "role": "assistant", 
+                    "content": f"Error: {str(e)}"
+                },
+                "done": True,
+                "error": str(e)
+            }
         
         return JSONResponse(
             content=ollama_response,
@@ -2908,20 +3081,61 @@ def run_self_test():
 def track_claude_process(pid, command, original_request=None):
     """Track a Claude process launched by this proxy server"""
     import time
+    
+    # If the pid is a string starting with "claude-process-", this is a temporary ID
+    # In that case, look up the real process to find the corresponding proxy process ID
+    temp_id = None
+    if isinstance(pid, str) and not pid.startswith("claude-process-"):
+        # This is a real system PID
+        numeric_pid = int(pid)
+        
+        # Look for temporary process IDs that should be linked to this real PID
+        for temp_pid, process_info in proxy_launched_processes.items():
+            if isinstance(temp_pid, str) and temp_pid.startswith("claude-process-"):
+                # Check if this temp_pid was recently created and doesn't already have a real PID
+                if process_info.get("real_pid") is None:
+                    # Link this temporary ID to the real PID
+                    proxy_launched_processes[temp_pid]["real_pid"] = numeric_pid
+                    temp_id = temp_pid
+                    break
+    
+    # Store process information
     proxy_launched_processes[pid] = {
         "pid": pid,
         "command": command,
         "start_time": time.time(),
         "status": "running",
-        "current_request": original_request
+        "current_request": original_request,
+        "temp_id": temp_id  # Store the temp ID if applicable
     }
+    
     logger.info(f"Tracking new Claude process with PID {pid}")
 
 def untrack_claude_process(pid):
     """Remove a Claude process from tracking"""
     if pid in proxy_launched_processes:
+        # Get the process info before removing it
+        process_info = proxy_launched_processes.get(pid, {})
+        
+        # Remove this process
         proxy_launched_processes.pop(pid, None)
         logger.info(f"Untracked Claude process with PID {pid}")
+        
+        # If this is a real PID (numeric), also remove any temporary IDs linked to it
+        if not isinstance(pid, str) or not pid.startswith("claude-process-"):
+            # This is a real PID - check for any temporary IDs that link to it
+            for temp_pid, info in list(proxy_launched_processes.items()):
+                if (isinstance(temp_pid, str) and temp_pid.startswith("claude-process-") and 
+                    info.get('real_pid') == pid):
+                    proxy_launched_processes.pop(temp_pid, None)
+                    logger.info(f"Untracked linked temporary process with PID {temp_pid}")
+        
+        # If this is a temporary ID, also remove the real PID it links to
+        if isinstance(pid, str) and pid.startswith("claude-process-"):
+            real_pid = process_info.get('real_pid')
+            if real_pid and real_pid in proxy_launched_processes:
+                proxy_launched_processes.pop(real_pid, None)
+                logger.info(f"Untracked linked real process with PID {real_pid}")
 
 def store_process_output(pid, stdout, stderr, command, prompt, response, converted_response=None, model=DEFAULT_MODEL, original_request=None):
     """Store the output from a Claude process"""
@@ -2975,14 +3189,26 @@ def get_running_claude_processes():
         # List of processes to return
         active_processes = []
         
+        # Track processes we've already processed (to avoid duplicates)
+        processed_pids = set()
+        
         # Check each tracked process to see if it's still running
         pids_to_remove = []
         for pid, process_info in proxy_launched_processes.items():
             try:
+                # Skip if already processed (avoids duplicates)
+                real_pid = process_info.get('real_pid')
+                if real_pid and real_pid in processed_pids:
+                    continue
+                
                 # Handle different process ID types
                 if isinstance(pid, str) and pid.startswith("claude-process-"):
-                    # For string-based process IDs, include in the list but mark as non-psutil
-                    # Calculate runtime
+                    # Check if this process has a real PID assigned - if so, skip it as we'll
+                    # process it when we encounter the real PID
+                    if real_pid:
+                        continue
+                        
+                    # For string-based process IDs without real PID, include in the list but mark as non-psutil
                     runtime_secs = int(time.time() - process_info['start_time'])
                     hours, remainder = divmod(runtime_secs, 3600)
                     minutes, seconds = divmod(remainder, 60)
@@ -3000,8 +3226,16 @@ def get_running_claude_processes():
                     continue
                 
                 # For numeric PIDs, convert and check if process exists
-                numeric_pid = int(pid) if isinstance(pid, str) else pid
-                process = psutil.Process(numeric_pid)
+                try:
+                    numeric_pid = int(pid) if isinstance(pid, str) else pid
+                    process = psutil.Process(numeric_pid)
+                except (psutil.NoSuchProcess, ValueError):
+                    # Process no longer exists or invalid PID format
+                    pids_to_remove.append(pid)
+                    continue
+                
+                # Mark as processed to avoid duplicates
+                processed_pids.add(numeric_pid)
                 
                 # Get process info
                 with process.oneshot():

@@ -211,17 +211,33 @@ def generate_dashboard_html():
         
         <div class="stats-grid">
             <div class="card">
-                <h2>General</h2>
+                <h2>Server Status</h2>
+                <div class="metric">
+                    <div class="metric-name">Status</div>
+                    <div class="metric-value">Running</div>
+                </div>
                 <div class="metric">
                     <div class="metric-name">Uptime</div>
                     <div class="metric-value">{metrics_data['uptime']['formatted']}</div>
                 </div>
                 <div class="metric">
-                    <div class="metric-name">Server Status</div>
-                    <div class="metric-value">Running</div>
+                    <div class="metric-name">Started At</div>
+                    <div class="metric-value">{metrics_data['uptime']['start_time'].split('T')[0]} {metrics_data['uptime']['start_time'].split('T')[1].split('.')[0]}</div>
+                </div>
+            </div>
+            
+            <div class="card">
+                <h2>Process Monitoring</h2>
+                <div class="metric">
+                    <div class="metric-name">Running Processes</div>
+                    <div class="metric-value">{metrics_data['claude_invocations']['current_running']}</div>
                 </div>
                 <div class="metric">
-                    <div class="metric-name">Claude Invocations</div>
+                    <div class="metric-name">Max Concurrent</div>
+                    <div class="metric-value">{metrics_data['claude_invocations']['max_concurrent']}</div>
+                </div>
+                <div class="metric">
+                    <div class="metric-name">Total Invocations</div>
                     <div class="metric-value">{metrics_data['claude_invocations']['total']}</div>
                 </div>
             </div>
@@ -295,15 +311,19 @@ def generate_dashboard_html():
     if running_processes:
         for proc in running_processes:
             pid = proc.get('pid', 'N/A')
-            cmd = proc.get('cmd', 'Unknown')[:80] + ('...' if len(proc.get('cmd', '')) > 80 else '')
-            cpu = f"{proc.get('cpu_percent', 0):.1f}%"
-            memory = f"{proc.get('memory_mb', 0):.1f} MB"
+            command = proc.get('command', proc.get('cmd', 'Unknown'))[:80] + ('...' if len(proc.get('command', proc.get('cmd', ''))) > 80 else '')
+            cpu = proc.get('cpu', proc.get('cpu_percent', 'N/A'))
+            if isinstance(cpu, (int, float)):
+                cpu = f"{cpu:.1f}%"
+            memory = proc.get('memory', proc.get('memory_mb', 'N/A'))
+            if isinstance(memory, (int, float)):
+                memory = f"{memory:.1f} MB"
             runtime = proc.get('runtime', 'N/A')
             
             html += f"""
                     <tr>
                         <td>{pid}</td>
-                        <td title="{proc.get('cmd', 'Unknown')}">{cmd}</td>
+                        <td title="{proc.get('command', proc.get('cmd', 'Unknown'))}">{command}</td>
                         <td>{cpu}</td>
                         <td>{memory}</td>
                         <td>{runtime}</td>

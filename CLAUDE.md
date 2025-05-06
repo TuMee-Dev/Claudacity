@@ -6,6 +6,7 @@
 - Clear out the log files in the logs directory if you need to check the logs.
 - ALWAYS USE THE SERVICE SCRIPTS for stopping, starting and restarting the service.
 - Read additional context from the .md files in the context directory.
+- Use the unified testing framework to ensure both ollama and claude are working after code fixes
 
 ## Important Files in Context Directory
 The context directory contains detailed documentation about various aspects of the system:
@@ -16,3 +17,6 @@ The context directory contains detailed documentation about various aspects of t
 - `TOOL_FIXES.md` - Documentation about tool handling fixes
 
 For a general README about the Claude Ollama API Server, see `context/claude_ollama_README.md`.
+
+## Port Information
+- Ports: 11434 is Ollama, 22434 is our proxy, 334xx is available to you as needed while testing
