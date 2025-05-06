@@ -171,7 +171,7 @@ async def compare_endpoints(claude_url: str, ollama_url: str) -> None:
     # For Ollama use the specified model or a default one
     ollama_model = ollama_tags.get('models', [])[0]['name'] if ollama_tags.get('models') else "microsoft/phi-4:latest"
     
-    test_prompt = "Tell me a short joke about programming."
+    test_prompt = "Write a function to hash a dictionary or list in python. The function should be recursive for any child dicts found (regardless of nesting level). Sort keys by their natural order first."
     
     print(f"\nUsing Claude model: {claude_model}")
     print(f"Using Ollama model: {ollama_model}")
@@ -222,7 +222,7 @@ async def run_tests(args):
     
     if args.test_type in ["chat", "all"]:
         model = "claude-3.7-sonnet"
-        prompt = "Tell me a short joke about programming."
+        prompt = "Write a function to hash a dictionary or list in python. The function should be recursive for any child dicts found (regardless of nesting level). Sort keys by their natural order first."
         
         # Test non-streaming chat
         print("\n=== Testing Non-streaming Chat ===")

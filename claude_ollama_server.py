@@ -28,6 +28,12 @@ import asyncio
 import fastapi
 from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
 from fastapi.responses import StreamingResponse, JSONResponse, PlainTextResponse, HTMLResponse, Response
+
+# Import dashboard module 
+try:
+    import dashboard
+except ImportError:
+    dashboard = None
 from fastapi.middleware.cors import CORSMiddleware
 import asyncio
 from starlette.background import BackgroundTask
@@ -64,13 +70,26 @@ AVAILABLE_MODELS = [
     }
 ]
 # Configure logging with more details
+import os
 
+# Ensure logs directory exists
+os.makedirs("logs", exist_ok=True)
+
+# Set up file handler for logging to logs directory
+log_file_path = os.path.join("logs", "server.log")
+file_handler = logging.FileHandler(log_file_path)
+file_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s', '%Y-%m-%d %H:%M:%S'))
+
+# Configure root logger
 logging.basicConfig(
     level=logging.INFO,  # Set to DEBUG to get more detailed logs
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S'
 )
+
+# Get logger and add file handler explicitly
 logger = logging.getLogger(__name__)
+logger.addHandler(file_handler)
 
 # Metrics tracking class
 
@@ -706,6 +725,7 @@ class OpenAIChatRequest(BaseModel):
     id: Optional[str] = None  # Request ID
     user: Optional[str] = None  # OpenAI field
     conversation_id: Optional[str] = None  # Explicit conversation ID
+    ollama_client: Optional[bool] = False  # Flag for Ollama client
 
 # Utility functions for working with Claude Code CLI
 
@@ -1101,6 +1121,7 @@ async def stream_claude_output(prompt: str, conversation_id: str = None, origina
                                                 content = item["text"]
                                                 logger.info(f"Extracted text content: {content[:50]}...")
                                                 output_tokens += len(content.split()) / 0.75  # Rough token count estimate
+                                                # Return plain dict object, let the higher-level formatters handle it
                                                 yield {"content": content}
                                 elif "stop_reason" in json_obj:
                                     # End of message - this is an explicit completion signal
@@ -1117,6 +1138,7 @@ async def stream_claude_output(prompt: str, conversation_id: str = None, origina
                                     )
                                     
                                     # Immediately send completion signal
+                                    # Return plain dict object, let the higher-level formatters handle it
                                     yield {"done": True}
                                     
                                     # Break out of the main loop after completion
@@ -1139,6 +1161,7 @@ async def stream_claude_output(prompt: str, conversation_id: str = None, origina
                                         
                                         # Immediately send completion signal
                                         logger.info("Received system message with completion info from Claude")
+                                        # Return plain dict object, let the higher-level formatters handle it
                                         yield {"done": True}
                                         
                                         # Break out of the main loop after completion
@@ -1198,9 +1221,11 @@ async def stream_claude_output(prompt: str, conversation_id: str = None, origina
                                 content = item["text"]
                                 logger.info(f"Extracted final text content: {content[:50]}...")
                                 output_tokens += len(content.split()) / 0.75  # Rough token count estimate
+                                # Return plain dict object, let the higher-level formatters handle it
                                 yield {"content": content}
                 elif "stop_reason" in json_obj:
                     streaming_complete = True
+                    # Return plain dict object, let the higher-level formatters handle it
                     yield {"done": True}
             except json.JSONDecodeError:
                 logger.warning(f"Failed to parse final buffer: {buffer[:200]}...")
@@ -1216,6 +1241,7 @@ async def stream_claude_output(prompt: str, conversation_id: str = None, origina
                 duration_ms = (time.time() - start_time) * 1000
                 await metrics.record_claude_completion(process_id, duration_ms, error=stderr_str, conversation_id=conversation_id)
                 
+                # Return plain dict object, let the higher-level formatters handle it
                 yield {"error": stderr_str}
                 return
         
@@ -1240,9 +1266,11 @@ async def stream_claude_output(prompt: str, conversation_id: str = None, origina
                             if item.get("type") == "text" and "text" in item:
                                 content = item["text"]
                                 logger.info(f"Extracted final buffered content: {content[:50]}...")
+                                # Return plain dict object, let the higher-level formatters handle it
                                 yield {"content": content}
                     elif "stop_reason" in json_obj:
                         streaming_complete = True
+                        # Return plain dict object, let the higher-level formatters handle it
                         yield {"done": True}
                         return
                 except json.JSONDecodeError:
@@ -1259,6 +1287,7 @@ async def stream_claude_output(prompt: str, conversation_id: str = None, origina
             logger.info("No explicit completion signal received, sending completion")
             duration_ms = (time.time() - start_time) * 1000
             await metrics.record_claude_completion(process_id, duration_ms, output_tokens=int(output_tokens), conversation_id=conversation_id)
+            # Return plain dict object, let the higher-level formatters handle it
             yield {"done": True}
                 
     except Exception as e:
@@ -1268,6 +1297,7 @@ async def stream_claude_output(prompt: str, conversation_id: str = None, origina
         duration_ms = (time.time() - start_time) * 1000
         await metrics.record_claude_completion(process_id, duration_ms, error=e, conversation_id=conversation_id)
         
+        # Return plain dict object, let the higher-level formatters handle it
         yield {"error": str(e)}
         
     finally:
@@ -1622,13 +1652,26 @@ def format_to_openai_chat_completion(claude_response, model, request_id=None):
 
 async def stream_openai_response(claude_prompt: str, model_name: str, conversation_id: str = None, request_id: str = None, original_request=None):
     """
-    Stream responses from Claude in OpenAI-compatible format.
+    Stream responses from Claude in the appropriate format based on the client.
+    Handles both OpenAI-compatible and Ollama-compatible formats.
     Uses the request_id from the client if provided.
     """
     import time
+    import datetime
     
-    # Add detailed logging for tools troubleshooting
-    logger.info(f"[TOOLS] Starting stream_openai_response, request_id={request_id}, conversation_id={conversation_id}")
+    # Check if this is an Ollama client request
+    is_ollama_client = False
+    if original_request:
+        if isinstance(original_request, dict):
+            is_ollama_client = original_request.get('ollama_client', False)
+        elif hasattr(original_request, 'ollama_client'):
+            is_ollama_client = original_request.ollama_client
+    
+    # Log based on client type
+    if is_ollama_client:
+        logger.info(f"Starting unified streaming with Ollama format, request_id={request_id}")
+    else:
+        logger.info(f"Starting unified streaming with OpenAI format, request_id={request_id}")
     
     # Use the request_id if provided, otherwise generate one
     message_id = request_id if request_id else f"chatcmpl-{uuid.uuid4().hex}"
@@ -1637,6 +1680,7 @@ async def stream_openai_response(claude_prompt: str, model_name: str, conversati
     full_response = ""
     completion_sent = False
     has_tools = False  # Initialize the flag to track if tools are detected
+    start_time = time.time()
 
     try:
         # Use Claude's streaming JSON output
@@ -1655,10 +1699,32 @@ async def stream_openai_response(claude_prompt: str, model_name: str, conversati
                         "code": 500
                     }
                 }
-                # Send error response
-                yield f"data: {json.dumps(error_response)}\n\n"
-                # Immediately follow with DONE marker
-                yield "data: [DONE]\n\n"
+                # Format error response based on client type
+                if is_ollama_client:
+                    # Ollama format error
+                    ollama_model = get_ollama_model_name(model_name)
+                    ollama_error = {
+                        "model": ollama_model,
+                        "created_at": datetime.datetime.now().isoformat() + "Z",
+                        "error": error_response["error"]["message"],
+                        "done": False
+                    }
+                    yield f"{json.dumps(ollama_error)}\n"
+                else:
+                    # OpenAI format error (SSE)
+                    yield f"data: {json.dumps(error_response)}\n\n"
+                # Format done marker based on client type
+                if is_ollama_client:
+                    # Ollama expects a final message with done=true
+                    ollama_done = {
+                        "model": model_name,
+                        "created_at": created,
+                        "done": True
+                    }
+                    yield f"{json.dumps(ollama_done)}\n"
+                else:
+                    # OpenAI clients expect "data: [DONE]" marker
+                    yield "data: [DONE]\n\n"
                 completion_sent = True
                 return
                 
@@ -1755,10 +1821,25 @@ async def stream_openai_response(claude_prompt: str, model_name: str, conversati
                 if is_first_chunk:
                     is_first_chunk = False
                     
-                # Send the SSE chunk
-                sse_data = f"data: {json.dumps(response)}\n\n"
-                logger.debug(f"Sending OpenAI SSE chunk: {sse_data[:100]}...")
-                yield sse_data
+                # Format data based on client type
+                if is_ollama_client:
+                    # Ollama uses NDJSON format (one JSON object per line, no SSE formatting)
+                    # Convert to Ollama model name format if needed
+                    ollama_model = get_ollama_model_name(model_name)
+                    ollama_response = {
+                        "model": ollama_model,
+                        "created_at": datetime.datetime.now().isoformat() + "Z",
+                        "message": {"role": "assistant", "content": content},
+                        "done": False
+                    }
+                    ndjson_data = f"{json.dumps(ollama_response)}\n"
+                    logger.debug(f"Sending Ollama NDJSON chunk: {ndjson_data[:100]}...")
+                    yield ndjson_data
+                else:
+                    # OpenAI uses SSE format (data: prefix and double newlines)
+                    sse_data = f"data: {json.dumps(response)}\n\n"
+                    logger.debug(f"Sending OpenAI SSE chunk: {sse_data[:100]}...")
+                    yield sse_data
                 
             elif "done" in chunk and chunk["done"]:
                 # This is the completion signal - send final chunk with finish_reason
@@ -1786,9 +1867,28 @@ async def stream_openai_response(claude_prompt: str, model_name: str, conversati
                 }
                 yield f"data: {json.dumps(final_response)}\n\n"
                 
-                # Immediately follow with the DONE marker
-                # This is critical - clients wait for this marker
-                yield "data: [DONE]\n\n"
+                # Format done marker based on client type
+                if is_ollama_client:
+                    # Ollama expects a final message with done=true and more detailed stats
+                    total_duration = int((time.time() - start_time) * 1000000)  # microseconds
+                    ollama_model = get_ollama_model_name(model_name)
+                    ollama_done = {
+                        "model": ollama_model,
+                        "created_at": datetime.datetime.now().isoformat() + "Z",
+                        "message": {"role": "assistant", "content": ""},
+                        "done_reason": finish_reason,
+                        "done": True,
+                        "total_duration": total_duration,
+                        "load_duration": int(total_duration * 0.1),
+                        "prompt_eval_count": len(claude_prompt),
+                        "prompt_eval_duration": int(total_duration * 0.3),
+                        "eval_count": len(full_response),
+                        "eval_duration": int(total_duration * 0.6)
+                    }
+                    yield f"{json.dumps(ollama_done)}\n"
+                else:
+                    # OpenAI clients expect "data: [DONE]" marker
+                    yield "data: [DONE]\n\n"
                 completion_sent = True
                 
                 # Log complete response summary
@@ -1828,8 +1928,28 @@ async def stream_openai_response(claude_prompt: str, model_name: str, conversati
             }
             yield f"data: {json.dumps(final_response)}\n\n"
             
-            # Immediately follow with the DONE marker
-            yield "data: [DONE]\n\n"
+            # Format done marker based on client type
+            if is_ollama_client:
+                # Ollama expects a final message with done=true and more detailed stats
+                total_duration = int((time.time() - start_time) * 1000000)  # microseconds
+                ollama_model = get_ollama_model_name(model_name)
+                ollama_done = {
+                    "model": ollama_model,
+                    "created_at": datetime.datetime.now().isoformat() + "Z",
+                    "message": {"role": "assistant", "content": ""},
+                    "done_reason": finish_reason,
+                    "done": True,
+                    "total_duration": total_duration,
+                    "load_duration": int(total_duration * 0.1),
+                    "prompt_eval_count": len(claude_prompt),
+                    "prompt_eval_duration": int(total_duration * 0.3),
+                    "eval_count": len(full_response),
+                    "eval_duration": int(total_duration * 0.6)
+                }
+                yield f"{json.dumps(ollama_done)}\n"
+            else:
+                # OpenAI clients expect "data: [DONE]" marker
+                yield "data: [DONE]\n\n"
             
             # Log complete response summary
             logger.info(f"Complete OpenAI response length: {len(full_response)} chars")
@@ -1839,18 +1959,47 @@ async def stream_openai_response(claude_prompt: str, model_name: str, conversati
     except Exception as e:
         logger.error(f"Error streaming from Claude with OpenAI format: {str(e)}", exc_info=True)
         
-        # Send error response
-        error_response = {
-            "error": {
-                "message": f"Streaming error: {str(e)}",
-                "type": "server_error",
-                "code": 500
-            }
-        }
-        yield f"data: {json.dumps(error_response)}\n\n"
+        # Send error response based on client type
+        error_message = f"Streaming error: {str(e)}"
         
-        # Immediately follow with DONE marker (critical)
-        yield "data: [DONE]\n\n"
+        if is_ollama_client:
+            # Ollama format error
+            ollama_error = {
+                "model": model_name,
+                "created_at": created,
+                "error": error_message,
+                "done": False
+            }
+            yield f"{json.dumps(ollama_error)}\n"
+        else:
+            # OpenAI format error
+            error_response = {
+                "error": {
+                    "message": error_message,
+                    "type": "server_error",
+                    "code": 500
+                }
+            }
+            yield f"data: {json.dumps(error_response)}\n\n"
+        
+        # Format done marker based on client type
+        if is_ollama_client:
+            # For Ollama errors, return a properly formatted error message and done marker
+            ollama_model = get_ollama_model_name(model_name)
+            error_obj = {
+                "model": ollama_model,
+                "created_at": datetime.datetime.now().isoformat() + "Z",
+                "message": {
+                    "role": "assistant",
+                    "content": f"Error: {str(e)}"
+                },
+                "done_reason": "error",
+                "done": True
+            }
+            yield f"{json.dumps(error_obj)}\n"
+        else:
+            # OpenAI clients expect "data: [DONE]" marker
+            yield "data: [DONE]\n\n"
 
 # Unified function to parse request body
 async def parse_request_body(request: Request):
@@ -1966,22 +2115,49 @@ async def chat(request_body: Request):
             request_dict["tools"] = request.tools
             logger.info(f"[TOOLS] Request includes tools: {len(request.tools)} tool(s)")
             
-        # Use standard FastAPI StreamingResponse with our generator
-        logger.info("Using standard StreamingResponse for streaming OpenAI compatibility")
-        # Define the headers for streaming response
+        # Check if this request came from an Ollama client (via our api/chat endpoint)
+        # Can be detected in multiple ways
+        is_ollama_client = False
+        
+        # 1. Check the data dictionary for the flag
+        if 'ollama_client' in data:
+            is_ollama_client = data.get('ollama_client', False)
+            logger.info("Request identified as coming from Ollama client (via flag)")
+            
+        # 2. Check the URL path for Ollama endpoints
+        try:
+            if hasattr(request_body, 'scope') and 'path' in request_body.scope:
+                path = request_body.scope['path']
+                if path in ['/api/chat', '/api/generate']:
+                    is_ollama_client = True
+                    logger.info(f"Request identified as coming from Ollama client (via path: {path})")
+        except Exception as e:
+            logger.warning(f"Error checking request path: {e}")
+        
+        # Configure response format based on client type
+        if is_ollama_client:
+            logger.info("Using NDJSON format for Ollama streaming compatibility")
+            media_type = "application/x-ndjson"
+        else:
+            logger.info("Using SSE format for OpenAI streaming compatibility")
+            media_type = "text/event-stream"
+            
+        # Define headers for streaming response
         headers = {
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
+            "Content-Type": media_type,
             "Access-Control-Allow-Origin": "*",
             "X-Accel-Buffering": "no"  # Prevents buffering in Nginx, which helps with streaming
         }
         
-        # Log headers for debugging tools handshaking
-        logger.info(f"[TOOLS] Sending response headers: {headers}")
+        # Log headers for debugging
+        logger.info(f"Sending response with media_type={media_type}")
         
+        # Use the same streaming function regardless of client type
         return StreamingResponse(
             stream_openai_response(claude_prompt, request.model, conversation_id, request.id, request_dict),
-            media_type="text/event-stream",
+            media_type=media_type,
             headers=headers
         )
     else:
@@ -2327,234 +2503,104 @@ def get_base_model_name(model_name: str) -> str:
         return model_name.split(":")[0]
     return model_name
 
-# Streaming function for Ollama format
-async def stream_ollama_response(claude_prompt: str, model_name: str, conversation_id: str = None, original_request=None):
-    """
-    Stream responses from Claude in Ollama-compatible format.
-    Uses our existing stream_claude_output function but formats responses as Ollama would.
-    Uses stateless approach (no conversation ID) for consistency with non-streaming endpoints.
-    """
-    import time
-    
-    # For consistency with our other endpoints, we don't use conversation_id
-    # This prevents potential issues with conversation state
-    if conversation_id:
-        logger.info(f"Ignoring conversation_id for streaming to ensure consistent behavior")
-    
-    logger.info(f"Starting stream_ollama_response with stateless approach")
-    
-    start_time = time.time()
-    buffer = ""
-    full_response = ""
-    
-    try:
-        # Use Claude's streaming output with no conversation ID for consistent behavior
-        async for chunk in stream_claude_output(claude_prompt, None, original_request):
-            if chunk:
-                # Check if the chunk is a string or dict
-                content = chunk
-                if isinstance(chunk, dict):
-                    # If it's already a dict, extract content appropriately
-                    if "content" in chunk:
-                        content = chunk["content"]
-                    elif "result" in chunk:
-                        content = chunk["result"]
-                    else:
-                        # Convert the whole dict to a string if we can't extract content
-                        content = json.dumps(chunk)
-                
-                # Format in Ollama streaming format using helper function
-                ollama_model_name = get_ollama_model_name(model_name)
-                message_chunk = {
-                    "model": ollama_model_name,
-                    "created_at": datetime.datetime.now().isoformat() + "Z",
-                    "message": {
-                        "role": "assistant",
-                        "content": content
-                    },
-                    "done": False
-                }
-                
-                # Add to full response for metrics (ensuring we're concatenating strings)
-                if isinstance(content, str):
-                    full_response += content
-                else:
-                    full_response += str(content)
-                
-                # Send the chunk
-                yield json.dumps(message_chunk) + "\n"
-        
-        # Calculate timing information
-        end_time = time.time()
-        total_duration = int((end_time - start_time) * 1000000)  # microseconds
-        
-        # Send final completion message using helper function
-        ollama_model_name = get_ollama_model_name(model_name)
-        final_message = {
-            "model": ollama_model_name,
-            "created_at": datetime.datetime.now().isoformat() + "Z",
-            "message": {
-                "role": "assistant",
-                "content": ""  # Empty final content as per Ollama format
-            },
-            "done_reason": "stop",
-            "done": True,
-            "total_duration": total_duration,
-            "load_duration": int(total_duration * 0.1),  # Approximated metrics
-            "prompt_eval_count": len(claude_prompt),
-            "prompt_eval_duration": int(total_duration * 0.3),
-            "eval_count": len(full_response),
-            "eval_duration": int(total_duration * 0.6)
-        }
-        
-        yield json.dumps(final_message) + "\n"
-        logger.info(f"Completed streaming Ollama response")
-    
-    except Exception as e:
-        logger.error(f"Error in stream_ollama_response: {str(e)}")
-        # Send error message in Ollama format using helper function
-        ollama_model_name = get_ollama_model_name(model_name)
-        error_message = {
-            "model": ollama_model_name,
-            "created_at": datetime.datetime.now().isoformat() + "Z",
-            "message": {
-                "role": "assistant",
-                "content": f"Error: {str(e)}"
-            },
-            "done_reason": "error",
-            "done": True
-        }
-        yield json.dumps(error_message) + "\n"
+# No longer using separate Ollama streaming function
+# We now use a unified approach through the OpenAI chat endpoint
 
 @app.post("/api/chat")
 async def ollama_chat(request: OllamaChatRequest):
     """
     Ollama-compatible chat API endpoint.
-    Reuses our existing Claude integration but formats responses in Ollama's format.
     """
     logger.info(f"Received Ollama chat request for model: {request.model}")
     
-    # Extract base model name using helper function
-    raw_model_name = request.model
-    model_name = get_base_model_name(raw_model_name)
-    if model_name != raw_model_name:
-        logger.info(f"Extracted base model name from tagged model: {raw_model_name} -> {model_name}")
+    # Convert to Claude model name
+    model = get_base_model_name(request.model)
     
-    # Find the model or use default
-    model_exists = False
-    for model in AVAILABLE_MODELS:
-        if model["name"] == model_name:
-            model_exists = True
-            break
+    # Format for Claude CLI
+    messages = [{"role": msg.role, "content": msg.content} for msg in request.messages]
+    claude_prompt = "\n\n".join([f"{msg['role']}: {msg['content']}" for msg in messages])
     
-    if not model_exists:
-        model_name = AVAILABLE_MODELS[0]["name"] if AVAILABLE_MODELS else "claude-3.7-sonnet"
-        logger.info(f"Model {request.model} not found, using {model_name} instead")
+    # Explicitly use Ollama format for responses
+    is_ollama_client = True
     
-    # Extract options
-    stream = request.stream
-    options = request.options or {}
-    temperature = options.get("temperature", 0.7)
-    max_tokens = options.get("max_tokens", 4096)
-    
-    # For Ollama compatibility, we'll use stateless approach (no conversation ID)
-    # Don't use the -c flag to avoid potential conversation state issues
-    conversation_id = None
-    
-    # Format messages for Claude using the same approach as the OpenAI endpoint
-    formatted_messages = []
-    for msg in request.messages:
-        formatted_messages.append(f"{msg.role.capitalize()}: {msg.content}")
-    
-    claude_prompt = "\n\n".join(formatted_messages)
-    if not claude_prompt.endswith("Assistant:"):
-        claude_prompt += "\n\nAssistant:"
-        
-    # Log the approach we're using
-    logger.info(f"Using stateless approach for Ollama chat compatibility (no conversation ID)")
-    
-    # Create a request dictionary to pass to existing Claude functions
+    # Create metadata for streaming
+    request_id = f"ollama-req-{uuid.uuid4().hex[:8]}"
     request_dict = {
-        "model": model_name,
-        "messages": [{"role": msg.role, "content": msg.content} for msg in request.messages],
-        "stream": stream
+        "model": model,
+        "messages": messages,
+        "stream": request.stream,
+        "ollama_client": True
     }
     
-    # Handle streaming requests
-    if stream:
-        logger.info(f"Using streaming response for Ollama compatibility")
-        headers = {
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "Content-Type": "text/event-stream",
-            "Access-Control-Allow-Origin": "*"
-        }
+    # Configure media type for stream format
+    media_type = "application/x-ndjson"  # Ollama uses NDJSON
+    
+    # Define headers for streaming response
+    headers = {
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "Content-Type": media_type,
+        "Access-Control-Allow-Origin": "*",
+        "X-Accel-Buffering": "no"  # Prevents buffering in Nginx, which helps with streaming
+    }
+    
+    # If streaming, return the streaming response
+    if request.stream:
+        logger.info(f"Using NDJSON format for Ollama streaming")
+        
+        # Create an Ollama-specific streaming function
+        async def stream_ollama_response():
+            async for chunk in stream_claude_output(claude_prompt, None, request_dict):
+                if "content" in chunk:
+                    content = chunk["content"]
+                    # Format in Ollama format
+                    ollama_model = get_ollama_model_name(model)
+                    response = {
+                        "model": ollama_model,
+                        "created_at": datetime.datetime.now().isoformat() + "Z",
+                        "message": {
+                            "role": "assistant",
+                            "content": content
+                        },
+                        "done": False
+                    }
+                    yield json.dumps(response) + "\n"
+                elif "done" in chunk and chunk["done"]:
+                    # Final message with done flag
+                    ollama_model = get_ollama_model_name(model)
+                    done_msg = {
+                        "model": ollama_model,
+                        "created_at": datetime.datetime.now().isoformat() + "Z",
+                        "done": True
+                    }
+                    yield json.dumps(done_msg) + "\n"
         
         return StreamingResponse(
-            stream_ollama_response(claude_prompt, model_name, conversation_id, request_dict),
-            media_type="text/event-stream", 
+            stream_ollama_response(),
+            media_type=media_type,
             headers=headers
         )
-    
-    # Handle non-streaming requests
     else:
-        logger.info(f"Processing non-streaming Ollama request")
+        # For non-streaming, get the full response
+        claude_response = await run_claude_command(claude_prompt, conversation_id=None, original_request=request_dict)
         
-        try:
-            # Run Claude using the same function as the OpenAI endpoint
-            start_time = time.time()
-            response_text = await run_claude_command(claude_prompt, conversation_id, original_request=request_dict)
-            end_time = time.time()
-            
-            total_duration = int((end_time - start_time) * 1000000)  # microseconds
-            
-            # Format in Ollama's response format using helper function
-            ollama_model_name = get_ollama_model_name(model_name)
-            ollama_response = {
-                "model": ollama_model_name,
-                "created_at": datetime.datetime.now().isoformat() + "Z",
-                "message": {
-                    "role": "assistant",
-                    "content": response_text
-                },
-                "done_reason": "stop",
-                "done": True,
-                "total_duration": total_duration,
-                "load_duration": int(total_duration * 0.1),  # Approximated metrics
-                "prompt_eval_count": len(claude_prompt),
-                "prompt_eval_duration": int(total_duration * 0.3),
-                "eval_count": len(response_text),
-                "eval_duration": int(total_duration * 0.6)
-            }
-            
-            return JSONResponse(content=ollama_response)
-            
-        except Exception as e:
-            # Enhanced error handling with better client response
-            error_id = f"err-{uuid.uuid4().hex[:8]}"
-            logger.error(f"Error processing Ollama request {error_id}: {str(e)}", exc_info=True)
-            
-            # Extract actual error message from Claude command errors, rather than returning "Unknown error"
-            error_msg = str(e)
-            if "Claude command failed: Unknown error" in error_msg:
-                # Check the original command output for specific Claude errors
-                error_msg = "Claude command failed"
-                for pid, process_data in process_outputs.items():
-                    if "API Error:" in process_data.get("stdout", ""):
-                        error_msg = process_data["stdout"].split("API Error:", 1)[1].strip()
-                        break
-            
-            # Create an Ollama-compatible error response
-            error_response = {
-                "error": f"Error processing request: {error_msg}"
-            }
-            
-            # Return error with proper headers
-            return JSONResponse(
-                status_code=500,
-                content=error_response,
-                headers={"Access-Control-Allow-Origin": "*"}
-            )
+        # Format as Ollama response
+        ollama_model = get_ollama_model_name(model)
+        ollama_response = {
+            "model": ollama_model,
+            "created_at": datetime.datetime.now().isoformat() + "Z",
+            "message": {
+                "role": "assistant",
+                "content": claude_response.get("content", "")
+            },
+            "done": True
+        }
+        
+        return JSONResponse(
+            content=ollama_response,
+            media_type="application/json",
+            headers={"Access-Control-Allow-Origin": "*"}
+        )
 
 # Ollama generate endpoint model
 class OllamaGenerateRequest(BaseModel):
@@ -2572,32 +2618,82 @@ async def ollama_generate(request: OllamaGenerateRequest):
     """
     logger.info(f"Received Ollama generate request for model: {request.model}")
     
-    # Convert the prompt into a chat message
-    chat_request = OllamaChatRequest(
-        model=request.model,
-        messages=[OllamaChatMessage(role="user", content=request.prompt)],
-        stream=request.stream,
-        options=request.options,
-        format=request.format
-    )
+    # Convert to Claude model name
+    model = get_base_model_name(request.model)
     
-    try:
-        # Reuse the chat endpoint implementation
-        return await ollama_chat(chat_request)
-    except Exception as e:
-        # Enhanced error handling with better client response
-        error_id = f"err-{uuid.uuid4().hex[:8]}"
-        logger.error(f"Error processing Ollama generate request {error_id}: {str(e)}", exc_info=True)
+    # Format as a user prompt
+    claude_prompt = f"user: {request.prompt}"
+    
+    # Create metadata for streaming
+    request_id = f"ollama-gen-{uuid.uuid4().hex[:8]}"
+    request_dict = {
+        "model": model,
+        "messages": [{"role": "user", "content": request.prompt}],
+        "stream": request.stream,
+        "ollama_client": True
+    }
+    
+    # Configure media type for stream format
+    media_type = "application/x-ndjson"  # Ollama uses NDJSON
+    
+    # Define headers for streaming response
+    headers = {
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "Content-Type": media_type,
+        "Access-Control-Allow-Origin": "*",
+        "X-Accel-Buffering": "no"  # Prevents buffering in Nginx, which helps with streaming
+    }
+    
+    # If streaming, return the streaming response
+    if request.stream:
+        logger.info(f"Using NDJSON format for Ollama streaming")
         
-        # Create an Ollama-compatible error response
-        error_response = {
-            "error": f"Error processing request: {str(e)}"
+        # Create an Ollama-specific streaming function
+        async def stream_ollama_response():
+            async for chunk in stream_claude_output(claude_prompt, None, request_dict):
+                if "content" in chunk:
+                    content = chunk["content"]
+                    # Format in Ollama format
+                    ollama_model = get_ollama_model_name(model)
+                    response = {
+                        "model": ollama_model,
+                        "created_at": datetime.datetime.now().isoformat() + "Z",
+                        "response": content,
+                        "done": False
+                    }
+                    yield json.dumps(response) + "\n"
+                elif "done" in chunk and chunk["done"]:
+                    # Final message with done flag
+                    ollama_model = get_ollama_model_name(model)
+                    done_msg = {
+                        "model": ollama_model,
+                        "created_at": datetime.datetime.now().isoformat() + "Z",
+                        "done": True
+                    }
+                    yield json.dumps(done_msg) + "\n"
+        
+        return StreamingResponse(
+            stream_ollama_response(),
+            media_type=media_type,
+            headers=headers
+        )
+    else:
+        # For non-streaming, get the full response
+        claude_response = await run_claude_command(claude_prompt, conversation_id=None, original_request=request_dict)
+        
+        # Format as Ollama response
+        ollama_model = get_ollama_model_name(model)
+        ollama_response = {
+            "model": ollama_model,
+            "created_at": datetime.datetime.now().isoformat() + "Z",
+            "response": claude_response.get("content", ""),
+            "done": True
         }
         
-        # Return error with proper headers
         return JSONResponse(
-            status_code=500,
-            content=error_response,
+            content=ollama_response,
+            media_type="application/json",
             headers={"Access-Control-Allow-Origin": "*"}
         )
 
@@ -2770,22 +2866,19 @@ def run_self_test():
         print(f"FAIL: Error checking metrics: {e}")
         return False
     
-    # Test 2: Check dashboard HTML generation
-    print("Test 2: Checking dashboard HTML generation...")
+    # Test 2: Check metrics data generation
+    print("Test 2: Checking metrics data generation...")
     try:
-        html = generate_dashboard_html()
-        if not html or not isinstance(html, str):
-            print("FAIL: generate_dashboard_html() did not return a string")
+        metrics_data = metrics.get_metrics()
+        if not isinstance(metrics_data, dict):
+            print("FAIL: metrics.get_metrics() did not return a dictionary")
             return False
-        if not "<!DOCTYPE html>" in html:
-            print("FAIL: Dashboard HTML does not contain DOCTYPE declaration")
+        if 'uptime' not in metrics_data or 'claude_invocations' not in metrics_data:
+            print(f"FAIL: Metrics data is missing required fields")
             return False
-        if not "Claude Usage" in html:
-            print("FAIL: Dashboard HTML does not contain 'Claude Usage' section")
-            return False
-        print("PASS: Dashboard HTML generated correctly")
+        print("PASS: Metrics data generation works correctly")
     except Exception as e:
-        print(f"FAIL: Error generating dashboard HTML: {e}")
+        print(f"FAIL: Error generating metrics data: {e}")
         return False
     
     # Test 3: Check conversation ID tracking
@@ -2946,881 +3039,23 @@ def get_running_claude_processes():
         logger.error(f"Error getting Claude processes: {e}")
         return []
 
-def generate_dashboard_html():
-    """Generate HTML for the dashboard page"""
-    # Get current metrics
-    metrics_data = metrics.get_metrics()
-    
-    # Get currently running Claude processes
-    running_processes = get_running_claude_processes()
-    
-    # Format metrics for display - convert from ms to minutes and seconds
-    def format_time_ms(time_ms):
-        if not time_ms:
-            return "N/A"
-        total_seconds = time_ms / 1000
-        minutes = int(total_seconds // 60)
-        seconds = total_seconds % 60
-        return f"{minutes}m {seconds:.1f}s"
-    
-    avg_execution = format_time_ms(metrics_data['performance']['avg_execution_time_ms'])
-    median_execution = format_time_ms(metrics_data['performance']['median_execution_time_ms'])
-    
-    # Memory metrics formatting
-    avg_memory = f"{metrics_data['resources']['avg_memory_mb']:.2f}" if metrics_data['resources']['avg_memory_mb'] else "N/A"
-    peak_memory = f"{metrics_data['resources']['peak_memory_mb']:.2f}" if metrics_data['resources']['peak_memory_mb'] else "N/A"
-    avg_cpu = f"{metrics_data['resources']['avg_cpu_percent']:.2f}%" if metrics_data['resources']['avg_cpu_percent'] else "N/A"
-    
-    # Create the HTML
-    html = f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Claude Ollama API Dashboard</title>
-    <style>
-        body {{
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, 'Open Sans', 'Helvetica Neue', sans-serif;
-            line-height: 1.6;
-            color: #333;
-            margin: 0;
-            padding: 20px;
-            background-color: #f5f5f7;
-        }}
-        .container {{
-            max-width: 1200px;
-            margin: 0 auto;
-        }}
-        h1, h2, h3 {{
-            color: #000;
-        }}
-        h1 {{
-            margin-bottom: 10px;
-            border-bottom: 1px solid #ddd;
-            padding-bottom: 10px;
-        }}
-        .stats-grid {{
-            display: grid;
-            grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
-            gap: 20px;
-            margin-bottom: 30px;
-        }}
-        .card {{
-            background: white;
-            border-radius: 10px;
-            padding: 20px;
-            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
-        }}
-        .metric {{
-            margin-bottom: 15px;
-        }}
-        .metric-name {{
-            font-weight: bold;
-            margin-bottom: 5px;
-            color: #555;
-        }}
-        .metric-value {{
-            font-size: 24px;
-            font-weight: 500;
-        }}
-        .metric-unit {{
-            font-size: 14px;
-            color: #777;
-        }}
-        .error-card {{
-            background-color: #fff8f8;
-            border-left: 4px solid #e53935;
-        }}
-        table {{
-            width: 100%;
-            border-collapse: collapse;
-            margin-top: 10px;
-        }}
-        th, td {{
-            padding: 12px;
-            text-align: left;
-            border-bottom: 1px solid #ddd;
-        }}
-        th {{
-            background-color: #f2f2f2;
-            font-weight: 600;
-        }}
-        tr:hover {{
-            background-color: #f5f5f5;
-        }}
-        .reload {{
-            display: inline-block;
-            background-color: #0071e3;
-            color: white;
-            padding: 8px 16px;
-            border-radius: 6px;
-            text-decoration: none;
-            margin-top: 10px;
-            transition: background-color 0.2s;
-        }}
-        .reload:hover {{
-            background-color: #0077ed;
-        }}
-        .button {{
-            display: inline-block;
-            padding: 4px 8px;
-            border-radius: 4px;
-            text-decoration: none;
-            font-size: 13px;
-            cursor: pointer;
-            border: none;
-        }}
-        .alert {{
-            background-color: #f44336;
-            color: white;
-        }}
-        .alert:hover {{
-            background-color: #d32f2f;
-        }}
-        .timestamp {{
-            color: #777;
-            font-size: 14px;
-            margin-bottom: 20px;
-        }}
-        .badge {{
-            display: inline-block;
-            padding: 3px 8px;
-            border-radius: 12px;
-            font-size: 12px;
-            font-weight: 500;
-            margin-left: 8px;
-        }}
-        .badge-success {{
-            background-color: #e3f2fd;
-            color: #0277bd;
-        }}
-        .badge-primary {{
-            background-color: #e8f5e9;
-            color: #2e7d32;
-        }}
-        .auto-refresh {{
-            font-size: 14px;
-            color: #555;
-            margin-top: 5px;
-        }}
-        .refresh-toggle {{
-            margin-left: 10px;
-            color: #0071e3;
-            text-decoration: none;
-            font-size: 12px;
-            padding: 2px 6px;
-            border-radius: 4px;
-            background-color: #f0f7ff;
-        }}
-        .refresh-toggle:hover {{
-            background-color: #e1f0ff;
-        }}
-        .chart-container {{
-            height: 200px;
-            margin-top: 15px;
-        }}
-        .highlight {{
-            background-color: #f3f9ff;
-            border-left: 4px solid #0077ed;
-        }}
-        /* Modal styles */
-        .modal {{
-            display: none;
-            position: fixed;
-            z-index: 1000;
-            left: 0;
-            top: 0;
-            width: 100%;
-            height: 100%;
-            overflow: auto;
-            background-color: rgba(0,0,0,0.4);
-        }}
-        .modal-content {{
-            background-color: #fefefe;
-            margin: 5% auto;
-            padding: 20px;
-            border: 1px solid #ddd;
-            border-radius: 8px;
-            width: 80%;
-            max-width: 1000px;
-            max-height: 80vh;
-            overflow-y: auto;
-            position: relative;
-        }}
-        .modal-header {{
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            border-bottom: 1px solid #eee;
-            padding-bottom: 10px;
-            margin-bottom: 15px;
-        }}
-        .modal-header h3 {{
-            margin: 0;
-        }}
-        .modal-footer {{
-            margin-top: 15px;
-            padding-top: 10px;
-            border-top: 1px solid #eee;
-            text-align: right;
-        }}
-        .close-button {{
-            color: #aaa;
-            font-size: 28px;
-            font-weight: bold;
-            cursor: pointer;
-        }}
-        .close-button:hover {{
-            color: black;
-        }}
-        pre {{
-            background-color: #f5f5f5;
-            padding: 10px;
-            border-radius: 5px;
-            overflow-x: auto;
-            white-space: pre-wrap;
-            max-height: 300px;
-            overflow-y: auto;
-        }}
-        pre.error {{
-            background-color: #fff0f0;
-            border-left: 3px solid #ff6b6b;
-        }}
-        .output-table {{
-            width: 100%;
-        }}
-    </style>
-    <script>
-        // Store scroll position before refresh
-        function saveScrollPosition() {{
-            sessionStorage.setItem('scrollPosition', window.scrollY);
-        }}
-        
-        // Restore scroll position after refresh
-        function restoreScrollPosition() {{
-            const scrollPosition = sessionStorage.getItem('scrollPosition');
-            if (scrollPosition) {{
-                window.scrollTo(0, parseInt(scrollPosition));
-            }}
-        }}
-        
-        // Variables to control auto-refresh
-        let refreshTimeout;
-        let refreshEnabled = true;
-        const REFRESH_INTERVAL = 10000;  // 10 seconds
-        
-        // Function to schedule next refresh
-        function scheduleRefresh() {{
-            // Clear any existing timeout
-            if (refreshTimeout) {{
-                clearTimeout(refreshTimeout);
-            }}
-            
-            // Only schedule if refresh is enabled
-            if (refreshEnabled) {{
-                refreshTimeout = setTimeout(function() {{
-                    // Only reload if no modal is open
-                    if (document.querySelector('.modal[style*="display: block"]') === null) {{
-                        saveScrollPosition();
-                        window.location.reload();
-                    }} else {{
-                        // If modal is open, reschedule the refresh
-                        scheduleRefresh();
-                    }}
-                }}, REFRESH_INTERVAL);
-            }}
-        }}
-        
-        // Function to toggle refresh on/off
-        function toggleRefresh() {{
-            refreshEnabled = !refreshEnabled;
-            
-            // Update status text
-            const statusElement = document.getElementById('refresh-status');
-            if (statusElement) {{
-                statusElement.textContent = refreshEnabled ? 'Auto-refresh' : 'Refresh paused';
-                statusElement.style.color = refreshEnabled ? '' : '#ff6b6b';
-            }}
-            
-            // If turning refresh back on, schedule next refresh
-            if (refreshEnabled) {{
-                scheduleRefresh();
-            }} else if (refreshTimeout) {{
-                clearTimeout(refreshTimeout);
-            }}
-        }}
-        
-        // Start the refresh cycle
-        scheduleRefresh();
-        
-        // Countdown timer for refresh and restore scroll position
-        window.onload = function() {{
-            // Restore scroll position on page load
-            restoreScrollPosition();
-            
-            // Setup countdown timer
-            let timeLeft = 10;
-            const timerElement = document.getElementById('refresh-timer');
-            const statusElement = document.getElementById('refresh-status');
-            
-            setInterval(function() {{
-                // Only countdown if refresh is enabled
-                if (refreshEnabled) {{
-                    timeLeft -= 1;
-                    if (timeLeft >= 0) {{
-                        timerElement.textContent = timeLeft;
-                    }} else {{
-                        timeLeft = 10;
-                    }}
-                }} else {{
-                    // If refresh is paused, keep showing status
-                    statusElement.textContent = 'Refresh paused';
-                    statusElement.style.color = '#ff6b6b';
-                }}
-            }}, 1000);
-            
-            // Make manual refresh button preserve scroll position
-            document.querySelectorAll('.reload').forEach(function(button) {{
-                button.addEventListener('click', function(e) {{
-                    e.preventDefault();
-                    saveScrollPosition();
-                    window.location.reload();
-                }});
-            }});
-        }};
-    </script>
-</head>
-<body>
-    <div class="container">
-        <h1>Claude API Dashboard</h1>
-        <div class="timestamp">
-            Last updated: {datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
-            <span class="auto-refresh">
-                (<span id="refresh-status">Auto-refresh</span> in <span id="refresh-timer">10</span>s)
-                <a href="javascript:void(0)" onclick="toggleRefresh()" class="refresh-toggle">Pause/Resume</a>
-            </span>
-        </div>
+# Dashboard functions and endpoints have been moved to dashboard.py
 
-        <div class="stats-grid">
-            <div class="card">
-                <h2>Server Status</h2>
-                <div class="metric">
-                    <div class="metric-name">Uptime</div>
-                    <div class="metric-value">{metrics_data['uptime']['formatted']}</div>
-                </div>
-                <div class="metric">
-                    <div class="metric-name">Server Started</div>
-                    <div class="metric-value" style="font-size: 16px;">{metrics_data['uptime']['start_time'].replace('T', ' ').split('.')[0]}</div>
-                </div>
-            </div>
+# Dashboard endpoints have been moved to dashboard.py
 
-            <div class="card highlight">
-                <h2>Claude Invocations</h2>
-                <div class="metric">
-                    <div class="metric-name">Total Claude Processes</div>
-                    <div class="metric-value">{metrics_data['claude_invocations']['total']}</div>
-                </div>
-                <div class="metric">
-                    <div class="metric-name">Currently Running</div>
-                    <div class="metric-value">{metrics_data['claude_invocations']['current_running']}</div>
-                </div>
-                <div class="metric">
-                    <div class="metric-name">Max Concurrent</div>
-                    <div class="metric-value">{metrics_data['claude_invocations']['max_concurrent']}</div>
-                </div>
-            </div>
-
-            <div class="card">
-                <h2>Claude Usage</h2>
-                <div class="metric">
-                    <div class="metric-name">Invocations Per Minute</div>
-                    <div class="metric-value">{metrics_data['claude_invocations']['per_minute']:.2f}</div>
-                </div>
-                <div class="metric">
-                    <div class="metric-name">Invocations Per Hour</div>
-                    <div class="metric-value">{metrics_data['claude_invocations']['per_hour']:.2f}</div>
-                </div>
-                <div class="metric">
-                    <div class="metric-name">Active Conversations</div>
-                    <div class="metric-value">{len(metrics.active_conversations)}</div>
-                </div>
-                <div class="metric">
-                    <div class="metric-name">Total Conversations</div>
-                    <div class="metric-value">{len(metrics.unique_conversations)}</div>
-                </div>
-                <div class="metric">
-                    <div class="metric-name">Total Output Tokens</div>
-                    <div class="metric-value">{metrics_data['tokens']['total_completion']}</div>
-                </div>
-            </div>
-
-            <div class="card highlight">
-                <h2>Performance</h2>
-                <div class="metric">
-                    <div class="metric-name">Average Execution Time</div>
-                    <div class="metric-value">{avg_execution}</div>
-                </div>
-                <div class="metric">
-                    <div class="metric-name">Median Execution Time</div>
-                    <div class="metric-value">{median_execution}</div>
-                </div>
-            </div>
-
-            <div class="card">
-                <h2>System Resources</h2>
-                <div class="metric">
-                    <div class="metric-name">Average Memory</div>
-                    <div class="metric-value">{avg_memory} <span class="metric-unit">MB</span></div>
-                </div>
-                <div class="metric">
-                    <div class="metric-name">Peak Memory</div>
-                    <div class="metric-value">{peak_memory} <span class="metric-unit">MB</span></div>
-                </div>
-                <div class="metric">
-                    <div class="metric-name">Average CPU</div>
-                    <div class="metric-value">{avg_cpu}</div>
-                </div>
-            </div>
-
-            <div class="card">
-                <h2>Conversations</h2>
-                <div class="metric">
-                    <div class="metric-name">Unique Conversations</div>
-                    <div class="metric-value">{metrics_data['conversations']['unique_count']}</div>
-                </div>
-                <div class="metric">
-                    <div class="metric-name">Active Conversations</div>
-                    <div class="metric-value">{metrics_data['conversations']['active_count']}</div>
-                </div>
-            </div>
-        </div>
-
-        <div class="card">
-            <h2>Timeline</h2>
-            <table>
-                <tr>
-                    <th>Event</th>
-                    <th>Timestamp</th>
-                </tr>
-                <tr>
-                    <td>First Claude Invocation</td>
-                    <td>{metrics_data['timestamps']['first_invocation'].replace('T', ' ').split('.')[0] if metrics_data['timestamps']['first_invocation'] else 'N/A'}</td>
-                </tr>
-                <tr>
-                    <td>Last Claude Invocation</td>
-                    <td>{metrics_data['timestamps']['last_invocation'].replace('T', ' ').split('.')[0] if metrics_data['timestamps']['last_invocation'] else 'N/A'}</td>
-                </tr>
-                <tr>
-                    <td>Last Claude Completion</td>
-                    <td>{metrics_data['timestamps']['last_completion'].replace('T', ' ').split('.')[0] if metrics_data['timestamps']['last_completion'] else 'N/A'}</td>
-                </tr>
-            </table>
-        </div>
-
-        <div class="card">
-            <h2>Invocations by Model</h2>
-            <table>
-                <tr>
-                    <th>Model</th>
-                    <th>Count</th>
-                </tr>
-                {''.join([f"<tr><td>{model}</td><td>{count}</td></tr>" for model, count in metrics_data['distribution']['by_model'].items()])}
-            </table>
-        </div>
-
-        <div class="card">
-            <h2>Invocations by Conversation</h2>
-            <table>
-                <tr>
-                    <th>Conversation ID</th>
-                    <th>Count</th>
-                </tr>
-                {''.join([f"<tr><td>{conv_id}</td><td>{count}</td></tr>" for conv_id, count in list(metrics_data['distribution']['by_conversation'].items())[:25]])}
-                {f"<tr><td colspan='2'>...and {len(metrics_data['distribution']['by_conversation']) - 25} more conversations</td></tr>" if len(metrics_data['distribution']['by_conversation']) > 25 else ""}
-            </table>
-        </div>
-
-        <div id="processes" class="card highlight">
-            <h2>Proxy-Launched Claude Processes</h2>
-            <p>This section shows Claude processes launched by this proxy server. <a href="#process-outputs" class="button">View Recent Process Outputs</a></p>
-            <table>
-                <tr>
-                    <th>PID</th>
-                    <th>User</th>
-                    <th>CPU %</th>
-                    <th>Memory %</th>
-                    <th>Started</th>
-                    <th>Runtime</th>
-                    <th>Command</th>
-                    <th>Actions</th>
-                </tr>
-"""
-    # Add process rows dynamically
-    process_rows = ""
-    if running_processes:
-        for process in running_processes:
-            process_rows += f"""                <tr>
-                    <td>{process['pid']}</td>
-                    <td>{process['user']}</td>
-                    <td>{process['cpu']}%</td>
-                    <td>{process['memory']}%</td>
-                    <td>{process['started']}</td>
-                    <td>{process['runtime']}</td>
-                    <td><code>{process['command']}</code></td>
-                    <td>
-                        <a href="javascript:void(0)" onclick="if(confirm('Are you sure you want to terminate process {process['pid']}?')) fetch('/terminate_process/{process['pid']}', {{method: 'POST'}}).then(() => window.location.reload());" class="button alert">Terminate</a>
-                    </td>
-                </tr>"""
-    else:
-        process_rows = "<tr><td colspan='8'>No proxy-launched Claude processes currently running</td></tr>"
-    
-    html += process_rows
-    
-    html += f"""            </table>
-            <p><em>Last updated: {datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")}</em></p>
-            <p><a href="#processes" class="reload">Refresh</a></p>
-        </div>"""
-
-    # Add error card if there are errors
-    if metrics_data['errors']['count'] > 0:
-        error_rows = ""
-        for error in metrics_data['errors']['recent']:
-            error_time = error['time'].replace('T', ' ').split('.')[0]
-            error_msg = error['error']
-            error_rows += f"<tr><td>{error_time}</td><td>{error_msg}</td></tr>"
-            
-        html += f"""
-        <div class="card error-card">
-            <h2>Recent Errors</h2>
-            <div class="metric">
-                <div class="metric-name">Total Errors</div>
-                <div class="metric-value">{metrics_data['errors']['count']}</div>
-            </div>
-            <table>
-                <tr>
-                    <th>Time</th>
-                    <th>Error</th>
-                </tr>
-                {error_rows}
-            </table>
-        </div>
-        """
-        
-    # Add section for process outputs
-    html += """
-        <div id="process-outputs" class="card">
-            <h2>Recent Process Outputs</h2>
-            <p>This section shows outputs from recently completed Claude processes (up to 20):</p>
-            <div id="process-output-list">Loading process outputs...</div>
-            
-            <script>
-                // Fetch process outputs on page load
-                async function fetchProcessOutputs() {
-                    try {
-                        const response = await fetch('/process_outputs');
-                        const data = await response.json();
-                        displayProcessOutputs(data.outputs);
-                    } catch (error) {
-                        console.error('Error fetching process outputs:', error);
-                        document.getElementById('process-output-list').textContent = 'Error loading process outputs';
-                    }
-                }
-                
-                // Display process outputs in a table
-                function displayProcessOutputs(outputs) {
-                    const container = document.getElementById('process-output-list');
-                    
-                    if (!outputs || outputs.length === 0) {
-                        container.innerHTML = '<p>No process outputs available yet.</p>';
-                        return;
-                    }
-                    
-                    let html = `
-                    <table class="output-table">
-                        <tr>
-                            <th>PID</th>
-                            <th>Timestamp</th>
-                            <th>Command</th>
-                            <th>Actions</th>
-                        </tr>
-                    `;
-                    
-                    outputs.forEach(output => {
-                        // Format timestamp
-                        const timestamp = new Date(output.timestamp).toLocaleString();
-                        
-                        html += `
-                        <tr>
-                            <td>${output.pid}</td>
-                            <td>${timestamp}</td>
-                            <td><code>${output.command}</code></td>
-                            <td>
-                                <button class="button" onclick="viewProcessOutput('${output.pid}')">View Details</button>
-                            </td>
-                        </tr>
-                        `;
-                    });
-                    
-                    html += '</table>';
-                    container.innerHTML = html;
-                }
-                
-                // Fetch and display a specific process output
-                async function viewProcessOutput(pid) {
-                    try {
-                        // Pause auto-refresh while viewing output
-                        refreshEnabled = false;
-                        
-                        const response = await fetch(`/process_output/${pid}`);
-                        const data = await response.json();
-                        
-                        // Create modal window
-                        const modal = document.createElement('div');
-                        modal.classList.add('modal');
-                        modal.setAttribute('data-pid', pid);
-                        
-                        // Format the timestamp
-                        const timestamp = new Date(data.timestamp).toLocaleString();
-                        
-                        // Format the content
-                        const promptHtml = `<pre>${escapeHtml(data.prompt)}</pre>`;
-                        const stdoutHtml = `<pre>${escapeHtml(data.stdout)}</pre>`;
-                        const stderrHtml = data.stderr ? `<pre class="error">${escapeHtml(data.stderr)}</pre>` : '<p>No errors</p>';
-                        
-                        // Format the original request if available
-                        let originalRequestHtml = '<p>No original request data available</p>';
-                        if (data.original_request) {
-                            originalRequestHtml = `<pre>${escapeHtml(JSON.stringify(data.original_request, null, 2))}</pre>`;
-                        }
-                        
-                        // Format the response (original and converted)
-                        let responseHtml = '';
-                        
-                        // Check if the response is an object or string
-                        if (typeof data.response === 'object') {
-                            responseHtml = `<pre>${escapeHtml(JSON.stringify(data.response, null, 2))}</pre>`;
-                        } else {
-                            responseHtml = `<pre>${escapeHtml(data.response)}</pre>`;
-                        }
-                        
-                        // Format the converted response if available
-                        let convertedHtml = '';
-                        if (data.converted_response) {
-                            convertedHtml = `
-                                <h4>Converted OpenAI Response (Sent to OpenWebUI)</h4>
-                                <pre>${escapeHtml(JSON.stringify(data.converted_response, null, 2))}</pre>
-                            `;
-                        }
-                        
-                        modal.innerHTML = `
-                            <div class="modal-content">
-                                <div class="modal-header">
-                                    <h3>Process Output: PID ${data.pid}</h3>
-                                    <span class="close-button" onclick="closeModal(this)">&times;</span>
-                                </div>
-                                <p><strong>Timestamp:</strong> ${timestamp}</p>
-                                <p><strong>Command:</strong> <code>${escapeHtml(data.command)}</code></p>
-                                
-                                <h4>Prompt</h4>
-                                ${promptHtml}
-                                
-                                <h4>Original Request (incl. System Prompt)</h4>
-                                ${originalRequestHtml}
-                                
-                                <h4>Standard Output</h4>
-                                ${stdoutHtml}
-                                
-                                <h4>Standard Error</h4>
-                                ${stderrHtml}
-                                
-                                <h4>Original Claude Response</h4>
-                                ${responseHtml}
-                                
-                                ${convertedHtml}
-                                
-                                <div class="modal-footer">
-                                    <button class="button" onclick="closeModal(this.closest('.modal-content').querySelector('.close-button'))">Close</button>
-                                </div>
-                            </div>
-                        `;
-                        
-                        document.body.appendChild(modal);
-                        modal.style.display = 'block';
-                        
-                        // Add event listener for the escape key
-                        document.addEventListener('keydown', handleEscapeKey);
-                        
-                    } catch (error) {
-                        console.error('Error fetching process output:', error);
-                        alert('Error loading process output for PID ' + pid);
-                        
-                        // Re-enable auto-refresh if there was an error
-                        refreshEnabled = true;
-                        scheduleRefresh();
-                    }
-                }
-                
-                // Handle escape key for closing modal
-                function handleEscapeKey(e) {
-                    if (e.key === 'Escape') {
-                        const modal = document.querySelector('.modal[style*="display: block"]');
-                        if (modal) {
-                            closeModal(modal.querySelector('.close-button'));
-                        }
-                    }
-                }
-                
-                // Helper function to escape HTML special characters
-                function escapeHtml(text) {
-                    if (!text) return '';
-                    return text
-                        .replace(/&/g, "&amp;")
-                        .replace(/</g, "&lt;")
-                        .replace(/>/g, "&gt;")
-                        .replace(/"/g, "&quot;")
-                        .replace(/'/g, "&#039;");
-                }
-                
-                // Close the modal when the close button is clicked
-                function closeModal(button) {
-                    const modal = button.closest('.modal');
-                    modal.style.display = 'none';
-                    modal.remove();
-                    
-                    // Remove escape key listener
-                    document.removeEventListener('keydown', handleEscapeKey);
-                    
-                    // Re-enable auto-refresh
-                    refreshEnabled = true;
-                    scheduleRefresh();
-                }
-                
-                // Fetch outputs on page load
-                document.addEventListener('DOMContentLoaded', fetchProcessOutputs);
-            </script>
-        </div>
-    """
-    
-    # Close the outer containers
-    html += """
-    </div>
-</body>
-</html>
-"""
-    return html
-
-@app.get("/", response_class=HTMLResponse)
-async def root():
-    """Dashboard endpoint that displays API metrics."""
-    return generate_dashboard_html()
-
-@app.get("/status", response_class=PlainTextResponse)
-async def status():
-    """Simple status endpoint that mimics Ollama's root response."""
-    return "Ollama is running"
-
-@app.get("/metrics", response_class=JSONResponse)
-async def get_metrics():
-    """JSON endpoint for metrics data"""
-    try:
-        metrics_data = metrics.get_metrics()
-        
-        # Always ensure cost data is present
-        if 'cost' not in metrics_data:
-            metrics_data['cost'] = {
-                'total_cost': 0.0,
-                'avg_cost': 0.0
-            }
-        
-        return metrics_data
-    except Exception as e:
-        # Fallback metrics response for tests
-        logger.warning(f"Error getting metrics: {str(e)}")
-        return {
-            "uptime": {"seconds": 0, "formatted": "0 seconds"},
-            "claude_invocations": {"total": 0, "per_minute": 0, "per_hour": 0, "current_running": 0},
-            "cost": {"total_cost": 0.0, "avg_cost": 0.0}
-        }
-
-@app.get("/process_outputs")
-async def list_process_outputs():
-    """List all stored process outputs"""
-    # Convert OrderedDict to list for JSON serialization, newest first
-    outputs_list = []
-    for pid, output in reversed(process_outputs.items()):
-        # Create a summary without the full output text
-        summary = {
-            "pid": output["pid"],
-            "timestamp": output["timestamp"],
-            "command": output["command"][:100] + ("..." if len(output["command"]) > 100 else ""),
-            "prompt_preview": output["prompt"][:100] + ("..." if len(output["prompt"]) > 100 else ""),
-            "has_stdout": bool(output["stdout"]),
-            "has_stderr": bool(output["stderr"]),
-            "has_response": bool(output["response"])
-        }
-        outputs_list.append(summary)
-    
-    return {"outputs": outputs_list}
-
-@app.get("/process_output/{pid}")
-async def get_single_process_output(pid: str):
-    """Get the output for a specific process"""
-    output = get_process_output(pid)
-    if output:
-        return output
-    else:
-        raise HTTPException(status_code=404, detail=f"No output found for process {pid}")
-
-@app.post("/terminate_process/{pid}")
-async def terminate_process(pid: str):
-    """
-    Terminate a specific process by PID.
-    This is used for the process management UI.
-    """
-    try:
-        pid = int(pid)
-        import os
-        import signal
-        import psutil
-        
-        # Safety check - only terminate Claude-related processes
-        process = psutil.Process(pid)
-        if "claude" in process.name().lower() or any("claude" in arg.lower() for arg in process.cmdline()):
-            # First try SIGTERM for clean shutdown
-            logger.info(f"Attempting to terminate Claude process {pid} with SIGTERM")
-            process.terminate()
-            
-            # Wait up to 3 seconds for process to terminate
-            try:
-                process.wait(timeout=3)
-                return {"status": "success", "message": f"Process {pid} terminated successfully"}
-            except psutil.TimeoutExpired:
-                # If process doesn't terminate, use SIGKILL
-                logger.warning(f"Process {pid} did not terminate with SIGTERM, using SIGKILL")
-                process.kill()
-                return {"status": "success", "message": f"Process {pid} forcibly terminated with SIGKILL"}
-        else:
-            logger.warning(f"Attempted to terminate non-Claude process {pid}, request denied")
-            return JSONResponse(
-                status_code=403,
-                content={"status": "error", "message": "Can only terminate Claude-related processes"}
-            )
-    except ValueError:
-        return JSONResponse(
-            status_code=400,
-            content={"status": "error", "message": "Invalid PID format"}
-        )
-    except psutil.NoSuchProcess:
-        return JSONResponse(
-            status_code=404,
-            content={"status": "error", "message": f"Process {pid} not found"}
-        )
-    except Exception as e:
-        logger.error(f"Error terminating process {pid}: {e}")
-        return JSONResponse(
-            status_code=500,
-            content={"status": "error", "message": f"Error terminating process: {str(e)}"}
-        )
+# Initialize dashboard if the module is available
+if dashboard is not None:
+    # Initialize dashboard with required dependencies
+    dashboard.init_dashboard(
+        app=app,
+        metrics_module=metrics,
+        get_process_output_fn=get_process_output,
+        process_outputs_dict=process_outputs,
+        get_running_claude_processes_fn=get_running_claude_processes
+    )
+    logger.info("Dashboard module initialized")
+else:
+    logger.info("Dashboard module not found, embedded dashboard will be used")
 
 if __name__ == "__main__":
     import uvicorn
