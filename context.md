@@ -8,6 +8,38 @@ Claudacity is a FastAPI-based server that provides an Ollama-compatible API for 
 - **OPENWEBUI_COMPATIBILITY.md**: Documentation for OpenWebUI compatibility features
 - **tests/**: Contains test files including test_api.py, test_metrics.py, test_dashboard.py
 
+## Service Management
+- **ALWAYS USE THE SERVICE CONTROLLER** for managing the service
+- **NEVER start the claude_ollama_server.py directly**
+- The service runs on port 22434 by default (registered in the 22xxx range)
+
+### Service Commands
+```bash
+# Start the service
+python claude_service.py --start
+
+# Stop the service
+python claude_service.py --stop
+
+# Restart the service (after code changes)
+python claude_service.py --stop && python claude_service.py --start
+
+# Check service status
+python claude_service.py --status
+
+# Install as a system service (first-time setup)
+python claude_service.py --install
+
+# Uninstall the service
+python claude_service.py --uninstall
+```
+
+### Important Notes
+- The service is configured to run on port 22434 by default
+- Logs are stored in the ./logs directory
+- If you need to test without using the service, use port 33xxx range
+- Always restart the service after making code changes
+
 ## Important Testing Instructions
 - **ALWAYS RUN TESTS AFTER MAKING CHANGES** before telling the user that changes are ready
 - Run tests with: `python tests/run_tests.py --all` or for specific tests:
