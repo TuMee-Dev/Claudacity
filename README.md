@@ -155,7 +155,7 @@ response = client.chat.completions.create(
 To connect Open WebUI to this server, set:
 - OLLAMA_BASE_URL=http://localhost:22434
 
-Note: This server includes special handling for tool/function calling with OpenWebUI. When Claude returns a JSON object with tools, the server transforms it into a text response that will prompt OpenWebUI to continue the conversation properly. See OPENWEBUI_COMPATIBILITY.md for detailed information.
+Note: This server includes special handling for tool/function calling with OpenWebUI. When Claude returns a JSON object with tools, the server transforms it into a text response that will prompt OpenWebUI to continue the conversation properly. See context/OPENWEBUI_COMPATIBILITY.md for detailed information.
 
 ## How It Works
 
@@ -179,6 +179,16 @@ The server intercepts Ollama API requests and:
 - Some Ollama-specific features may not be fully supported
 - Performance metrics are simulated as Claude doesn't provide the same metrics as Ollama
 - The server requires Claude Code to be installed and configured
+
+## Project Documentation
+
+Various markdown files containing detailed documentation are stored in the `context/` directory:
+
+- `context.md` - General context and instructions for running the service
+- `OPENWEBUI_COMPATIBILITY.md` - Details about OpenWebUI integration
+- `METRICS_ADAPTER.md` - Information about the metrics adapter system
+- `OLLAMA_COMPATIBILITY.md` - Details about Ollama API compatibility
+- `TOOL_FIXES.md` - Documentation about tool handling fixes
 
 ## Cross-Platform Service Support
 
