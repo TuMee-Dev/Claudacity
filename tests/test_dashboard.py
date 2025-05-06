@@ -174,8 +174,8 @@ class TestDashboard(unittest.TestCase):
         # Create a mock dashboard generation function that returns our test HTML
         self.mock_dashboard_generator = MagicMock(return_value=self.dashboard_html)
         
-        # Patch the dashboard generator
-        self.dashboard_patcher = patch('claude_ollama_server.generate_dashboard_html', self.mock_dashboard_generator)
+        # Patch the dashboard generator - now in the dashboard module
+        self.dashboard_patcher = patch('dashboard.generate_dashboard_html', self.mock_dashboard_generator)
         self.dashboard_patcher.start()
     
     def tearDown(self):
@@ -197,8 +197,9 @@ class TestDashboard(unittest.TestCase):
     
     def test_dashboard_html_generation(self):
         """Test that the dashboard HTML generates correctly."""
-        # Call the dashboard generator
-        html = claude_ollama_server.generate_dashboard_html()
+        # Call the dashboard generator - now from the dashboard module
+        import dashboard
+        html = dashboard.generate_dashboard_html()
         
         # Basic structure checks
         self.assertIn("<!DOCTYPE html>", html)

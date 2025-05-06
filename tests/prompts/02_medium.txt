@@ -1,0 +1,1 @@
+Write a function to hash a dictionary or list in python. The function should be recursive for any child dicts found (regardless of nesting level). Sort keys by their natural order first.

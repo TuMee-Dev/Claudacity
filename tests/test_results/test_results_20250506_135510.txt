@@ -1,0 +1,49 @@
+Claudacity Unified Test Results
+Date: 2025-05-06 13:56:10
+Total test time: 60.04 seconds
+Ollama URL: http://localhost:11434/api/chat
+Proxy URL: http://localhost:22434/api/chat
+Timeout: 120s
+Skip Ollama: True
+Skip Proxy: False
+Skip Streaming: False
+Skip Non-streaming: False
+
+================================================================================
+TEST SUMMARY: 5/6 tests passed (83.3%)
+================================================================================
+
+Results by Endpoint:
+----------------------------------------
+http://localhost:22434/api/chat - Streaming: 3/3 passed (100.0%)
+http://localhost:22434/api/chat - Non-streaming: 2/3 passed (66.7%)
+
+Results by Prompt:
+----------------------------------------
+01_simple.txt: 2/2 passed (100.0%)
+02_medium.txt: 2/2 passed (100.0%)
+03_complex.txt: 1/2 passed (50.0%)
+
+Response Samples from Successful Tests:
+--------------------------------------------------------------------------------
+01_simple.txt - localhost:22434 - Streaming (2.76s):
+  Start: Hello! How can I help with your project today?... End: ...Hello! How can I help with your project today?
+
+02_medium.txt - localhost:22434 - Streaming (12.17s):
+  Start: I'll write a recursive dictionary/list hashing fun... End: ... hashlib.sha256(json_str.encode()).hexdigest()
+```
+
+03_complex.txt - localhost:22434 - Streaming (39.68s):
+  Start: I'll create a distributed job scheduling system in... End: ...he system architecture or implementation approach?
+
+01_simple.txt - localhost:22434 - Non-streaming (2.58s):
+  Hello! How can I help you with the Claudacity project today?
+
+02_medium.txt - localhost:22434 - Non-streaming (13.23s):
+  Start: I need permission to write the file. Here's the fu... End: ...256(canonical_str.encode('utf-8')).hexdigest()
+```
+
+
+Failed Tests:
+----------------------------------------
+FAILURE: http://localhost:22434/api/chat - Non-streaming - 03_complex.txt (completed in 60.04s) - Error: Error in response: Claude command timed out after 60.0 seconds
