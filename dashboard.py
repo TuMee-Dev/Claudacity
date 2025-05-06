@@ -8,6 +8,7 @@ including HTML generation, metrics visualization, and process management.
 import time
 import psutil
 import logging
+import json
 from fastapi import HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 
@@ -64,8 +65,8 @@ def generate_dashboard_html():
     peak_memory = f"{metrics_data['resources']['peak_memory_mb']:.2f}" if metrics_data['resources']['peak_memory_mb'] else "N/A"
     avg_cpu = f"{metrics_data['resources']['avg_cpu_percent']:.2f}%" if metrics_data['resources']['avg_cpu_percent'] else "N/A"
     
-    # Create the HTML
-    html = f"""<!DOCTYPE html>
+    # Create the HTML using template with format method
+    html_template = """<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
@@ -202,12 +203,38 @@ def generate_dashboard_html():
                 alert("Error terminating process: " + error);
             }}
         }}
+        
+        async function openProcessDialog(pid) {{
+            // Create modal dialog
+            const modal = document.createElement('div');
+            modal.className = 'modal';
+            modal.innerHTML = '<div class="modal-content"><span class="close">&times;</span><iframe src="/process_output/' + pid + '" width="100%" height="90%"></iframe></div>';
+            document.body.appendChild(modal);
+            
+            // Add styles for the modal
+            const style = document.createElement('style');
+            style.textContent = '.modal {{display: block; position: fixed; z-index: 1000; left: 0; top: 0; width: 100%; height: 100%; overflow: auto; background-color: rgba(0,0,0,0.4);}} .modal-content {{background-color: #fefefe; margin: 2% auto; padding: 20px; border: 1px solid #888; width: 90%; height: 90%; border-radius: 10px; box-shadow: 0 4px 8px rgba(0,0,0,0.1);}} .close {{color: #aaa; float: right; font-size: 28px; font-weight: bold; cursor: pointer;}} .close:hover, .close:focus {{color: black; text-decoration: none;}} iframe {{border: none; margin-top: 10px;}}';
+            document.head.appendChild(style);
+            
+            // Add close functionality
+            const closeBtn = modal.querySelector('.close');
+            closeBtn.onclick = function() {{
+                document.body.removeChild(modal);
+            }}
+            
+            // Close when clicking outside the modal content
+            window.onclick = function(event) {{
+                if (event.target == modal) {{
+                    document.body.removeChild(modal);
+                }}
+            }}
+        }}
     </script>
 </head>
 <body>
     <div class="container">
         <h1>Claude Ollama API Dashboard <span class="badge badge-success">v1.0</span></h1>
-        <p class="timestamp">Last updated: {time.strftime('%Y-%m-%d %H:%M:%S')}</p>
+        <p class="timestamp">Last updated: {timestamp}</p>
         
         <div class="stats-grid">
             <div class="card">
@@ -218,11 +245,11 @@ def generate_dashboard_html():
                 </div>
                 <div class="metric">
                     <div class="metric-name">Uptime</div>
-                    <div class="metric-value">{metrics_data['uptime']['formatted']}</div>
+                    <div class="metric-value">{uptime}</div>
                 </div>
                 <div class="metric">
                     <div class="metric-name">Started At</div>
-                    <div class="metric-value">{metrics_data['uptime']['start_time'].split('T')[0]} {metrics_data['uptime']['start_time'].split('T')[1].split('.')[0]}</div>
+                    <div class="metric-value">{start_time}</div>
                 </div>
             </div>
             
@@ -230,15 +257,15 @@ def generate_dashboard_html():
                 <h2>Process Monitoring</h2>
                 <div class="metric">
                     <div class="metric-name">Running Processes</div>
-                    <div class="metric-value">{metrics_data['claude_invocations']['current_running']}</div>
+                    <div class="metric-value">{current_running}</div>
                 </div>
                 <div class="metric">
                     <div class="metric-name">Max Concurrent</div>
-                    <div class="metric-value">{metrics_data['claude_invocations']['max_concurrent']}</div>
+                    <div class="metric-value">{max_concurrent}</div>
                 </div>
                 <div class="metric">
                     <div class="metric-name">Total Invocations</div>
-                    <div class="metric-value">{metrics_data['claude_invocations']['total']}</div>
+                    <div class="metric-value">{total_invocations}</div>
                 </div>
             </div>
             
@@ -254,7 +281,7 @@ def generate_dashboard_html():
                 </div>
                 <div class="metric">
                     <div class="metric-name">Invocations per Minute</div>
-                    <div class="metric-value">{metrics_data['claude_invocations']['per_minute']:.2f}</div>
+                    <div class="metric-value">{per_minute}</div>
                 </div>
             </div>
             
@@ -278,15 +305,15 @@ def generate_dashboard_html():
                 <h2>Cost Tracking</h2>
                 <div class="metric">
                     <div class="metric-name">Total Cost</div>
-                    <div class="metric-value">${metrics_data.get('cost', {}).get('total_cost', 0):.4f}</div>
+                    <div class="metric-value">${total_cost}</div>
                 </div>
                 <div class="metric">
                     <div class="metric-name">Avg Cost per Request</div>
-                    <div class="metric-value">${metrics_data.get('cost', {}).get('avg_cost', 0):.4f}</div>
+                    <div class="metric-value">${avg_cost}</div>
                 </div>
                 <div class="metric">
                     <div class="metric-name">Active Conversations</div>
-                    <div class="metric-value">{len(metrics.active_conversations)}</div>
+                    <div class="metric-value">{active_conversations}</div>
                 </div>
             </div>
         </div>
@@ -307,6 +334,27 @@ def generate_dashboard_html():
                 <tbody>
 """
     
+    # Format the template with values
+    format_data = {
+        'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
+        'uptime': metrics_data['uptime']['formatted'],
+        'start_time': f"{metrics_data['uptime']['start_time'].split('T')[0]} {metrics_data['uptime']['start_time'].split('T')[1].split('.')[0]}",
+        'current_running': metrics_data['claude_invocations']['current_running'],
+        'max_concurrent': metrics_data['claude_invocations']['max_concurrent'],
+        'total_invocations': metrics_data['claude_invocations']['total'],
+        'avg_execution': avg_execution,
+        'median_execution': median_execution,
+        'per_minute': f"{metrics_data['claude_invocations']['per_minute']:.2f}",
+        'avg_memory': avg_memory,
+        'peak_memory': peak_memory,
+        'avg_cpu': avg_cpu,
+        'total_cost': f"{metrics_data.get('cost', {}).get('total_cost', 0):.4f}",
+        'avg_cost': f"{metrics_data.get('cost', {}).get('avg_cost', 0):.4f}",
+        'active_conversations': len(metrics.active_conversations)
+    }
+    
+    html = html_template.format(**format_data)
+    
     # Add running processes to table
     if running_processes:
         for proc in running_processes:
@@ -320,10 +368,10 @@ def generate_dashboard_html():
                 memory = f"{memory:.1f} MB"
             runtime = proc.get('runtime', 'N/A')
             
-            html += f"""
+            html += """
                     <tr>
                         <td>{pid}</td>
-                        <td title="{proc.get('command', proc.get('cmd', 'Unknown'))}">{command}</td>
+                        <td title="{command_full}">{command}</td>
                         <td>{cpu}</td>
                         <td>{memory}</td>
                         <td>{runtime}</td>
@@ -331,7 +379,14 @@ def generate_dashboard_html():
                             <button onclick="terminateProcess('{pid}')" class="button alert">Terminate</button>
                         </td>
                     </tr>
-"""
+""".format(
+                pid=pid,
+                command_full=proc.get('command', proc.get('cmd', 'Unknown')),
+                command=command,
+                cpu=cpu,
+                memory=memory,
+                runtime=runtime
+            )
     else:
         html += """
                     <tr>
@@ -378,16 +433,20 @@ def generate_dashboard_html():
         
     if recent_outputs:
         for output in recent_outputs:
-            html += f"""
+            html += """
                     <tr>
-                        <td>{output['pid']}</td>
-                        <td>{output['timestamp']}</td>
-                        <td title="{output['command']}">{output['command']}</td>
+                        <td>{pid}</td>
+                        <td>{timestamp}</td>
+                        <td title="{command}">{command}</td>
                         <td>
-                            <a href="/process_output/{output['pid']}" target="_blank" class="button">View Details</a>
+                            <a href="/process_output/{pid}" onclick="event.preventDefault(); openProcessDialog('{pid}');" class="button">View Details</a>
                         </td>
                     </tr>
-"""
+""".format(
+                pid=output['pid'],
+                timestamp=output['timestamp'],
+                command=output['command']
+            )
     else:
         html += """
                     <tr>
@@ -459,7 +518,232 @@ async def get_single_process_output(pid: str):
     """Get the output for a specific process"""
     output = get_process_output(pid)
     if output:
-        return output
+        # Create a formatted HTML view instead of returning raw JSON
+        prompt = output.get("prompt", "")
+        stdout = output.get("stdout", "")
+        stderr = output.get("stderr", "")
+        command = output.get("command", "")
+        timestamp = output.get("timestamp", "")
+        original_request = output.get("original_request", {})
+        response_obj = output.get("response", {})
+        converted_response = output.get("converted_response", {})
+        
+        # Format the JSON objects for display
+        try:
+            if isinstance(original_request, dict):
+                original_request_str = json.dumps(original_request, indent=2)
+            else:
+                original_request_str = str(original_request)
+                
+            if isinstance(response_obj, dict):
+                response_str = json.dumps(response_obj, indent=2)
+            else:
+                response_str = str(response_obj)
+                
+            if isinstance(converted_response, dict):
+                converted_response_str = json.dumps(converted_response, indent=2)
+            else:
+                converted_response_str = str(converted_response)
+            
+            # Check if this is a running process
+            process_status = ""
+            if response_str == "Process is still running..." or (isinstance(converted_response, dict) and converted_response.get("status") == "running"):
+                # Check if the process is still actually running
+                pid_int = None
+                try:
+                    pid_int = int(pid)
+                except:
+                    pass
+                
+                if pid_int:
+                    try:
+                        import psutil
+                        if psutil.pid_exists(pid_int):
+                            process = psutil.Process(pid_int)
+                            if "claude" in process.name().lower() or any("claude" in arg.lower() for arg in process.cmdline()):
+                                # Process is still running
+                                process_status = '<div class="running-process-alert"><h3 style="color: #0277bd;">Process is still running</h3><p>This process is currently active. The response will be updated when the process completes.</p><p>Process running time: {} seconds</p></div>'.format(
+                                    int(time.time() - process.create_time())
+                                )
+                    except:
+                        # In case of any errors, assume process might be running
+                        process_status = '<div class="running-process-alert"><h3 style="color: #0277bd;">Process may still be running</h3><p>The response will be updated when the process completes.</p></div>'
+            else:
+                process_status = ""
+                
+        except:
+            # Fallback for any formatting errors
+            original_request_str = str(original_request)
+            response_str = str(response_obj)
+            converted_response_str = str(converted_response)
+            process_status = ""
+        
+        # Create the HTML for the popup dialog
+        html = """<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Process Output - {pid}</title>
+    <style>
+        body {{
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, 'Open Sans', 'Helvetica Neue', sans-serif;
+            line-height: 1.6;
+            color: #333;
+            margin: 0;
+            padding: 20px;
+            background-color: #f5f5f7;
+        }}
+        .container {{
+            max-width: 1200px;
+            margin: 0 auto;
+        }}
+        h1, h2, h3 {{
+            color: #000;
+        }}
+        .card {{
+            background: white;
+            border-radius: 10px;
+            padding: 20px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+            margin-bottom: 20px;
+        }}
+        pre {{
+            background-color: #f8f8f8;
+            border-radius: 5px;
+            padding: 15px;
+            overflow-x: auto;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+            border: 1px solid #e3e3e3;
+        }}
+        .timestamp {{
+            color: #777;
+            font-size: 14px;
+            margin-bottom: 20px;
+        }}
+        .error {{
+            color: #e53935;
+        }}
+        .tab {{
+            overflow: hidden;
+            border: 1px solid #ccc;
+            background-color: #f1f1f1;
+            border-radius: 5px 5px 0 0;
+        }}
+        .tab button {{
+            background-color: inherit;
+            float: left;
+            border: none;
+            outline: none;
+            cursor: pointer;
+            padding: 14px 16px;
+            transition: 0.3s;
+            font-size: 16px;
+        }}
+        .tab button:hover {{
+            background-color: #ddd;
+        }}
+        .tab button.active {{
+            background-color: #fff;
+            border-bottom: 2px solid #0071e3;
+        }}
+        .tabcontent {{
+            display: none;
+            padding: 20px;
+            border: 1px solid #ccc;
+            border-top: none;
+            border-radius: 0 0 5px 5px;
+            background-color: white;
+        }}
+        .show {{
+            display: block;
+        }}
+    </style>
+    <script>
+        function openTab(evt, tabName) {{
+            var i, tabcontent, tablinks;
+            tabcontent = document.getElementsByClassName("tabcontent");
+            for (i = 0; i < tabcontent.length; i++) {{
+                tabcontent[i].style.display = "none";
+            }}
+            tablinks = document.getElementsByClassName("tablinks");
+            for (i = 0; i < tablinks.length; i++) {{
+                tablinks[i].className = tablinks[i].className.replace(" active", "");
+            }}
+            document.getElementById(tabName).style.display = "block";
+            evt.currentTarget.className += " active";
+        }}
+        
+        window.onload = function() {{
+            // Open the prompt tab by default
+            document.getElementById("promptTab").click();
+        }};
+    </script>
+</head>
+<body>
+    <div class="container">
+        <h1>Process Output Details</h1>
+        <p class="timestamp">Process ID: {pid} | Timestamp: {timestamp}</p>
+        
+        <div class="tab">
+            <button class="tablinks" id="promptTab" onclick="openTab(event, 'Prompt')">Prompt</button>
+            <button class="tablinks" onclick="openTab(event, 'Request')">Request</button>
+            <button class="tablinks" onclick="openTab(event, 'Response')">Response</button>
+            <button class="tablinks" onclick="openTab(event, 'Command')">Command</button>
+            <button class="tablinks" onclick="openTab(event, 'Logs')">Logs</button>
+        </div>
+        
+        <div id="Prompt" class="tabcontent">
+            <h2>Prompt</h2>
+            <pre>{prompt}</pre>
+        </div>
+        
+        <div id="Request" class="tabcontent">
+            <h2>Original Request</h2>
+            <pre>{original_request_str}</pre>
+        </div>
+        
+        <div id="Response" class="tabcontent">
+            <h3>Claude Response</h3>
+            <pre>{response_str}</pre>
+            
+            <h3>Converted OpenAI Response</h3>
+            <pre>{converted_response_str}</pre>
+            
+            {process_status}
+        </div>
+        
+        <div id="Command" class="tabcontent">
+            <h2>Command</h2>
+            <pre>{command}</pre>
+        </div>
+        
+        <div id="Logs" class="tabcontent">
+            <h3>Standard Output</h3>
+            <pre>{stdout}</pre>
+            
+            <h3>Standard Error</h3>
+            <pre class="error">{stderr}</pre>
+        </div>
+    </div>
+</body>
+</html>
+"""
+        # Format the HTML with variables
+        html = html.format(
+            pid=pid,
+            prompt=prompt,
+            stdout=stdout,
+            stderr=stderr,
+            command=command,
+            timestamp=timestamp,
+            original_request_str=original_request_str,
+            response_str=response_str,
+            converted_response_str=converted_response_str,
+            process_status=process_status
+        )
+        return HTMLResponse(content=html)
     else:
         raise HTTPException(status_code=404, detail=f"No output found for process {pid}")
 

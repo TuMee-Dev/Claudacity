@@ -1075,13 +1075,8 @@ async def stream_claude_output(prompt: str, conversation_id: str = None, origina
     # Start building the base command
     base_cmd = f"{CLAUDE_CMD}"
     
-    # Extract model if available
-    model = None
-    if original_request and isinstance(original_request, dict) and 'model' in original_request:
-        model = original_request.get('model')
-        if model:
-            logger.info(f"[TOOLS] Using model from request: {model}")
-            base_cmd += f" --model {model}"
+    # We don't need to extract model - Claude command only takes -p and --output-format
+    logger.info(f"[TOOLS] Preparing to run Claude in streaming mode with prompt length: {len(prompt)}")
 
     # Log if tools are present for debugging purposes only
     if original_request and isinstance(original_request, dict) and original_request.get('tools'):
@@ -2303,15 +2298,8 @@ async def chat(request_body: Request):
             try:
                 logger.info(f"Starting non-streaming request via run_claude_command for prompt of length {len(claude_prompt)}")
                 
-                # Log the actual command that will be run (important for debugging)
-                # Start building the base command
-                base_cmd = f"{CLAUDE_CMD}"
-                if request.model:
-                    base_cmd += f" --model {request.model}"
-                import shlex
-                quoted_prompt = shlex.quote(claude_prompt)
-                cmd = f"{base_cmd} -p {quoted_prompt} --output-format json"
-                logger.info(f"Non-streaming command: {cmd}")
+                # Log that we're about to run the command
+                logger.info(f"About to run Claude in non-streaming mode with prompt length: {len(claude_prompt)}")
                 
                 # Actually run the command
                 claude_response = await run_claude_command(claude_prompt, conversation_id=conversation_id, original_request=request_dict)
@@ -3088,6 +3076,27 @@ def track_claude_process(pid, command, original_request=None):
     if isinstance(pid, str) and not pid.startswith("claude-process-"):
         # This is a real system PID
         numeric_pid = int(pid)
+        
+        # Create a basic process output entry as soon as process starts
+        # This ensures we can see in-progress processes in the dashboard
+        if original_request:
+            prompt = ""
+            if isinstance(original_request, dict) and "messages" in original_request:
+                for msg in original_request.get("messages", []):
+                    if msg.get("role") == "user" and "content" in msg:
+                        prompt += msg["content"] + "\n"
+            
+            store_process_output(
+                pid,
+                "",  # empty stdout since process is still running
+                "",  # empty stderr since process is still running
+                command,
+                prompt.strip(),
+                "Process is still running...",  # placeholder response
+                {"status": "running"},  # placeholder converted response
+                original_request.get("model", DEFAULT_MODEL),
+                original_request
+            )
         
         # Look for temporary process IDs that should be linked to this real PID
         for temp_pid, process_info in proxy_launched_processes.items():
