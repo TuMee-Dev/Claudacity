@@ -4,27 +4,30 @@ Claude-compatible Ollama API Server.
 This FastAPI application provides an OpenAI-compatible API server that interfaces with
 a locally running Claude Code process. It implements both Ollama API and OpenAI API format.
 """
-import os
-import sys
+
+import inspect
 import json
-import time
-import uuid
 import logging
-import asyncio
-import tempfile
-import datetime
+import os
+import pprint
+import subprocess
+import shlex
+import sys
+import time
+import traceback
+import uuid
 import collections
 import statistics
-import subprocess
+import datetime
+import tempfile
+import shutil
 from typing import Dict, List, Optional, Any, Union, Deque
 from pydantic import BaseModel, Field
-from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
-from fastapi.responses import StreamingResponse, JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
-from starlette.background import BackgroundTask
 import httpx
-import shutil
-
+import asyncio
+import fastapi
+from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
+from fastapi.responses import StreamingResponse, JSONResponse, PlainTextResponse, HTMLResponse, Response
 
 # Dashboard will be imported at the end to avoid circular imports
 dashboard = None
