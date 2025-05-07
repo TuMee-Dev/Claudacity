@@ -17,6 +17,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 from fastapi.testclient import TestClient
 import claude_ollama_server
 from claude_ollama_server import app
+import process_tracking
 
 # Import our metrics adapter for tests
 import metrics_tracker
@@ -621,7 +622,7 @@ class TestClaudeOllamaAPI(unittest.TestCase):
                 mock_process.return_value = mock_instance
                 
                 # Call the function directly
-                result = claude_ollama_server.get_running_claude_processes()
+                result = process_tracking.get_running_claude_processes()
                 
                 # Verify the function succeeded without errors
                 self.assertIsNotNone(result)

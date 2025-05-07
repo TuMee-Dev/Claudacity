@@ -8,9 +8,11 @@ including HTML generation, metrics visualization, and process management.
 import time
 import psutil
 import logging
-import claude_ollama_server
+import process_tracking
 import threading
 import metrics_tracker
+import process_tracking
+
 
 # Create a lock for process access
 dashboard_lock = threading.Lock()
@@ -25,19 +27,13 @@ logger = logging.getLogger(__name__)
 
 # These will be imported from the main module
 metrics = None
-get_process_output = None
-process_outputs = None
-get_running_claude_processes = None
 
-def init_dashboard(app, metrics_module, get_process_output_fn, process_outputs_dict, get_running_claude_processes_fn):
+def init_dashboard(app, metrics_module):
     """Initialize the dashboard with required dependencies"""
-    global metrics, get_process_output, process_outputs, get_running_claude_processes
+    global metrics
     
     # Set the dependencies
     metrics = metrics_module
-    get_process_output = get_process_output_fn
-    process_outputs = process_outputs_dict
-    get_running_claude_processes = get_running_claude_processes_fn
     
     # Register routes
     app.get("/")(root)
@@ -53,7 +49,7 @@ def update_process_count_in_metrics():
     """Update the current running process count in metrics based on actual running processes"""
     try:
         # Get the list of actually running processes
-        running_processes = get_running_claude_processes()
+        running_processes = process_tracking.get_running_claude_processes()
         
         # Count only truly running processes (not ones that should be marked finished)
         actual_running_count = len(running_processes)
@@ -79,7 +75,7 @@ def generate_dashboard_html():
     with dashboard_lock:
         # First check and update any stale processes
         current_time = time.time()
-        for pid, process_info in list(claude_ollama_server.proxy_launched_processes.items()):
+        for pid, process_info in list(process_tracking.proxy_launched_processes.items()):
             if process_info.get('status', '') == 'running':
                 # Check if this is a numeric PID we can verify
                 try:
@@ -98,7 +94,7 @@ def generate_dashboard_html():
                         logger.info(f"Auto-marked long-running process {pid} as finished (age: {process_age:.1f}s)")
                         
         # Now get the running processes for display
-        for pid, process_info in list(claude_ollama_server.proxy_launched_processes.items()):
+        for pid, process_info in list(process_tracking.proxy_launched_processes.items()):
             # Only include processes with status 'running'
             if process_info.get('status', '') == 'running':
                 # Calculate runtime
@@ -495,7 +491,7 @@ def generate_dashboard_html():
     
     # Add recent process outputs
     recent_outputs = []
-    for pid, output in reversed(list(process_outputs.items())):
+    for pid, output in reversed(list(process_tracking.process_outputs.items())):
         # Only show the most recent outputs
         if len(recent_outputs) >= 10:
             break
@@ -577,7 +573,7 @@ async def list_process_outputs():
     """List all stored process outputs"""
     # Convert OrderedDict to list for JSON serialization, newest first
     outputs_list = []
-    for pid, output in reversed(process_outputs.items()):
+    for pid, output in reversed(process_tracking.process_outputs.items()):
         # Create a summary without the full output text
         summary = {
             "pid": output["pid"],
@@ -594,7 +590,7 @@ async def list_process_outputs():
 
 async def get_single_process_output(pid: str):
     """Get the output for a specific process"""
-    output = get_process_output(pid)
+    output = process_tracking.get_process_output(pid)
     if output:
         # Create a formatted HTML view instead of returning raw JSON
         prompt = output.get("prompt", "")
@@ -631,7 +627,7 @@ async def get_single_process_output(pid: str):
             is_running = False
             
             # Get the master list of running processes for more accurate status
-            running_processes = get_running_claude_processes()
+            running_processes = process_tracking.get_running_claude_processes()
             
             # Check if this PID is in the running processes list
             pid_in_running = False
@@ -689,8 +685,8 @@ async def get_single_process_output(pid: str):
                 if not is_running:
                     try:
                         with dashboard_lock:
-                            if pid in claude_ollama_server.proxy_launched_processes:
-                                claude_ollama_server.proxy_launched_processes[pid]["status"] = "finished"
+                            if pid in process_tracking.proxy_launched_processes:
+                                process_tracking.proxy_launched_processes[pid]["status"] = "finished"
                                 logger.info(f"Updated process {pid} status to finished in proxy_launched_processes")
                                 
                                 # Also update the converted response status here if it exists
@@ -732,8 +728,8 @@ async def get_single_process_output(pid: str):
                     # Try multiple methods to get the complete response
                     try:
                         # Method 1: Try to get complete_response directly from process_info
-                        if pid in claude_ollama_server.proxy_launched_processes:
-                            process_info = claude_ollama_server.proxy_launched_processes[pid]
+                        if pid in process_tracking.proxy_launched_processes:
+                            process_info = process_tracking.proxy_launched_processes[pid]
                             # Try to get the complete_response field
                             complete_response = process_info.get("complete_response")
                             if complete_response:
@@ -750,7 +746,7 @@ async def get_single_process_output(pid: str):
                                 logger.info(f"Process {pid} info available keys: {list(process_info.keys())}")
                                 
                         # Method 3: Check if there's a final output in main process_outputs dict
-                        direct_process_data = claude_ollama_server.process_outputs.get(pid, {})
+                        direct_process_data = process_tracking.process_outputs.get(pid, {})
                         if "final_output" in direct_process_data:
                             output["response"] = direct_process_data["final_output"]
                             response_obj = output["response"]  # Also update the displayed response
@@ -794,8 +790,8 @@ async def get_single_process_output(pid: str):
                             break
                 
                 # Source 2: Check if complete_response exists in proxy_launched_processes
-                if not actual_content and pid in claude_ollama_server.proxy_launched_processes:
-                    proc_info = claude_ollama_server.proxy_launched_processes[pid]
+                if not actual_content and pid in process_tracking.proxy_launched_processes:
+                    proc_info = process_tracking.proxy_launched_processes[pid]
                     if "content" in proc_info:
                         actual_content = proc_info["content"]
                         logger.info(f"Used content field from proxy_launched_processes for {pid}")
@@ -1067,8 +1063,8 @@ async def get_single_process_output(pid: str):
         # Try to find any streaming content wherever it might be stored
         try:
             # Look in all possible locations for streaming content
-            if pid in claude_ollama_server.proxy_launched_processes:
-                process_info = claude_ollama_server.proxy_launched_processes[pid]
+            if pid in process_tracking.proxy_launched_processes:
+                process_info = process_tracking.proxy_launched_processes[pid]
                 
                 # Option 1: Check for direct content
                 if "content" in process_info:
@@ -1083,8 +1079,8 @@ async def get_single_process_output(pid: str):
                             streaming_content = process_info["complete_response"]["message"]["content"]
             
             # Option 4: Check process_outputs for any streaming data
-            if streaming_content == "No streaming content available" and pid in claude_ollama_server.process_outputs:
-                output_data = claude_ollama_server.process_outputs[pid]
+            if streaming_content == "No streaming content available" and pid in process_tracking.process_outputs:
+                output_data = process_tracking.process_outputs[pid]
                 
                 if "stream_data" in output_data:
                     streaming_content = output_data["stream_data"]
@@ -1109,8 +1105,8 @@ async def get_single_process_output(pid: str):
             if streaming_content == "No streaming content available":
                 # First check specifically for streaming_content_buffer
                 try:
-                    if hasattr(claude_ollama_server, 'streaming_content_buffer'):
-                        buffer = claude_ollama_server.streaming_content_buffer
+                    if hasattr(process_tracking, 'streaming_content_buffer'):
+                        buffer = process_tracking.streaming_content_buffer
                         if isinstance(buffer, dict) and pid in buffer:
                             streaming_content = buffer[pid]
                             logger.info(f"Found content in streaming_content_buffer for {pid}")
@@ -1119,10 +1115,10 @@ async def get_single_process_output(pid: str):
                 
                 # Look for any other _buffer or streaming_outputs global variables
                 if streaming_content == "No streaming content available":
-                    for var_name in dir(claude_ollama_server):
+                    for var_name in dir(process_tracking):
                         if "buffer" in var_name.lower() or "stream" in var_name.lower():
                             try:
-                                var = getattr(claude_ollama_server, var_name)
+                                var = getattr(process_tracking, var_name)
                                 if isinstance(var, dict) and pid in var:
                                     streaming_content = f"Found in {var_name}: {var[pid]}"
                                     break
@@ -1160,7 +1156,7 @@ def ensure_accurate_process_count():
     
     with dashboard_lock:
         # Count processes with status 'running'
-        for pid, info in claude_ollama_server.proxy_launched_processes.items():
+        for pid, info in process_tracking.proxy_launched_processes.items():
             if info.get('status') == 'running':
                 actual_count += 1
                 logger.info(f"Running process found: PID {pid}")
@@ -1209,8 +1205,8 @@ async def terminate_process(pid: str):
                     
                     # Process terminated - update its status and metrics
                     with dashboard_lock:
-                        if pid_int in claude_ollama_server.proxy_launched_processes:
-                            claude_ollama_server.proxy_launched_processes[pid_int]["status"] = "finished"
+                        if pid_int in process_tracking.proxy_launched_processes:
+                            process_tracking.proxy_launched_processes[pid_int]["status"] = "finished"
                             logger.info(f"Updated process {pid} status to finished")
                     
                     # Ensure metrics are updated
@@ -1224,8 +1220,8 @@ async def terminate_process(pid: str):
                     
                     # Process killed - update its status and metrics
                     with dashboard_lock:
-                        if pid_int in claude_ollama_server.proxy_launched_processes:
-                            claude_ollama_server.proxy_launched_processes[pid_int]["status"] = "finished"
+                        if pid_int in process_tracking.proxy_launched_processes:
+                            process_tracking.proxy_launched_processes[pid_int]["status"] = "finished"
                             logger.info(f"Updated process {pid} status to finished after SIGKILL")
                     
                     # Ensure metrics are updated
@@ -1242,8 +1238,8 @@ async def terminate_process(pid: str):
             # Process doesn't exist, but still update any references to it
             try:
                 with dashboard_lock:
-                    if pid_int in claude_ollama_server.proxy_launched_processes:
-                        claude_ollama_server.proxy_launched_processes[pid_int]["status"] = "finished"
+                    if pid_int in process_tracking.proxy_launched_processes:
+                        process_tracking.proxy_launched_processes[pid_int]["status"] = "finished"
                         logger.info(f"Updated non-existent process {pid} status to finished")
                 
                 # Ensure metrics are updated
@@ -1257,13 +1253,13 @@ async def terminate_process(pid: str):
         # Not a numeric PID, could be a temp process ID
         try:
             with dashboard_lock:
-                if pid in claude_ollama_server.proxy_launched_processes:
+                if pid in process_tracking.proxy_launched_processes:
                     # Found the temp process, mark it as finished
-                    claude_ollama_server.proxy_launched_processes[pid]["status"] = "finished"
+                    process_tracking.proxy_launched_processes[pid]["status"] = "finished"
                     logger.info(f"Updated temp process {pid} status to finished")
                     
                     # If it has a real PID, try to terminate that too
-                    real_pid = claude_ollama_server.proxy_launched_processes[pid].get("real_pid")
+                    real_pid = process_tracking.proxy_launched_processes[pid].get("real_pid")
                     if real_pid:
                         try:
                             process = psutil.Process(real_pid)

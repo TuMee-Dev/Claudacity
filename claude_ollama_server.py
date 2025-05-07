@@ -17,6 +17,7 @@ import time
 import traceback
 import uuid
 import collections
+from contextlib import asynccontextmanager
 import statistics
 import datetime
 import tempfile
@@ -28,6 +29,7 @@ import asyncio
 import fastapi
 from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
 from fastapi.responses import StreamingResponse, JSONResponse, PlainTextResponse, HTMLResponse, Response
+import process_tracking
 
 # Dashboard will be imported at the end to avoid circular imports
 dashboard = None
@@ -473,20 +475,26 @@ os.makedirs(CONV_TEMP_ROOT, exist_ok=True)
 # Map of conversation IDs to their temporary directories
 conversation_temp_dirs = {}
 
+# Background task for cleanup
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Run background tasks when the server starts."""
+    # Start background cleanup task
+    periodic_cleanup_task = asyncio.create_task(periodic_cleanup())
+    yield
+    # Stop background cleanup task
+    #&? Impliment
+
+
 # Initialize FastAPI app
 
 app = FastAPI(
     title="Claude Ollama API",
     description="OpenAI-compatible API server for Claude Code",
     version=API_VERSION,
+    lifespan=lifespan
 )
 
-# Background task for cleanup
-@app.on_event("startup")
-async def startup_event():
-    """Run background tasks when the server starts."""
-    # Start background cleanup task
-    asyncio.create_task(periodic_cleanup())
 
 async def periodic_cleanup():
     """Periodically clean up old data to prevent memory leaks."""
@@ -812,7 +820,7 @@ async def run_claude_command(prompt: str, conversation_id: str = None, original_
     await metrics.record_claude_start(process_id, model, conversation_id)
 
     # Track this process with the original request data
-    proxy_launched_processes[process_id] = {
+    process_tracking.proxy_launched_processes[process_id] = {
         "command": cmd,
         "start_time": time.time(),
         "current_request": original_request,
@@ -825,8 +833,8 @@ async def run_claude_command(prompt: str, conversation_id: str = None, original_
     current_max_silence = CLAUDE_STREAM_MAX_SILENCE
     
     # Adjust timeout based on prompt length or complexity if needed
-    proxy_launched_processes[process_id]['chunk_timeout'] = current_chunk_timeout
-    proxy_launched_processes[process_id]['max_silence'] = current_max_silence
+    process_tracking.proxy_launched_processes[process_id]['chunk_timeout'] = current_chunk_timeout
+    process_tracking.proxy_launched_processes[process_id]['max_silence'] = current_max_silence
     
     logger.info(f"Tracking new Claude process with PID {process_id}")
 
@@ -852,8 +860,8 @@ async def run_claude_command(prompt: str, conversation_id: str = None, original_
         # Track this process
         if process and process.pid:
             # Transfer the original request from our process ID to the actual process ID
-            if original_request and process_id in proxy_launched_processes:
-                original_request_data = proxy_launched_processes[process_id].get("current_request")
+            if original_request and process_id in process_tracking.proxy_launched_processes:
+                original_request_data = process_tracking.proxy_launched_processes[process_id].get("current_request")
             else:
                 original_request_data = original_request
                 
@@ -863,7 +871,7 @@ async def run_claude_command(prompt: str, conversation_id: str = None, original_
         # Add timeout handling for non-streaming mode
         try:
             # Get process-specific timeout if available (or use the default)
-            process_info = proxy_launched_processes.get(str(process.pid), {})
+            process_info = process_tracking.proxy_launched_processes.get(str(process.pid), {})
             max_silence = process_info.get('max_silence', timeout)
             logger.info(f"Using timeout of {max_silence} seconds for non-streaming request")
             logger.info(f"Process ID: {process.pid}, Command: {cmd}")
@@ -967,8 +975,8 @@ async def run_claude_command(prompt: str, conversation_id: str = None, original_
                 
                 # Get the original request for storing
                 original_request = None
-                if "current_request" in proxy_launched_processes.get(str(process.pid), {}):
-                    original_request = proxy_launched_processes[str(process.pid)]["current_request"]
+                if "current_request" in process_tracking.proxy_launched_processes.get(str(process.pid), {}):
+                    original_request = process_tracking.proxy_launched_processes[str(process.pid)]["current_request"]
                 
                 store_process_output(
                     str(process.pid),
@@ -1156,7 +1164,7 @@ async def stream_claude_output(prompt: str, conversation_id: str = None, origina
     await metrics.record_claude_start(process_id, model, conversation_id)
     
     # Track this process with the original request data
-    proxy_launched_processes[process_id] = {
+    process_tracking.proxy_launched_processes[process_id] = {
         "command": cmd,
         "start_time": time.time(),
         "current_request": original_request,
@@ -1172,7 +1180,7 @@ async def stream_claude_output(prompt: str, conversation_id: str = None, origina
         current_max_silence = CLAUDE_STREAM_MAX_SILENCE
         
         # Store these in the process info for reference during streaming
-        process_info = proxy_launched_processes.get(process_id, {})
+        process_info = process_tracking.proxy_launched_processes.get(process_id, {})
         if process_info:
             process_info['chunk_timeout'] = current_chunk_timeout
             process_info['max_silence'] = current_max_silence
@@ -1194,8 +1202,8 @@ async def stream_claude_output(prompt: str, conversation_id: str = None, origina
     # Track this process
     if process and process.pid:
         # Transfer the original request from our process ID to the actual process ID
-        if original_request and process_id in proxy_launched_processes:
-            original_request_data = proxy_launched_processes[process_id].get("current_request")
+        if original_request and process_id in process_tracking.proxy_launched_processes:
+            original_request_data = process_tracking.proxy_launched_processes[process_id].get("current_request")
         else:
             original_request_data = original_request
             
@@ -1368,7 +1376,7 @@ async def stream_claude_output(prompt: str, conversation_id: str = None, origina
                     break
                 
                 # Get process-specific timeout if available (or use the default)
-                process_info = proxy_launched_processes.get(process.pid, {})
+                process_info = process_tracking.proxy_launched_processes.get(process.pid, {})
                 chunk_timeout = process_info.get('chunk_timeout', CLAUDE_STREAM_CHUNK_TIMEOUT)
                 
                 # Check if we've gone too long without output - using the process-specific timeout
@@ -1547,8 +1555,8 @@ async def stream_claude_output(prompt: str, conversation_id: str = None, origina
                     # Store what we have
                     # Get the original request for storing
                     original_request = None
-                    if "current_request" in proxy_launched_processes.get(str(process.pid), {}):
-                        original_request = proxy_launched_processes[str(process.pid)]["current_request"]
+                    if "current_request" in process_tracking.proxy_launched_processes.get(str(process.pid), {}):
+                        original_request = process_tracking.proxy_launched_processes[str(process.pid)]["current_request"]
                     
                     store_process_output(
                         str(process.pid),
@@ -1914,10 +1922,10 @@ def get_real_process_id(request_info):
         return None
     
     # Check if it's a temporary ID that maps to a real PID
-    with process_lock:
-        if isinstance(pid, str) and pid.startswith("claude-process-") and pid in proxy_launched_processes:
+    with process_tracking.process_lock:
+        if isinstance(pid, str) and pid.startswith("claude-process-") and pid in process_tracking.proxy_launched_processes:
             # Get the real PID if it exists
-            real_pid = proxy_launched_processes[pid].get("real_pid")
+            real_pid = process_tracking.proxy_launched_processes[pid].get("real_pid")
             if real_pid:
                 return real_pid
     
@@ -1932,11 +1940,6 @@ async def stream_openai_response(claude_prompt: str, model_name: str, conversati
     """
     import time
     import datetime
-    
-    # Initialize streaming buffer if needed
-    global streaming_content_buffer
-    if 'streaming_content_buffer' not in globals():
-        streaming_content_buffer = {}
     
     # Check if this is an Ollama client request
     is_ollama_client = False
@@ -2113,7 +2116,7 @@ async def stream_openai_response(claude_prompt: str, model_name: str, conversati
                         streaming_content_buffer[f"claude-process-{request_id}"] = full_response
                         
                         # Also update any process outputs entries that match this request ID
-                        for pid, output in process_outputs.items():
+                        for pid, output in process_tracking.process_outputs.items():
                             # Update any entries with matching request ID or similar formats
                             if (pid == request_id or 
                                 pid == f"claude-process-{request_id}" or
@@ -2319,16 +2322,16 @@ async def stream_openai_response(claude_prompt: str, model_name: str, conversati
                         }
                         # Record in a format that would make sense as output
                         tool_calls_formatted = json.dumps(tool_calls_response, indent=2)
-                        with process_lock:
+                        with process_tracking.process_lock:
                             # Try to update all recent processes in case we missed the right one
-                            for pid, info in list(proxy_launched_processes.items()):
+                            for pid, info in list(process_tracking.proxy_launched_processes.items()):
                                 if (time.time() - info.get("start_time", 0) < 300):  # 5 minutes
                                     update_streaming_process_output(str(pid), tool_calls_formatted)
                     else:
                         # For regular responses, update with the text content
-                        with process_lock:
+                        with process_tracking.process_lock:
                             # Try to update all recent processes in case we missed the right one
-                            for pid, info in list(proxy_launched_processes.items()):
+                            for pid, info in list(process_tracking.proxy_launched_processes.items()):
                                 if (time.time() - info.get("start_time", 0) < 300):  # 5 minutes
                                     update_streaming_process_output(str(pid), full_response)
                     
@@ -2353,9 +2356,9 @@ async def stream_openai_response(claude_prompt: str, model_name: str, conversati
                     
                     # Find all running Claude processes and store the tool calls in all of them
                     # This ensures we don't miss the process due to ID mapping issues
-                    with process_lock:
+                    with process_tracking.process_lock:
                         stored = False
-                        for pid, process_info in proxy_launched_processes.items():
+                        for pid, process_info in process_tracking.proxy_launched_processes.items():
                             # Only update running processes started within the last few minutes
                             if (process_info.get("status") == "running" and 
                                 time.time() - process_info.get("start_time", 0) < 300):  # 5 minutes
@@ -2443,16 +2446,16 @@ async def stream_openai_response(claude_prompt: str, model_name: str, conversati
                     }
                     # Record in a format that would make sense as output
                     tool_calls_formatted = json.dumps(tool_calls_response, indent=2)
-                    with process_lock:
+                    with process_tracking.process_lock:
                         # Try to update all recent processes in case we missed the right one
-                        for pid, info in list(proxy_launched_processes.items()):
+                        for pid, info in list(process_tracking.proxy_launched_processes.items()):
                             if (time.time() - info.get("start_time", 0) < 300):  # 5 minutes
                                 update_streaming_process_output(str(pid), tool_calls_formatted)
                 else:
                     # For regular responses, update with the text content
-                    with process_lock:
+                    with process_tracking.process_lock:
                         # Try to update all recent processes in case we missed the right one
-                        for pid, info in list(proxy_launched_processes.items()):
+                        for pid, info in list(process_tracking.proxy_launched_processes.items()):
                             if (time.time() - info.get("start_time", 0) < 300):  # 5 minutes
                                 update_streaming_process_output(str(pid), full_response)
                 
@@ -2848,7 +2851,7 @@ async def chat(request_body: Request):
                 logger.info(f"Unique conversations: {len(metrics.unique_conversations)}")
             
             # Store in process outputs directly for debugging in dashboard
-            for process_id, process_info in list(proxy_launched_processes.items()):
+            for process_id, process_info in list(process_tracking.proxy_launched_processes.items()):
                 if "pid" in process_info:
                     # Create a dict representation of the request
                     request_dict = {
@@ -2867,9 +2870,9 @@ async def chat(request_body: Request):
                     
                     # Check if we have output already stored
                     pid_str = str(process_info.get("pid"))
-                    if pid_str in process_outputs:
+                    if pid_str in process_tracking.process_outputs:
                         # Update the existing output with the request data
-                        process_outputs[pid_str]["original_request"] = request_dict
+                        process_tracking.process_outputs[pid_str]["original_request"] = request_dict
                         logger.info(f"Updated output with request data for process {pid_str}")
             
             # No artificial delay - let FastAPI/Starlette handle the request normally
@@ -3162,7 +3165,7 @@ async def ollama_chat(request: OllamaChatRequest):
             import shlex
             quoted_prompt = shlex.quote(claude_prompt)
             cmd = f"{base_cmd} -p {quoted_prompt} --output-format json"
-            logger.info(f"Non-streaming command: {cmd}")
+            logger.debug(f"Non-streaming command: {cmd}")
             
             # Actually run the command
             claude_response = await run_claude_command(claude_prompt, conversation_id=None, original_request=request_dict)
@@ -3454,15 +3457,6 @@ async def test_client_info(request: Request):
     logger.info(f"Sending test response: {json.dumps(test_response)[:100]}...")
     return JSONResponse(content=test_response, headers=headers)
 
-# Dictionary to track proxy-launched Claude processes
-proxy_launched_processes = {}
-# Dictionary to store outputs from recent processes (limited to last 20)
-process_outputs = collections.OrderedDict()
-MAX_STORED_OUTPUTS = 20
-# Lock for process access - we need to use threading.Lock() not asyncio.Lock() at module level
-import threading
-process_lock = threading.Lock()  # Must use threading.Lock() not asyncio.Lock() at module level
-
 # Self-test function for basic health checks
 def run_self_test():
     """Run quick self-tests to verify functionality."""
@@ -3555,17 +3549,17 @@ def track_claude_process(pid, command, original_request=None):
             )
         
         # Look for temporary process IDs that should be linked to this real PID
-        for temp_pid, process_info in proxy_launched_processes.items():
+        for temp_pid, process_info in process_tracking.proxy_launched_processes.items():
             if isinstance(temp_pid, str) and temp_pid.startswith("claude-process-"):
                 # Check if this temp_pid was recently created and doesn't already have a real PID
                 if process_info.get("real_pid") is None:
                     # Link this temporary ID to the real PID
-                    proxy_launched_processes[temp_pid]["real_pid"] = numeric_pid
+                    process_tracking.proxy_launched_processes[temp_pid]["real_pid"] = numeric_pid
                     temp_id = temp_pid
                     break
     
     # Store process information
-    proxy_launched_processes[pid] = {
+    process_tracking.proxy_launched_processes[pid] = {
         "pid": pid,
         "command": command,
         "start_time": time.time(),
@@ -3578,69 +3572,68 @@ def track_claude_process(pid, command, original_request=None):
 
 def untrack_claude_process(pid):
     """Remove a Claude process from tracking or mark it as finished if needed"""
-    with process_lock:
-        if pid in proxy_launched_processes:
+    with process_tracking.process_lock:
+        if pid in process_tracking.proxy_launched_processes:
             # Get the process info before removing it
-            process_info = proxy_launched_processes.get(pid, {})
+            process_info = process_tracking.proxy_launched_processes.get(pid, {})
             
             # Check if we should keep this process for record-keeping
             if process_info.get("keep_record", False):
                 # Instead of removing, mark as finished
-                proxy_launched_processes[pid]["status"] = "finished"
+                process_tracking.proxy_launched_processes[pid]["status"] = "finished"
                 logger.info(f"Marked Claude process with PID {pid} as finished (keeping record)")
                 return
             
             # Otherwise remove this process
-            proxy_launched_processes.pop(pid, None)
+            process_tracking.proxy_launched_processes.pop(pid, None)
             logger.info(f"Untracked Claude process with PID {pid}")
             
             # If this is a real PID (numeric), also clean up any temporary IDs linked to it
             if not isinstance(pid, str) or not pid.startswith("claude-process-"):
                 # This is a real PID - check for any temporary IDs that link to it
-                for temp_pid, info in list(proxy_launched_processes.items()):
+                for temp_pid, info in list(process_tracking.proxy_launched_processes.items()):
                     if (isinstance(temp_pid, str) and temp_pid.startswith("claude-process-") and 
                         info.get('real_pid') == pid):
                         # Check if we should keep this process for record-keeping
                         if info.get("keep_record", False):
                             # Instead of removing, mark as finished
-                            proxy_launched_processes[temp_pid]["status"] = "finished" 
+                            process_tracking.proxy_launched_processes[temp_pid]["status"] = "finished" 
                             logger.info(f"Marked linked temporary process with PID {temp_pid} as finished (keeping record)")
                         else:
-                            proxy_launched_processes.pop(temp_pid, None)
+                            process_tracking.proxy_launched_processes.pop(temp_pid, None)
                             logger.info(f"Untracked linked temporary process with PID {temp_pid}")
             
             # If this is a temporary ID, also handle the real PID it links to
             if isinstance(pid, str) and pid.startswith("claude-process-"):
                 real_pid = process_info.get('real_pid')
-                if real_pid and real_pid in proxy_launched_processes:
+                if real_pid and real_pid in process_tracking.proxy_launched_processes:
                     # Check if we should keep this process for record-keeping
-                    if proxy_launched_processes[real_pid].get("keep_record", False):
+                    if process_tracking.proxy_launched_processes[real_pid].get("keep_record", False):
                         # Instead of removing, mark as finished
-                        proxy_launched_processes[real_pid]["status"] = "finished"
+                        process_tracking.proxy_launched_processes[real_pid]["status"] = "finished"
                         logger.info(f"Marked linked real process with PID {real_pid} as finished (keeping record)")
                     else:
-                        proxy_launched_processes.pop(real_pid, None)
+                        process_tracking.proxy_launched_processes.pop(real_pid, None)
                         logger.info(f"Untracked linked real process with PID {real_pid}")
 
 def store_process_output(pid, stdout, stderr, command, prompt, response, converted_response=None, model=DEFAULT_MODEL, original_request=None):
     """Store the output from a Claude process"""
-    global process_outputs
     timestamp = datetime.datetime.now().isoformat()
     
     # Check if we're updating an existing output for a streaming process
-    if pid in process_outputs and response != "Streaming response - output sent directly to client":
-        if process_outputs[pid].get("response") == "Streaming response - output sent directly to client":
+    if pid in process_tracking.process_outputs and response != "Streaming response - output sent directly to client":
+        if process_tracking.process_outputs[pid].get("response") == "Streaming response - output sent directly to client":
             # We're updating a streaming process with the final output
             logger.info(f"Updating streaming process {pid} with final content")
-            process_outputs[pid]["response"] = response
+            process_tracking.process_outputs[pid]["response"] = response
             
             # Also update the converted response if it exists
-            if "converted_response" in process_outputs[pid] and converted_response:
-                process_outputs[pid]["converted_response"] = converted_response
-            elif "converted_response" in process_outputs[pid] and isinstance(response, (dict, str)):
+            if "converted_response" in process_tracking.process_outputs[pid] and converted_response:
+                process_tracking.process_outputs[pid]["converted_response"] = converted_response
+            elif "converted_response" in process_tracking.process_outputs[pid] and isinstance(response, (dict, str)):
                 try:
                     # Update the message content in the existing converted response
-                    conv_resp = process_outputs[pid]["converted_response"]
+                    conv_resp = process_tracking.process_outputs[pid]["converted_response"]
                     if isinstance(conv_resp, dict) and "choices" in conv_resp:
                         for choice in conv_resp["choices"]:
                             if "message" in choice:
@@ -3674,17 +3667,17 @@ def store_process_output(pid, stdout, stderr, command, prompt, response, convert
             logger.error(f"Failed to convert response for storage: {e}")
     
     # Store the entry
-    process_outputs[pid] = entry
+    process_tracking.process_outputs[pid] = entry
     
     # Limit the number of stored outputs
-    while len(process_outputs) > MAX_STORED_OUTPUTS:
-        process_outputs.popitem(last=False)  # Remove oldest item (FIFO)
+    while len(process_tracking.process_outputs) > process_tracking.MAX_STORED_OUTPUTS:
+        process_tracking.process_outputs.popitem(last=False)  # Remove oldest item (FIFO)
     
     logger.info(f"Stored output for process {pid}")
 
 def update_streaming_process_output(pid, content):
     """Update a streaming process output with the full response content"""
-    global process_outputs, streaming_content_buffer
+    global streaming_content_buffer
     logger.info(f"Updating streaming process output for PID {pid} with content length: {len(content)}")
     
     # Create global buffer for streaming content if it doesn't exist
@@ -3695,20 +3688,20 @@ def update_streaming_process_output(pid, content):
     # Always store the streaming content in a global buffer for easy access
     streaming_content_buffer[pid] = content
         
-    # Update in process_outputs
-    if pid in process_outputs:
+    # Update in process_tracking.process_outputs
+    if pid in process_tracking.process_outputs:
         # Set the actual response content directly - overwrite the placeholder
-        process_outputs[pid]["response"] = content
+        process_tracking.process_outputs[pid]["response"] = content
         # Also store it in special fields for dashboard access
-        process_outputs[pid]["final_output"] = content
-        process_outputs[pid]["stream_buffer"] = content  # Add dedicated field for streaming buffer
-        process_outputs[pid]["stream_data"] = content    # Alternative name in case code looks for this
+        process_tracking.process_outputs[pid]["final_output"] = content
+        process_tracking.process_outputs[pid]["stream_buffer"] = content  # Add dedicated field for streaming buffer
+        process_tracking.process_outputs[pid]["stream_data"] = content    # Alternative name in case code looks for this
         logger.info(f"Updated multiple content fields for process {pid}")
         
         # Also update the message content in the converted response
-        if "converted_response" in process_outputs[pid]:
+        if "converted_response" in process_tracking.process_outputs[pid]:
             try:
-                conv_resp = process_outputs[pid]["converted_response"]
+                conv_resp = process_tracking.process_outputs[pid]["converted_response"]
                 if isinstance(conv_resp, dict) and "choices" in conv_resp:
                     for choice in conv_resp["choices"]:
                         if "message" in choice:
@@ -3721,28 +3714,28 @@ def update_streaming_process_output(pid, content):
                     conv_resp["status"] = "finished"
                     logger.info(f"Updated status to finished in converted response for {pid}")
                     
-                # Store updated converted_response back in process_outputs
-                process_outputs[pid]["converted_response"] = conv_resp
+                # Store updated converted_response back in process_tracking.process_outputs
+                process_tracking.process_outputs[pid]["converted_response"] = conv_resp
             except Exception as e:
                 logger.error(f"Error updating converted response: {e}")
         
         # Also update process status
-        if pid in proxy_launched_processes:
+        if pid in process_tracking.proxy_launched_processes:
             # Update the status to finished
-            proxy_launched_processes[pid]["status"] = "finished"
+            process_tracking.proxy_launched_processes[pid]["status"] = "finished"
             logger.info(f"Marked process {pid} as finished")
             
             # Store content in multiple places to make it accessible
-            proxy_launched_processes[pid]["content"] = content
-            proxy_launched_processes[pid]["stream_buffer"] = content
-            proxy_launched_processes[pid]["streaming_content"] = content
+            process_tracking.proxy_launched_processes[pid]["content"] = content
+            process_tracking.proxy_launched_processes[pid]["stream_buffer"] = content
+            process_tracking.proxy_launched_processes[pid]["streaming_content"] = content
             
             # Add complete_response for the dashboard to display
             complete_message = {
                 "role": "assistant",
                 "content": content
             }
-            proxy_launched_processes[pid]["complete_response"] = {
+            process_tracking.proxy_launched_processes[pid]["complete_response"] = {
                 "message": complete_message,
                 "finish_reason": "stop"
             }
@@ -3752,163 +3745,7 @@ def update_streaming_process_output(pid, content):
         content_sample = content[:50] + "..." if len(content) > 50 else content
         logger.info(f"Final streaming content for {pid}: {content_sample}")
 
-def get_process_output(pid):
-    """Get the stored output for a process"""
-    return process_outputs.get(pid, None)
 
-def get_running_claude_processes():
-    """Get information about currently running Claude processes that were launched by this proxy"""
-    try:
-        import subprocess
-        import re
-        import time
-        import psutil
-        
-        # List of processes to return
-        active_processes = []
-        
-        # Track processes we've already processed (to avoid duplicates)
-        processed_pids = set()
-        
-        # Check each tracked process to see if it's still running
-        pids_to_remove = []
-        max_process_age = 1800  # 30 minutes - remove processes older than this
-        current_time = time.time()
-        
-        for pid, process_info in list(proxy_launched_processes.items()):  # Use list() to avoid dict changing during iteration
-            try:
-                # Check for stale processes regardless of type
-                process_age = current_time - process_info.get('start_time', 0)
-                if process_age > max_process_age:
-                    logger.info(f"Removing stale process {pid} (age: {process_age:.1f}s)")
-                    pids_to_remove.append(pid)
-                    continue
-                
-                # Skip if already processed (avoids duplicates)
-                real_pid = process_info.get('real_pid')
-                if real_pid and real_pid in processed_pids:
-                    continue
-                
-                # Handle different process ID types
-                if isinstance(pid, str) and pid.startswith("claude-process-"):
-                    # Check if this process has a real PID assigned
-                    if real_pid:
-                        # Check if the real PID process exists
-                        try:
-                            if not psutil.pid_exists(real_pid):
-                                logger.info(f"Temporary process {pid} refers to non-existent real PID {real_pid}")
-                                # Mark as finished instead of removing so it shows properly in dashboard
-                                process_info['status'] = 'finished'
-                                logger.info(f"Marking temp process {pid} as finished due to non-existent real PID {real_pid}")
-                                continue
-                            else:
-                                # Skip as we'll process when we encounter the real PID
-                                continue
-                        except:
-                            # Error checking real PID - mark as finished too
-                            process_info['status'] = 'finished'
-                            logger.info(f"Marking temp process {pid} as finished due to error checking real PID")
-                            continue
-                            
-                    # Set status to finished for processes that have been around too long
-                    if process_age > 300:  # 5 minutes
-                        process_info['status'] = 'finished'
-                        logger.info(f"Marking temp process {pid} as finished due to age: {process_age:.1f}s")
-                    
-                    # Only include running processes in the dashboard
-                    if process_info.get('status') == 'running':
-                        # For string-based process IDs without real PID, include in the list but mark as non-psutil
-                        runtime_secs = int(current_time - process_info['start_time'])
-                        hours, remainder = divmod(runtime_secs, 3600)
-                        minutes, seconds = divmod(remainder, 60)
-                        runtime = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
-                        
-                        active_processes.append({
-                            "user": "claude",
-                            "pid": pid,
-                            "cpu": "N/A",
-                            "memory": "N/A",
-                            "started": time.strftime("%H:%M:%S", time.localtime(process_info['start_time'])),
-                            "runtime": runtime,
-                            "command": process_info.get('command', 'Claude Process')[:80]
-                        })
-                    continue
-                
-                # For numeric PIDs, convert and check if process exists
-                try:
-                    numeric_pid = int(pid) if isinstance(pid, str) else pid
-                    
-                    # Check if the process exists before creating Process object
-                    if not psutil.pid_exists(numeric_pid):
-                        pids_to_remove.append(pid)
-                        logger.info(f"Process {numeric_pid} no longer exists")
-                        continue
-                    
-                    # Check if it's actually a Claude process
-                    process = psutil.Process(numeric_pid)
-                    cmdline = process.cmdline()
-                    if not ("claude" in process.name().lower() or any("claude" in arg.lower() for arg in cmdline)):
-                        # Not a Claude process - either reused PID or wrong process
-                        logger.info(f"Process {numeric_pid} exists but is not a Claude process: {' '.join(cmdline)}")
-                        pids_to_remove.append(pid)
-                        continue
-                except (psutil.NoSuchProcess, ValueError, psutil.AccessDenied) as e:
-                    # Process no longer exists or invalid PID format
-                    logger.info(f"Error checking process {pid}: {str(e)}")
-                    pids_to_remove.append(pid)
-                    continue
-                
-                # Mark as processed to avoid duplicates
-                processed_pids.add(numeric_pid)
-                
-                # Update the status in the process_info
-                process_info['status'] = 'running'
-                
-                # Get process info
-                with process.oneshot():
-                    user = process.username()
-                    cpu = f"{process.cpu_percent(interval=0.1):.1f}"
-                    mem = f"{process.memory_percent():.1f}"
-                    started = time.strftime("%H:%M:%S", time.localtime(process.create_time()))
-                    command = " ".join(process.cmdline())[:80] + ("..." if len(" ".join(process.cmdline())) > 80 else "")
-                    
-                    # Calculate runtime
-                    runtime_secs = int(current_time - process_info['start_time'])
-                    hours, remainder = divmod(runtime_secs, 3600)
-                    minutes, seconds = divmod(remainder, 60)
-                    runtime = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
-                    
-                    active_processes.append({
-                        "user": user,
-                        "pid": pid,
-                        "cpu": cpu,
-                        "memory": mem,
-                        "started": started,
-                        "runtime": runtime,
-                        "command": command
-                    })
-            except (psutil.NoSuchProcess, psutil.AccessDenied, ValueError) as e:
-                # Process no longer exists, can't be accessed, or invalid PID format
-                logger.info(f"Error processing {pid}: {str(e)}")
-                pids_to_remove.append(pid)
-                
-        # Clean up processes that no longer exist
-        for pid in pids_to_remove:
-            # First mark as finished before untracking
-            try:
-                proxy_launched_processes[pid]['status'] = 'finished'
-                logger.info(f"Marked process {pid} as finished before cleanup")
-            except:
-                pass
-                
-            # Now untrack the process
-            untrack_claude_process(pid)
-            logger.info(f"Untracked Claude process with PID {pid}")
-        
-        return active_processes
-    except Exception as e:
-        logger.error(f"Error getting Claude processes: {e}")
-        return []
 
 # Dashboard functions and endpoints have been moved to dashboard.py
 
@@ -3922,9 +3759,6 @@ try:
     dashboard.init_dashboard(
         app=app,
         metrics_module=metrics,
-        get_process_output_fn=get_process_output,
-        process_outputs_dict=process_outputs,
-        get_running_claude_processes_fn=get_running_claude_processes
     )
     logger.info("Dashboard module initialized")
 except (ImportError, AttributeError) as e:
