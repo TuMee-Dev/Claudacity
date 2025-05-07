@@ -29,11 +29,8 @@ import fastapi
 from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
 from fastapi.responses import StreamingResponse, JSONResponse, PlainTextResponse, HTMLResponse, Response
 
-# Import dashboard module 
-try:
-    import dashboard
-except ImportError:
-    dashboard = None
+# Dashboard will be imported at the end to avoid circular imports
+dashboard = None
 from fastapi.middleware.cors import CORSMiddleware
 import asyncio
 from starlette.background import BackgroundTask
@@ -885,6 +882,22 @@ async def run_claude_command(prompt: str, conversation_id: str = None, original_
                 stderr_text = stderr.decode() if stderr else ""
                 if stderr_text:
                     logger.error(f"[TOOLS] Claude process stderr output: {stderr_text}")
+                    
+                    # Check for authentication issues in stderr
+                    if "log in" in stderr_text.lower() or "authenticate" in stderr_text.lower() or "not authenticated" in stderr_text.lower() or "login" in stderr_text.lower() or "session expired" in stderr_text.lower():
+                        logger.warning("Authentication issue detected in Claude CLI")
+                        # Create an auth error response that can be propagated back to the client
+                        auth_error = {
+                            "error": {
+                                "message": "Claude CLI authentication required. Please log in using the Claude CLI.",
+                                "type": "auth_error",
+                                "param": None,
+                                "code": "claude_auth_required"
+                            },
+                            "auth_required": True,
+                            "user_message": "Authentication required: Please log in using the Claude CLI on your server."
+                        }
+                        return json.dumps(auth_error)
             else:
                 logger.info("No stderr output from Claude process")
                 
@@ -998,6 +1011,28 @@ async def run_claude_command(prompt: str, conversation_id: str = None, original_
         try:
             response = json.loads(output)
             logger.debug(f"Parsed Claude response: {response}")
+            
+            # Check for authentication error in the exact format provided
+            if (isinstance(response, dict) and 
+                response.get("role") == "system" and 
+                "result" in response and 
+                isinstance(response["result"], str) and 
+                ("Invalid API key" in response["result"] or 
+                 "Please run /login" in response["result"])):
+                
+                logger.warning(f"Authentication error detected in Claude response: {response['result']}")
+                # Create an auth error response that can be propagated back to the client
+                auth_error = {
+                    "error": {
+                        "message": response["result"],
+                        "type": "auth_error",
+                        "param": None,
+                        "code": "claude_auth_required"
+                    },
+                    "auth_required": True,
+                    "user_message": "Authentication required: Please log in using the Claude CLI on your server."
+                }
+                return json.dumps(auth_error)
             
             # Extract token count if available
             output_tokens = None
@@ -1167,6 +1202,37 @@ async def stream_claude_output(prompt: str, conversation_id: str = None, origina
     # Just log that we're ready to process
     logger.debug("Claude process started with prompt in command line, ready to read output")
 
+    # Check for any auth errors in stderr first
+    stderr_data = b""
+    try:
+        # Try to read any early stderr output - non-blocking
+        stderr_data = await asyncio.wait_for(process.stderr.read(1024), timeout=0.5)
+    except asyncio.TimeoutError:
+        # No stderr output yet, which is fine
+        pass
+    except Exception as e:
+        logger.debug(f"Error reading initial stderr: {str(e)}")
+    
+    # If we got stderr data, check for auth issues
+    if stderr_data:
+        stderr_text = stderr_data.decode('utf-8')
+        logger.warning(f"Early stderr from Claude: {stderr_text}")
+        
+        # Check for auth-related errors
+        if any(term in stderr_text.lower() for term in ["log in", "authenticate", "not authenticated", "login", "session expired"]):
+            logger.warning("Authentication issue detected in Claude CLI")
+            # Return an auth error that can be passed back to client
+            yield {
+                "error": {
+                    "message": "Claude CLI authentication required. Please log in using the Claude CLI.",
+                    "type": "auth_error",
+                    "code": "claude_auth_required"
+                }
+            }
+            # Close the process
+            process.terminate()
+            return
+    
     # Read the output
     try:
         # Buffer for collecting complete JSON objects
@@ -1239,8 +1305,27 @@ async def stream_claude_output(prompt: str, conversation_id: str = None, origina
                                     break
                                 # Additional handling for system messages with cost info
                                 elif "role" in json_obj and json_obj["role"] == "system":
+                                    # Check for authentication errors in system message
+                                    if ("result" in json_obj and 
+                                        isinstance(json_obj["result"], str) and 
+                                        ("Invalid API key" in json_obj["result"] or 
+                                         "Please run /login" in json_obj["result"])):
+                                        
+                                        logger.warning(f"Authentication error detected in streaming response: {json_obj['result']}")
+                                        # Return an auth error that can be passed back to client
+                                        yield {
+                                            "error": {
+                                                "message": json_obj["result"],
+                                                "type": "auth_error",
+                                                "code": "claude_auth_required"
+                                            }
+                                        }
+                                        # Mark as complete
+                                        streaming_complete = True
+                                        break
+                                    
                                     # This is a system message with additional info
-                                    if "cost_usd" in json_obj or "duration_ms" in json_obj:
+                                    elif "cost_usd" in json_obj or "duration_ms" in json_obj:
                                         # Extract execution duration if available
                                         duration_ms = json_obj.get("duration_ms", (time.time() - start_time) * 1000)
                                         streaming_complete = True
@@ -1876,8 +1961,37 @@ async def stream_openai_response(claude_prompt: str, model_name: str, conversati
             logger.info(f"[TOOLS] Received chunk: {str(chunk)[:100]}...")
             logger.debug(f"Processing OpenAI stream chunk: {chunk}")
             
-            # Check for errors
+            # Check for errors or auth issues
             if "error" in chunk:
+                # Check if this is an auth error
+                if isinstance(chunk["error"], dict) and chunk["error"].get("type") == "auth_error":
+                    logger.warning("Authentication error detected in stream, passing to client")
+                    
+                    # Format as OpenAI error response for streaming
+                    auth_error_msg = {
+                        "id": message_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model_name,
+                        "choices": [{
+                            "index": 0,
+                            "delta": {
+                                "role": "assistant",
+                                "content": "Authentication required: " + chunk["error"].get("message", "Please log in with Claude CLI")
+                            },
+                            "finish_reason": "error"
+                        }]
+                    }
+                    
+                    # Send the error as a regular chunk
+                    yield f"data: {json.dumps(auth_error_msg)}\n\n"
+                    
+                    # Send completion marker
+                    yield "data: [DONE]\n\n"
+                    
+                    # Mark as completed
+                    completion_sent = True
+                    return
                 logger.error(f"Error in OpenAI stream: {chunk['error']}")
                 error_response = {
                     "error": {
@@ -2155,6 +2269,35 @@ async def stream_openai_response(claude_prompt: str, model_name: str, conversati
                 if len(full_response) < 500:
                     logger.debug(f"Complete OpenAI response: {full_response}")
                 
+                # Call our new function to update streaming process outputs
+                try:
+                    # Call the dedicated function to update streaming outputs
+                    if has_tools and tool_calls_collection:
+                        # For tool calls, create a proper response
+                        tool_calls_response = {
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": tool_calls_collection
+                        }
+                        # Record in a format that would make sense as output
+                        tool_calls_formatted = json.dumps(tool_calls_response, indent=2)
+                        with process_lock:
+                            # Try to update all recent processes in case we missed the right one
+                            for pid, info in list(proxy_launched_processes.items()):
+                                if (time.time() - info.get("start_time", 0) < 300):  # 5 minutes
+                                    update_streaming_process_output(str(pid), tool_calls_formatted)
+                    else:
+                        # For regular responses, update with the text content
+                        with process_lock:
+                            # Try to update all recent processes in case we missed the right one
+                            for pid, info in list(proxy_launched_processes.items()):
+                                if (time.time() - info.get("start_time", 0) < 300):  # 5 minutes
+                                    update_streaming_process_output(str(pid), full_response)
+                    
+                    logger.info(f"Updated streaming processes with content length: {len(full_response)}")
+                except Exception as e:
+                    logger.error(f"Error updating streaming process output: {e}")
+                
                 # Store the complete response for the dashboard, including tool calls
                 if has_tools and tool_calls_collection:
                     # Create a complete message that includes all tool calls
@@ -2249,6 +2392,35 @@ async def stream_openai_response(claude_prompt: str, model_name: str, conversati
             logger.info(f"Complete OpenAI response length: {len(full_response)} chars")
             if len(full_response) < 500:
                 logger.debug(f"Complete OpenAI response: {full_response}")
+                
+            # Call our new function to update streaming process outputs (fallback case)
+            try:
+                # Call the dedicated function to update streaming outputs
+                if has_tools and tool_calls_collection:
+                    # For tool calls, create a proper response
+                    tool_calls_response = {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": tool_calls_collection
+                    }
+                    # Record in a format that would make sense as output
+                    tool_calls_formatted = json.dumps(tool_calls_response, indent=2)
+                    with process_lock:
+                        # Try to update all recent processes in case we missed the right one
+                        for pid, info in list(proxy_launched_processes.items()):
+                            if (time.time() - info.get("start_time", 0) < 300):  # 5 minutes
+                                update_streaming_process_output(str(pid), tool_calls_formatted)
+                else:
+                    # For regular responses, update with the text content
+                    with process_lock:
+                        # Try to update all recent processes in case we missed the right one
+                        for pid, info in list(proxy_launched_processes.items()):
+                            if (time.time() - info.get("start_time", 0) < 300):  # 5 minutes
+                                update_streaming_process_output(str(pid), full_response)
+                
+                logger.info(f"Updated streaming processes with content length: {len(full_response)} (fallback)")
+            except Exception as e:
+                logger.error(f"Error updating streaming process output (fallback): {e}")
             
     except Exception as e:
         logger.error(f"Error streaming from Claude with OpenAI format: {str(e)}", exc_info=True)
@@ -2488,6 +2660,58 @@ async def chat(request_body: Request):
                 
                 # Actually run the command
                 claude_response = await run_claude_command(claude_prompt, conversation_id=conversation_id, original_request=request_dict)
+                
+                # Check if response is a string that looks like JSON
+                if isinstance(claude_response, str) and claude_response.strip().startswith('{') and claude_response.strip().endswith('}'):
+                    try:
+                        response_obj = json.loads(claude_response)
+                        
+                        # Check for authentication error in our format
+                        if "error" in response_obj and isinstance(response_obj["error"], dict) and response_obj["error"].get("type") == "auth_error":
+                            logger.warning("Authentication error detected in run_claude_command response")
+                            # Return a friendly error response to the client
+                            error_message = response_obj["error"].get("message", "Authentication required")
+                            user_message = response_obj.get("user_message", "Please log in using the Claude CLI on your server")
+                            
+                            # Return error response in OpenAI format
+                            return JSONResponse(
+                                status_code=401,  # Unauthorized
+                                content={
+                                    "error": {
+                                        "message": error_message,
+                                        "type": "auth_error",
+                                        "param": None,
+                                        "code": "claude_auth_required"
+                                    }
+                                },
+                                headers={"WWW-Authenticate": "Basic realm=\"Claude CLI Authentication Required\""}
+                            )
+                        
+                        # Check for the exact Claude CLI auth error format
+                        elif (response_obj.get("role") == "system" and 
+                              "result" in response_obj and 
+                              isinstance(response_obj["result"], str) and 
+                              ("Invalid API key" in response_obj["result"] or 
+                               "Please run /login" in response_obj["result"])):
+                            
+                            logger.warning(f"Claude CLI authentication error detected: {response_obj['result']}")
+                            
+                            # Return error response in OpenAI format
+                            return JSONResponse(
+                                status_code=401,  # Unauthorized
+                                content={
+                                    "error": {
+                                        "message": response_obj["result"],
+                                        "type": "auth_error",
+                                        "param": None,
+                                        "code": "claude_auth_required"
+                                    }
+                                },
+                                headers={"WWW-Authenticate": "Basic realm=\"Claude CLI Authentication Required\""}
+                            )
+                    except json.JSONDecodeError:
+                        # Not valid JSON, proceed as normal
+                        pass
                 
                 # Log the raw Claude response at debug level
                 if isinstance(claude_response, dict):
@@ -3191,6 +3415,9 @@ proxy_launched_processes = {}
 # Dictionary to store outputs from recent processes (limited to last 20)
 process_outputs = collections.OrderedDict()
 MAX_STORED_OUTPUTS = 20
+# Lock for process access - we need to use threading.Lock() not asyncio.Lock() at module level
+import threading
+process_lock = threading.Lock()  # Must use threading.Lock() not asyncio.Lock() at module level
 
 # Self-test function for basic health checks
 def run_self_test():
@@ -3356,6 +3583,29 @@ def store_process_output(pid, stdout, stderr, command, prompt, response, convert
     global process_outputs
     timestamp = datetime.datetime.now().isoformat()
     
+    # Check if we're updating an existing output for a streaming process
+    if pid in process_outputs and response != "Streaming response - output sent directly to client":
+        if process_outputs[pid].get("response") == "Streaming response - output sent directly to client":
+            # We're updating a streaming process with the final output
+            logger.info(f"Updating streaming process {pid} with final content")
+            process_outputs[pid]["response"] = response
+            
+            # Also update the converted response if it exists
+            if "converted_response" in process_outputs[pid] and converted_response:
+                process_outputs[pid]["converted_response"] = converted_response
+            elif "converted_response" in process_outputs[pid] and isinstance(response, (dict, str)):
+                try:
+                    # Update the message content in the existing converted response
+                    conv_resp = process_outputs[pid]["converted_response"]
+                    if isinstance(conv_resp, dict) and "choices" in conv_resp:
+                        for choice in conv_resp["choices"]:
+                            if "message" in choice:
+                                choice["message"]["content"] = response
+                    logger.info(f"Updated converted response content for streaming process {pid}")
+                except Exception as e:
+                    logger.error(f"Failed to update converted response: {e}")
+            return
+    
     # Create a new entry for this process
     entry = {
         "pid": pid,
@@ -3372,7 +3622,7 @@ def store_process_output(pid, stdout, stderr, command, prompt, response, convert
     if converted_response:
         entry["converted_response"] = converted_response
     # Otherwise, try to convert it now
-    elif response and isinstance(response, (dict, str)):
+    elif response and isinstance(response, (dict, str)) and response != "Streaming response - output sent directly to client":
         try:
             converted = format_to_openai_chat_completion(response, model)
             entry["converted_response"] = converted
@@ -3387,6 +3637,28 @@ def store_process_output(pid, stdout, stderr, command, prompt, response, convert
         process_outputs.popitem(last=False)  # Remove oldest item (FIFO)
     
     logger.info(f"Stored output for process {pid}")
+
+def update_streaming_process_output(pid, content):
+    """Update a streaming process output with the full response content"""
+    global process_outputs
+    
+    if pid in process_outputs:
+        # Update the response content
+        process_outputs[pid]["response"] = content
+        
+        # Update the converted response if it exists
+        if "converted_response" in process_outputs[pid]:
+            try:
+                conv_resp = process_outputs[pid]["converted_response"]
+                if isinstance(conv_resp, dict) and "choices" in conv_resp:
+                    for choice in conv_resp["choices"]:
+                        if "message" in choice:
+                            choice["message"]["content"] = content
+                logger.info(f"Updated converted response content for streaming process {pid}")
+            except Exception as e:
+                logger.error(f"Failed to update converted response for streaming: {e}")
+                
+        logger.info(f"Updated streaming process {pid} with content: {content[:50]}...")
 
 def get_process_output(pid):
     """Get the stored output for a process"""
@@ -3433,13 +3705,17 @@ def get_running_claude_processes():
                         try:
                             if not psutil.pid_exists(real_pid):
                                 logger.info(f"Temporary process {pid} refers to non-existent real PID {real_pid}")
-                                pids_to_remove.append(pid)
+                                # Mark as finished instead of removing so it shows properly in dashboard
+                                process_info['status'] = 'finished'
+                                logger.info(f"Marking temp process {pid} as finished due to non-existent real PID {real_pid}")
                                 continue
                             else:
                                 # Skip as we'll process when we encounter the real PID
                                 continue
                         except:
-                            # Error checking real PID
+                            # Error checking real PID - mark as finished too
+                            process_info['status'] = 'finished'
+                            logger.info(f"Marking temp process {pid} as finished due to error checking real PID")
                             continue
                             
                     # Set status to finished for processes that have been around too long
@@ -3526,6 +3802,14 @@ def get_running_claude_processes():
                 
         # Clean up processes that no longer exist
         for pid in pids_to_remove:
+            # First mark as finished before untracking
+            try:
+                proxy_launched_processes[pid]['status'] = 'finished'
+                logger.info(f"Marked process {pid} as finished before cleanup")
+            except:
+                pass
+                
+            # Now untrack the process
             untrack_claude_process(pid)
             logger.info(f"Untracked Claude process with PID {pid}")
         
@@ -3539,7 +3823,9 @@ def get_running_claude_processes():
 # Dashboard endpoints have been moved to dashboard.py
 
 # Initialize dashboard if the module is available
-if dashboard is not None:
+# Import dashboard at the end to avoid circular imports
+try:
+    import dashboard
     # Initialize dashboard with required dependencies
     dashboard.init_dashboard(
         app=app,
@@ -3549,8 +3835,8 @@ if dashboard is not None:
         get_running_claude_processes_fn=get_running_claude_processes
     )
     logger.info("Dashboard module initialized")
-else:
-    logger.info("Dashboard module not found, embedded dashboard will be used")
+except (ImportError, AttributeError) as e:
+    logger.info(f"Dashboard module not found or error initializing: {e}, embedded dashboard will be used")
 
 if __name__ == "__main__":
     import uvicorn

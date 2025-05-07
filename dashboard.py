@@ -677,6 +677,22 @@ async def get_single_process_output(pid: str):
             else:
                 process_status = ""
                 
+                # Update the stored responses if needed to remove "still running" status
+                if isinstance(converted_response, dict) and converted_response.get("status") == "running":
+                    # Create updated converted response with status finished
+                    updated_response = converted_response.copy()
+                    updated_response["status"] = "finished"
+                    
+                    # Update the stored process output
+                    try:
+                        output["converted_response"] = updated_response
+                        
+                        # Fix the displayed response text
+                        converted_response_str = json.dumps(updated_response, indent=2)
+                        logger.info(f"Updated response for process {pid} to mark it as finished")
+                    except Exception as e:
+                        logger.error(f"Error updating response status: {e}")
+                
         except:
             # Fallback for any formatting errors
             original_request_str = str(original_request)
