@@ -4,7 +4,10 @@ import re
 import subprocess
 import time
 import threading
-        
+import logging
+
+
+logger = logging.getLogger(__name__)
 
 # Dictionary to track proxy-launched Claude processes
 proxy_launched_processes = {}
@@ -35,7 +38,7 @@ def get_running_claude_processes():
         max_process_age = 1800  # 30 minutes - remove processes older than this
         current_time = time.time()
         
-        for pid, process_info in list(process_tracking.proxy_launched_processes.items()):  # Use list() to avoid dict changing during iteration
+        for pid, process_info in list(proxy_launched_processes.items()):  # Use list() to avoid dict changing during iteration
             try:
                 # Check for stale processes regardless of type
                 process_age = current_time - process_info.get('start_time', 0)
