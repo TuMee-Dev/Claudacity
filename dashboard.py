@@ -15,6 +15,7 @@ import metrics_tracker
 import process_tracking
 from fastapi import HTTPException # type: ignore
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse # type: ignore
+import claude_metrics
 from claude_metrics import ClaudeMetrics
 
 logger = logging.getLogger(__name__)
@@ -427,7 +428,9 @@ def generate_dashboard_html():
     # Add running processes to table
     if running_processes:
         for proc in running_processes:
-            pid = proc.get('pid', 'N/A')
+            pid = proc.get('pid', None)
+            if pid is None or not isinstance(pid, (int)):
+                continue
             command = proc.get('command', proc.get('cmd', 'Unknown'))[:80] + ('...' if len(proc.get('command', proc.get('cmd', ''))) > 80 else '')
             cpu = proc.get('cpu', proc.get('cpu_percent', 'N/A'))
             if isinstance(cpu, (int, float)):

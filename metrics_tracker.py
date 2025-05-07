@@ -5,10 +5,8 @@ This module provides compatibility with the old MetricsTracker interface
 to ensure tests continue to work as expected.
 """
 
-import collections
-import statistics
 import datetime
-import asyncio
+import statistics
 from typing import Dict, Optional, Any, Set, Deque, List
 from claude_metrics import ClaudeMetrics
 
@@ -31,46 +29,91 @@ class MetricsTracker:
         # Most methods will delegate to this instance
         self._metrics = metrics
         
-        # Initialize properties directly for testing
-        self.total_invocations = getattr(self._metrics, 'total_invocations', 0)
-        self.current_processes = getattr(self._metrics, 'current_processes', 0)
-        self.max_concurrent_processes = getattr(self._metrics, 'max_concurrent_processes', 0)
-        self.active_conversations = getattr(self._metrics, 'active_conversations', set())
-        self.unique_conversations = getattr(self._metrics, 'unique_conversations', set())
-        self.first_invocation_time = getattr(self._metrics, 'first_invocation_time', None)
-        self.last_invocation_time = getattr(self._metrics, 'last_invocation_time', None)
-        self.last_completion_time = getattr(self._metrics, 'last_completion_time', None)
-        
-        # Computed properties needed by tests
-        self.total_input_tokens = getattr(self._metrics, 'total_prompt_tokens', 0)
-        self.total_output_tokens = getattr(self._metrics, 'total_completion_tokens', 0)
+        # Only initialize properties that aren't directly accessed from the underlying metrics
         self.total_cost = 0.0
         self.avg_cost = 0.0
         
-        # Properties for performance metrics
-        self.avg_execution_time_ms = 0
-        self.median_execution_time_ms = 0
+        # For test fallbacks, initialize _execution_durations if needed
+        self._execution_durations = []
         
-        # Check if durations exist and have values before calculating statistics
-        execution_durations = getattr(self._metrics, 'execution_durations', [])
-        if execution_durations and len(execution_durations) > 0:
-            try:
-                self.avg_execution_time_ms = self._metrics.get_avg_execution_time()
-            except (AttributeError, TypeError, ValueError):
-                self.avg_execution_time_ms = 0
-                
-            try:
-                times = list(execution_durations)
-                if times and all(t is not None for t in times):
-                    self.median_execution_time_ms = statistics.median(times)
-            except (TypeError, ValueError, AttributeError):
-                self.median_execution_time_ms = 0
-        
-        # Reference to start time for uptime calculation
+        # Reference to start time for uptime calculation (used as fallback)
         try:
-            self.start_time = getattr(self._metrics, 'start_time', datetime.datetime.now())
+            self._fallback_start_time = datetime.datetime.now()
         except (AttributeError, TypeError):
-            self.start_time = datetime.datetime.now()
+            self._fallback_start_time = datetime.datetime.now()
+            
+    # Dynamically access metrics properties from the underlying metrics object
+    @property
+    def total_invocations(self):
+        return getattr(self._metrics, 'total_invocations', 0)
+    
+    @property
+    def current_processes(self):
+        return getattr(self._metrics, 'current_processes', 0)
+    
+    @current_processes.setter
+    def current_processes(self, value):
+        if self._metrics:
+            self._metrics.current_processes = value
+    
+    @property
+    def max_concurrent_processes(self):
+        return getattr(self._metrics, 'max_concurrent_processes', 0)
+    
+    @property
+    def active_conversations(self):
+        return getattr(self._metrics, 'active_conversations', set())
+    
+    @property
+    def unique_conversations(self):
+        return getattr(self._metrics, 'unique_conversations', set())
+    
+    @property
+    def first_invocation_time(self):
+        return getattr(self._metrics, 'first_invocation_time', None)
+    
+    @property
+    def last_invocation_time(self):
+        return getattr(self._metrics, 'last_invocation_time', None)
+    
+    @property
+    def last_completion_time(self):
+        return getattr(self._metrics, 'last_completion_time', None)
+    
+    @property
+    def total_input_tokens(self):
+        return getattr(self._metrics, 'total_prompt_tokens', 0)
+    
+    @property
+    def total_output_tokens(self):
+        return getattr(self._metrics, 'total_completion_tokens', 0)
+    
+    @property
+    def avg_execution_time_ms(self):
+        try:
+            return self._metrics.get_avg_execution_time()
+        except (AttributeError, TypeError, ValueError):
+            # Fallback to our local calculation
+            if hasattr(self, '_execution_durations') and self._execution_durations:
+                return sum(self._execution_durations) / len(self._execution_durations)
+            return 0
+    
+    @property
+    def median_execution_time_ms(self):
+        try:
+            if hasattr(self._metrics, 'execution_durations'):
+                times = list(self._metrics.execution_durations)
+                if times and all(t is not None for t in times):
+                    return statistics.median(times)
+        except (TypeError, ValueError, AttributeError):
+            # Fallback to our local calculation
+            if hasattr(self, '_execution_durations') and self._execution_durations:
+                return statistics.median(self._execution_durations)
+        return 0
+    
+    @property
+    def start_time(self):
+        return getattr(self._metrics, 'start_time', self._fallback_start_time)
     
     # Uptime methods
     def get_uptime(self) -> float:

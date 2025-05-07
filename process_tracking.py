@@ -1,13 +1,23 @@
+import asyncio
 import collections
 import datetime
+import json
 import psutil # type: ignore
-import re
 import os
+import shlex
 import subprocess
+import sys
 import time
 import threading
+import uuid
 import logging
 import formatters
+import streaming
+import traceback
+from typing import Union
+import models
+from claude_metrics import ClaudeMetrics
+import claude_metrics
 
 logger = logging.getLogger(__name__)
 
@@ -60,7 +70,347 @@ def find_claude_command():
         logger.error(f"Error finding claude command: {e}")
         return "claude"  # Fallback to simple command name
 
-def track_claude_process(pid, command, original_request=None):
+async def run_claude_command(claude_cmd: str, prompt: str, conversation_id: str = None, original_request=None, timeout: float = streaming.CLAUDE_STREAM_MAX_SILENCE) -> str:
+    """Run a Claude Code command and return the output."""
+    # Log the request details for debugging
+    logger.debug(f"run_claude_command called with:")
+    logger.debug(f"  - prompt length: {len(prompt)}")
+    logger.debug(f"  - conversation_id: {conversation_id}")
+    logger.debug(f"  - timeout: {timeout}s")
+    
+    # Start building the base command
+    base_cmd = f"{claude_cmd}"
+
+    # Log if tools are present for debugging purposes only
+    if original_request and isinstance(original_request, dict) and original_request.get('tools'):
+        logger.debug(f"[TOOLS] Detected tools in original_request for conversation: {conversation_id}")
+        logger.debug(f"[TOOLS] Tools are detected but will NOT be passed to Claude directly")
+    
+    # Always use conversation ID if provided (regardless of tools or message count)
+    if conversation_id:
+        logger.debug(f"[TOOLS] Using conversation ID: {conversation_id}")
+        base_cmd += f" -r {conversation_id}"
+        
+        # Check if we're in test mode (only create temp dirs in production)
+        is_test = 'unittest' in sys.modules or os.environ.get('TESTING') == '1'
+        
+        if not is_test:
+            # Create or get a temporary directory for this conversation
+            temp_dir = models.get_conversation_temp_dir(conversation_id)
+            
+            # Set the current working directory for this conversation
+            # We'll use environment variable to pass it to the Claude CLI
+            os.environ["CLAUDE_CWD"] = temp_dir
+    else:
+        logger.debug(f"[TOOLS] No conversation ID provided")
+
+    # Add the -p flag AFTER the conversation flag
+    # The prompt needs to be directly after -p, not piped via stdin
+    quoted_prompt = shlex.quote(prompt)
+    cmd = f"{base_cmd} -p {quoted_prompt} --output-format json"
+
+    logger.debug(f"Running command: {cmd}")
+    
+    # Generate a unique process ID for tracking
+    process_id = f"claude-process-{uuid.uuid4().hex[:8]}"
+    start_time = time.time()
+    model = models.DEFAULT_MODEL
+    
+    # Record the Claude process start in metrics
+    await claude_metrics.global_metrics.record_claude_start(process_id, model, conversation_id)
+
+    # Track this process with the original request data
+    proxy_launched_processes[process_id] = {
+        "command": cmd,
+        "start_time": time.time(),
+        "current_request": original_request,
+        "status": "running"  # Explicitly mark as running
+    }
+    
+    # Set appropriate timeout parameters based on prompt complexity
+    # The longer/more complex the prompt, the more time Claude might need
+    current_chunk_timeout = streaming.CLAUDE_STREAM_CHUNK_TIMEOUT
+    current_max_silence = streaming.CLAUDE_STREAM_MAX_SILENCE
+    
+    # Adjust timeout based on prompt length or complexity if needed
+    proxy_launched_processes[process_id]['chunk_timeout'] = current_chunk_timeout
+    proxy_launched_processes[process_id]['max_silence'] = current_max_silence
+    
+    logger.info(f"Tracking new Claude process with PID {process_id}")
+
+    process = None
+    try:
+        # No need for stdin=PIPE since we're passing the prompt via command line now
+        logger.debug(f"[TOOLS] About to start Claude process with command: {cmd}")
+        try:
+            process = await asyncio.create_subprocess_shell(
+                cmd,
+                stdin=None,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            if process and process.pid:
+                logger.info(f"[TOOLS] Successfully started Claude process with PID: {process.pid}")
+            else:
+                logger.error(f"[TOOLS] Failed to start Claude process, no PID assigned")
+        except Exception as e:
+            logger.error(f"[TOOLS] Exception while starting Claude process: {str(e)}")
+            raise
+        
+        # Track this process
+        if process and process.pid:
+            # Transfer the original request from our process ID to the actual process ID
+            if original_request and process_id in proxy_launched_processes:
+                original_request_data = proxy_launched_processes[process_id].get("current_request")
+            else:
+                original_request_data = original_request
+                
+            track_claude_process(process.pid, cmd, original_request_data)
+        
+        # Wait for Claude to process the command (prompt is already in the command line)
+        # Add timeout handling for non-streaming mode
+        try:
+            # Get process-specific timeout if available (or use the default)
+            process_info = proxy_launched_processes.get(str(process.pid), {})
+            max_silence = process_info.get('max_silence', timeout)
+            logger.info(f"Using timeout of {max_silence} seconds for non-streaming request")
+            logger.debug(f"Process ID: {process.pid}, Command: {cmd}")
+            
+            # Use asyncio.wait_for to add a timeout to communicate()
+            logger.info(f"Starting process.communicate() with timeout={max_silence}s")
+            try:
+                logger.info(f"Non-streaming pid is: {process.pid}")
+                stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=max_silence)
+                logger.info("process.communicate() completed successfully")
+            except Exception as comm_error:
+                logger.error(f"Error in process.communicate(): {comm_error}")
+                logger.error(f"Traceback: {traceback.format_exc()}")
+                raise
+            
+            # Log any stderr output for debugging
+            if stderr:
+                stderr_text = stderr.decode() if stderr else ""
+                if stderr_text:
+                    logger.error(f"[TOOLS] Claude process stderr output: {stderr_text}")
+                    
+                    # Check for authentication issues in stderr
+                    if "log in" in stderr_text.lower() or "authenticate" in stderr_text.lower() or "not authenticated" in stderr_text.lower() or "login" in stderr_text.lower() or "session expired" in stderr_text.lower():
+                        logger.warning("Authentication issue detected in Claude CLI")
+                        # Create an auth error response that can be propagated back to the client
+                        auth_error = models.create_auth_error_response("Claude CLI authentication required. Please log in using the Claude CLI.")
+                        # Untrack the temporary process ID before returning
+                        untrack_claude_process(process_id)
+                        return json.dumps(auth_error)
+            else:
+                logger.info("No stderr output from Claude process")
+                
+            if stdout:
+                stdout_text = stdout.decode() if stdout else ""
+                logger.info(f"stdout length: {len(stdout_text)} bytes")
+                logger.debug(f"stdout preview: {stdout_text[:100]}...")
+            else:
+                logger.warning("No stdout output from Claude process!")
+                
+        except asyncio.TimeoutError:
+            # Process is taking too long - likely hung
+            logger.warning(f"Non-streaming Claude process {process.pid} timed out after {max_silence} seconds")
+            logger.warning(f"Command that may have hung: {cmd}")
+            logger.warning(f"Process state: {process}")
+            # Try to get process info
+            try:
+                p = psutil.Process(process.pid)
+                logger.warning(f"Process status: {p.status()}")
+                logger.warning(f"Process creation time: {p.create_time()}")
+                logger.warning(f"Process CPU times: {p.cpu_times()}")
+            except Exception as psutil_error:
+                logger.warning(f"Could not get psutil info for process: {psutil_error}")
+            
+            # Try to terminate the process
+            try:
+                logger.warning(f"Attempting to terminate hung Claude process {process.pid}")
+                process.kill()
+                # If successful, untrack this process
+                untrack_claude_process(process.pid)
+                untrack_claude_process(process_id)
+            except Exception as kill_error:
+                logger.error(f"Failed to kill hung process: {kill_error}")
+            
+            # Record timeout error in metrics
+            duration_ms = (time.time() - start_time) * 1000
+            await claude_metrics.global_metrics.record_claude_completion(process_id, duration_ms, error="Process timeout", conversation_id=conversation_id)
+            
+            # Raise a specific timeout exception
+            raise Exception(f"Claude command timed out after {timeout} seconds")
+        
+        # Calculate execution duration
+        duration_ms = (time.time() - start_time) * 1000
+        
+        # Store the process output before untracking
+        if process and process.pid:
+            try:
+                stdout_text = stdout.decode() if stdout else ""
+                stderr_text = stderr.decode() if stderr else ""
+                # Try to parse the response as JSON
+                response_obj = None
+                try:
+                    if stdout_text and stdout_text.strip().startswith('{'):
+                        response_obj = json.loads(stdout_text)
+                except json.JSONDecodeError:
+                    response_obj = stdout_text
+                
+                # Convert to OpenAI format
+                openai_response = None
+                try:
+                    openai_response = formatters.format_to_openai_chat_completion(response_obj or stdout_text, model)
+                except Exception as e:
+                    logger.error(f"Failed to convert to OpenAI format: {e}")
+                
+                # Get the original request for storing
+                original_request = None
+                if "current_request" in proxy_launched_processes.get(str(process.pid), {}):
+                    original_request = proxy_launched_processes[str(process.pid)]["current_request"]
+                
+                store_process_output(
+                    str(process.pid),
+                    stdout_text,
+                    stderr_text,
+                    cmd,
+                    prompt,
+                    response_obj or stdout_text,  # Original response
+                    openai_response,  # Converted response
+                    model,
+                    original_request
+                )
+            except Exception as e:
+                logger.error(f"Error storing process output: {e}")
+            
+            # Now untrack the process
+            untrack_claude_process(process.pid)
+            untrack_claude_process(process_id)
+        
+        if process.returncode != 0:
+            stderr_text = stderr.decode() if stderr else ""
+            stdout_text = stdout.decode() if stdout else ""
+            
+            # Check if we have an API error in stdout (this can happen with certain Claude CLI errors)
+            if stdout_text and "API Error:" in stdout_text:
+                error_msg = stdout_text
+            elif stderr_text:
+                error_msg = stderr_text
+            else:
+                error_msg = "Unknown error"
+                
+            # Log the detailed error
+            logger.error(f"Claude command failed with return code {process.returncode}: {error_msg}")
+            
+            # Record completion with error
+            await claude_metrics.global_metrics.record_claude_completion(process_id, duration_ms, error=error_msg, conversation_id=conversation_id)
+            
+            raise Exception(f"Claude command failed: {error_msg}")
+        
+        output = stdout.decode()
+        logger.debug(f"Raw Claude response: {output}")
+        
+        # Parse JSON response
+        try:
+            response = json.loads(output)
+            logger.debug(f"Parsed Claude response: {response}")
+            
+            # Check for authentication error in the exact format provided
+            if (isinstance(response, dict) and 
+                response.get("role") == "system" and 
+                "result" in response and 
+                isinstance(response["result"], str) and 
+                ("Invalid API key" in response["result"] or 
+                 "Please run /login" in response["result"])):
+                
+                logger.warning(f"Authentication error detected in Claude response: {response['result']}")
+                # Create an auth error response that can be propagated back to the client
+                auth_error = models.create_auth_error_response(response["result"])
+                # Untrack the temporary process ID before returning
+                untrack_claude_process(process_id)
+                return json.dumps(auth_error)
+            
+            # Extract token count if available
+            output_tokens = None
+            if isinstance(response, dict) and "usage" in response:
+                output_tokens = response["usage"].get("completion_tokens", None)
+            
+            # If we have a system response with a result, use that content
+            if isinstance(response, dict) and "role" in response and response["role"] == "system" and "result" in response:
+                # Use duration from response if available, otherwise use our calculated duration
+                response_duration_ms = response.get("duration_ms", duration_ms)
+                cost_usd = response.get("cost_usd", 0)
+                result = response["result"]
+                
+                # Record completion metrics
+                await claude_metrics.global_metrics.record_claude_completion(process_id, response_duration_ms, output_tokens, conversation_id=conversation_id)
+                
+                # Try to parse as JSON if it looks like JSON
+                try:
+                    if isinstance(result, str) and result.strip().startswith('{') and result.strip().endswith('}'):
+                        parsed_result = json.loads(result)
+                        # Return a structured response with parsed content
+                        # Untrack the temporary process ID before returning
+                        untrack_claude_process(process_id)
+                        return {
+                            "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
+                            "role": "assistant",
+                            "parsed_json": True,
+                            "content": parsed_result,
+                            "raw_content": result,
+                            "duration_ms": response_duration_ms,
+                            "cost_usd": cost_usd
+                        }
+                except json.JSONDecodeError:
+                    # Not valid JSON, continue with the original result
+                    pass
+                
+                # Return a structured response with properly extracted content
+                # Untrack the temporary process ID before returning
+                untrack_claude_process(process_id)
+                return {
+                    "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
+                    "role": "assistant",
+                    "parsed_json": False,
+                    "content": result,
+                    "duration_ms": response_duration_ms,
+                    "cost_usd": cost_usd
+                }
+            
+            # Record completion metrics using our calculated duration
+            await claude_metrics.global_metrics.record_claude_completion(process_id, duration_ms, output_tokens, conversation_id=conversation_id)
+            
+            # Return the response as-is if it doesn't match expected format
+            # Untrack the temporary process ID before returning
+            untrack_claude_process(process_id)
+            return response
+            
+        except json.JSONDecodeError:
+            logger.warning("Failed to parse JSON response, returning raw output")
+            
+            # Record completion metrics
+            await claude_metrics.global_metrics.record_claude_completion(process_id, duration_ms, conversation_id=conversation_id)
+            
+            # Untrack the temporary process ID before returning
+            untrack_claude_process(process_id)
+            return output
+            
+    except Exception as e:
+        # Record error in metrics
+        duration_ms = (time.time() - start_time) * 1000
+        await claude_metrics.global_metrics.record_claude_completion(process_id, duration_ms, error=e, conversation_id=conversation_id)
+        
+        # Untrack the process if it's still tracked
+        if process and process.pid:
+            untrack_claude_process(process.pid)
+        untrack_claude_process(process_id)
+            
+        logger.error(f"Error running Claude command: {str(e)}")
+        raise
+
+
+def track_claude_process(pid: Union[str, int], command: str, original_request=None):
     """Track a Claude process launched by this proxy server"""
     import time
     

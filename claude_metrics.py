@@ -358,3 +358,5 @@ class ClaudeMetrics:
                 'by_conversation': dict(self.invocations_by_conversation)
             }
         }
+    
+global_metrics = ClaudeMetrics()

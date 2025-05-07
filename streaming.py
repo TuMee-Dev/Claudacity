@@ -684,7 +684,7 @@ async def stream_claude_output(metrics, claude_cmd:str, prompt: str, conversatio
         else:
             original_request_data = original_request
             
-        process_tracking.track_claude_process(str(process.pid), cmd, original_request_data)
+        process_tracking.track_claude_process(process.pid, cmd, original_request_data)
 
     # No need to write to stdin - the prompt is in the command line
     # Just log that we're ready to process
@@ -885,6 +885,7 @@ async def stream_claude_output(metrics, claude_cmd:str, prompt: str, conversatio
                                 process.kill()
                                 # If successful, untrack this process
                                 process_tracking.untrack_claude_process(process.pid)
+                                process_tracking.untrack_claude_process(process_id)
                             except Exception as kill_error:
                                 logger.error(f"Failed to kill hung process: {kill_error}")
                             
@@ -1071,7 +1072,8 @@ async def stream_claude_output(metrics, claude_cmd:str, prompt: str, conversatio
                     logger.error(f"Error storing streaming process output: {e}")
                 
                 # Now untrack the process
-                process_tracking.untrack_claude_process(str(process.pid))
+                process_tracking.untrack_claude_process(process.pid)
+                process_tracking.untrack_claude_process(process_id)
 
 def update_streaming_process_output(pid, content):
     """Update a streaming process output with the full response content"""

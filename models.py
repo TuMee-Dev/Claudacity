@@ -100,3 +100,38 @@ def cleanup_conversation_temp_dir(conversation_id: str):
                 logger.error(f"Failed to clean up temporary directory {temp_dir}: {e}")
         # Remove from the map regardless of success
         del conversation_temp_dirs[conversation_id]
+
+def format_messages_for_claude(request: ChatRequest) -> str:
+    """Format messages from Ollama request into a prompt for Claude Code CLI."""
+    prompt = ""
+
+    # Add system message if present
+    if request.system:
+        prompt += f"System: {request.system}\n\n"
+
+    # Add all messages in conversation
+    for msg in request.messages:
+        if msg.role == "user":
+            prompt += f"Human: {msg.content}\n\n"
+        elif msg.role == "assistant":
+            prompt += f"Assistant: {msg.content}\n\n"
+        elif msg.role == "system" and not request.system:
+            prompt += f"System: {msg.content}\n\n"
+
+    return prompt
+
+def create_auth_error_response(error_message):
+    """Create a standardized Claude authentication error response"""
+    return {
+        "error": {
+            "message": error_message,
+            "type": "auth_error",
+            "param": None,
+            "code": "claude_auth_required"
+        },
+        "auth_required": True,
+        "user_message": "Authentication required: Please log in using the Claude CLI."
+    }
+
+
+
