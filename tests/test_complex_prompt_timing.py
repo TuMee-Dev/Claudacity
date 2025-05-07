@@ -5,7 +5,7 @@ Script to test the complex prompt response times in both streaming and non-strea
 import asyncio
 import time
 import json
-import aiohttp
+import aiohttp # type: ignore
 import argparse
 from datetime import datetime
 

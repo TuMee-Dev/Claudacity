@@ -2,7 +2,9 @@ import asyncio
 import datetime
 import collections
 import statistics
+import logging
 
+logger = logging.getLogger(__name__)
 
 METRICS_HISTORY_SIZE = 1000  # Number of requests to keep for metrics calculations
 

@@ -28,10 +28,13 @@ try:
     from claude_ollama_server import (
         CLAUDE_STREAM_CHUNK_TIMEOUT,
         CLAUDE_STREAM_MAX_SILENCE,
+    )
+    from process_tracking import (
         track_claude_process,
         untrack_claude_process,
         proxy_launched_processes
     )
+
     
     logger.info(f"Imported constants successfully:")
     logger.info(f"CLAUDE_STREAM_CHUNK_TIMEOUT = {CLAUDE_STREAM_CHUNK_TIMEOUT}")

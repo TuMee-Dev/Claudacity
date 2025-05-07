@@ -5,32 +5,34 @@ This FastAPI application provides an OpenAI-compatible API server that interface
 a locally running Claude Code process. It implements both Ollama API and OpenAI API format.
 """
 
+import argparse
+import asyncio
+import datetime
 import json
 import logging
 import os
 import pprint
-import subprocess
+import psutil # type: ignore
+import shlex
+import shutil
 import sys
+import tempfile
 import time
+import timezone
 import traceback
 import uuid
+import uvicorn # type: ignore
 from contextlib import asynccontextmanager
-import datetime
-import tempfile
-import shutil
 from typing import Dict, List, Optional, Any, Union, Deque
-from pydantic import BaseModel, Field
-import asyncio
-from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
-from fastapi.responses import StreamingResponse, JSONResponse, PlainTextResponse, HTMLResponse, Response
-import process_tracking
+from pydantic import BaseModel, Field # type: ignore
+from fastapi import FastAPI, Request, HTTPException, BackgroundTasks # type: ignore
+from fastapi.responses import StreamingResponse, JSONResponse, PlainTextResponse, HTMLResponse, Response # type: ignore
+from fastapi.middleware.cors import CORSMiddleware # type: ignore
+from starlette.background import BackgroundTask # type: ignore
 from claude_metrics import ClaudeMetrics
-
-# Dashboard will be imported at the end to avoid circular imports
-dashboard = None
-from fastapi.middleware.cors import CORSMiddleware
-import asyncio
-from starlette.background import BackgroundTask
+import dashboard
+import formatters
+import process_tracking
 
 # Configuration
 
@@ -263,50 +265,12 @@ async def log_requests(request: Request, call_next):
 
 def get_iso_timestamp():
     """Generate ISO-8601 timestamp for created_at field."""
-    from datetime import datetime, timezone
     return datetime.now(timezone.utc).isoformat("T", "milliseconds") + "Z"
 
 # Command to interact with Claude Code CLI
 
-# Try to find claude executable
-def find_claude_command():
-    """Find the claude command executable path"""
-    try:
-        # First try the simple case - claude in PATH
-        if subprocess.run(['which', 'claude'], capture_output=True, text=True, check=False).returncode == 0:
-            return "claude"
-        
-        # Next, try common installation locations
-        common_paths = [
-            "/opt/homebrew/bin/claude",
-            "/usr/local/bin/claude",
-            os.path.expanduser("~/.local/bin/claude")
-        ]
-        
-        for path in common_paths:
-            if os.path.exists(path) and os.access(path, os.X_OK):
-                logger.info(f"Found claude at: {path}")
-                return path
-        
-        # Last resort: try to run command discovery via shell
-        try:
-            result = subprocess.run(['bash', '-c', 'which claude'], 
-                                   capture_output=True, text=True, check=False)
-            if result.returncode == 0 and result.stdout.strip():
-                path = result.stdout.strip()
-                logger.info(f"Found claude via shell at: {path}")
-                return path
-        except:
-            pass
-            
-        # If we're here, we couldn't find claude
-        logger.warning("Could not find claude command. Default to 'claude' and hope for the best.")
-        return "claude"
-    except Exception as e:
-        logger.error(f"Error finding claude command: {e}")
-        return "claude"  # Fallback to simple command name
 
-CLAUDE_CMD = find_claude_command()
+CLAUDE_CMD = process_tracking.find_claude_command()
 
 # Conversation management functions
 
@@ -446,7 +410,6 @@ async def run_claude_command(prompt: str, conversation_id: str = None, original_
 
     # Add the -p flag AFTER the conversation flag
     # The prompt needs to be directly after -p, not piped via stdin
-    import shlex
     quoted_prompt = shlex.quote(prompt)
     cmd = f"{base_cmd} -p {quoted_prompt} --output-format json"
 
@@ -482,7 +445,7 @@ async def run_claude_command(prompt: str, conversation_id: str = None, original_
     process = None
     try:
         # No need for stdin=PIPE since we're passing the prompt via command line now
-        logger.info(f"[TOOLS] About to start Claude process with command: {cmd}")
+        logger.debug(f"[TOOLS] About to start Claude process with command: {cmd}")
         try:
             process = await asyncio.create_subprocess_shell(
                 cmd,
@@ -506,7 +469,7 @@ async def run_claude_command(prompt: str, conversation_id: str = None, original_
             else:
                 original_request_data = original_request
                 
-            track_claude_process(str(process.pid), cmd, original_request_data)
+            process_tracking.track_claude_process(str(process.pid), cmd, original_request_data)
         
         # Wait for Claude to process the command (prompt is already in the command line)
         # Add timeout handling for non-streaming mode
@@ -525,7 +488,6 @@ async def run_claude_command(prompt: str, conversation_id: str = None, original_
                 logger.info("process.communicate() completed successfully")
             except Exception as comm_error:
                 logger.error(f"Error in process.communicate(): {comm_error}")
-                import traceback
                 logger.error(f"Traceback: {traceback.format_exc()}")
                 raise
             
@@ -556,7 +518,7 @@ async def run_claude_command(prompt: str, conversation_id: str = None, original_
             if stdout:
                 stdout_text = stdout.decode() if stdout else ""
                 logger.info(f"stdout length: {len(stdout_text)} bytes")
-                logger.info(f"stdout preview: {stdout_text[:100]}...")
+                logger.debug(f"stdout preview: {stdout_text[:100]}...")
             else:
                 logger.warning("No stdout output from Claude process!")
                 
@@ -566,7 +528,6 @@ async def run_claude_command(prompt: str, conversation_id: str = None, original_
             logger.warning(f"Command that may have hung: {cmd}")
             logger.warning(f"Process state: {process}")
             # Try to get process info
-            import psutil
             try:
                 p = psutil.Process(process.pid)
                 logger.warning(f"Process status: {p.status()}")
@@ -580,7 +541,7 @@ async def run_claude_command(prompt: str, conversation_id: str = None, original_
                 logger.warning(f"Attempting to terminate hung Claude process {process.pid}")
                 process.kill()
                 # If successful, untrack this process
-                untrack_claude_process(str(process.pid))
+                process_tracking.untrack_claude_process(str(process.pid))
             except Exception as kill_error:
                 logger.error(f"Failed to kill hung process: {kill_error}")
             
@@ -610,7 +571,7 @@ async def run_claude_command(prompt: str, conversation_id: str = None, original_
                 # Convert to OpenAI format
                 openai_response = None
                 try:
-                    openai_response = format_to_openai_chat_completion(response_obj or stdout_text, model)
+                    openai_response = formatters.format_to_openai_chat_completion(response_obj or stdout_text, model)
                 except Exception as e:
                     logger.error(f"Failed to convert to OpenAI format: {e}")
                 
@@ -619,7 +580,7 @@ async def run_claude_command(prompt: str, conversation_id: str = None, original_
                 if "current_request" in process_tracking.proxy_launched_processes.get(str(process.pid), {}):
                     original_request = process_tracking.proxy_launched_processes[str(process.pid)]["current_request"]
                 
-                store_process_output(
+                process_tracking.store_process_output(
                     str(process.pid),
                     stdout_text,
                     stderr_text,
@@ -634,7 +595,7 @@ async def run_claude_command(prompt: str, conversation_id: str = None, original_
                 logger.error(f"Error storing process output: {e}")
             
             # Now untrack the process
-            untrack_claude_process(str(process.pid))
+            process_tracking.untrack_claude_process(str(process.pid))
         
         if process.returncode != 0:
             stderr_text = stderr.decode() if stderr else ""
@@ -750,7 +711,7 @@ async def run_claude_command(prompt: str, conversation_id: str = None, original_
         
         # Untrack the process if it's still tracked
         if process and process.pid:
-            untrack_claude_process(str(process.pid))
+            process_tracking.untrack_claude_process(str(process.pid))
             
         logger.error(f"Error running Claude command: {str(e)}")
         raise
@@ -790,7 +751,6 @@ async def stream_claude_output(prompt: str, conversation_id: str = None, origina
 
     # Add the -p flag AFTER the conversation flag
     # The prompt needs to be directly after -p, not piped via stdin
-    import shlex
     quoted_prompt = shlex.quote(prompt)
     cmd = f"{base_cmd} -p {quoted_prompt} --output-format stream-json"
 
@@ -813,7 +773,7 @@ async def stream_claude_output(prompt: str, conversation_id: str = None, origina
     }
     logger.info(f"Tracking new Claude process with PID {process_id}")
 
-    logger.info(f"[TOOLS] About to start Claude process with command: {cmd}")
+    logger.debug(f"[TOOLS] About to start Claude process with command: {cmd}")
     try:
         # Set appropriate timeout parameters based on prompt complexity
         # The longer/more complex the prompt, the more time Claude might need
@@ -848,7 +808,7 @@ async def stream_claude_output(prompt: str, conversation_id: str = None, origina
         else:
             original_request_data = original_request
             
-        track_claude_process(str(process.pid), cmd, original_request_data)
+        process_tracking.track_claude_process(str(process.pid), cmd, original_request_data)
 
     # No need to write to stdin - the prompt is in the command line
     # Just log that we're ready to process
@@ -1048,7 +1008,7 @@ async def stream_claude_output(prompt: str, conversation_id: str = None, origina
                                 logger.warning(f"Attempting to terminate hung Claude process {process.pid}")
                                 process.kill()
                                 # If successful, untrack this process
-                                untrack_claude_process(process.pid)
+                                process_tracking.untrack_claude_process(process.pid)
                             except Exception as kill_error:
                                 logger.error(f"Failed to kill hung process: {kill_error}")
                             
@@ -1199,7 +1159,7 @@ async def stream_claude_output(prompt: str, conversation_id: str = None, origina
                     if "current_request" in process_tracking.proxy_launched_processes.get(str(process.pid), {}):
                         original_request = process_tracking.proxy_launched_processes[str(process.pid)]["current_request"]
                     
-                    store_process_output(
+                    process_tracking.store_process_output(
                         str(process.pid),
                         stdout_text,
                         stderr_text,
@@ -1235,7 +1195,7 @@ async def stream_claude_output(prompt: str, conversation_id: str = None, origina
                     logger.error(f"Error storing streaming process output: {e}")
                 
                 # Now untrack the process
-                untrack_claude_process(str(process.pid))
+                process_tracking.untrack_claude_process(str(process.pid))
 
 # Message formatting functions
 
@@ -1273,274 +1233,6 @@ def format_openai_to_claude(request: OpenAIChatRequest) -> str:
 
     return prompt
 
-def format_to_openai_chat_completion(claude_response, model, request_id=None):
-    """
-    Convert Claude CLI response to OpenAI-compatible Chat Completion format.
-    
-    OpenAI Chat Completion format:
-    {
-        "id": "chatcmpl-123",
-        "object": "chat.completion",
-        "created": 1677652288,
-        "model": "gpt-3.5-turbo-0613",
-        "choices": [{
-            "index": 0,
-            "message": {
-                "role": "assistant",
-                "content": "..."
-            },
-            "logprobs": null,
-            "finish_reason": "stop"
-        }],
-        "usage": {
-            "prompt_tokens": 9,
-            "completion_tokens": 12,
-            "total_tokens": 21
-        }
-    }
-    """
-    import time
-    logger.debug(f"Converting Claude response to OpenAI format: {str(claude_response)[:200]}...")
-    
-    # Get current timestamp
-    timestamp = int(time.time())
-    
-    # Extract content - handle differently based on response type
-    content = ""
-    duration_ms = 0
-    prompt_tokens = 0
-    completion_tokens = 0
-    has_tools = False  # Flag to track if tools are detected in the response
-    
-    if isinstance(claude_response, dict):
-        # Extract duration if available
-        duration_ms = claude_response.get("duration_ms", 0)
-        duration_api_ms = claude_response.get("duration_api_ms", duration_ms)
-        
-        # Extract token counts if available
-        if "usage" in claude_response:
-            prompt_tokens = claude_response["usage"].get("prompt_tokens", 0)
-            completion_tokens = claude_response["usage"].get("completion_tokens", 0)
-        
-        # Check if it's our parsed response format
-        if "role" in claude_response and claude_response["role"] == "assistant":
-            # Check if we have parsed JSON
-            if claude_response.get("parsed_json", False):
-                # Use the pre-parsed content
-                parsed_content = claude_response.get("content", {})
-                # For OpenAI, serialize back to JSON string
-                content = json.dumps(parsed_content)
-            else:
-                # Use the raw content
-                content = claude_response.get("content", "")
-        
-        # Check for standard Claude system response with result (most common format)
-        elif "role" in claude_response and claude_response["role"] == "system" and "result" in claude_response:
-            # This is the Claude CLI JSON response format
-            raw_result = claude_response["result"]
-            
-            # Handle the case where result is a string that looks like a Python dict
-            # (which happens with tool_calls and other structured outputs)
-            if isinstance(raw_result, str) and raw_result.startswith("{") and raw_result.endswith("}"):
-                try:
-                    # Handle Python vs JSON quotes
-                    parsed_result = None
-                    if "'" in raw_result and not '"' in raw_result:
-                        # Convert Python single quotes to JSON double quotes
-                        quoted_result = raw_result.replace("'", '"')
-                        try:
-                            parsed_result = json.loads(quoted_result)
-                        except json.JSONDecodeError:
-                            logger.warning(f"Failed to parse quoted result: {quoted_result[:100]}")
-                            parsed_result = {}
-                    else:
-                        # Otherwise try to parse as-is
-                        try:
-                            parsed_result = json.loads(raw_result)
-                        except json.JSONDecodeError:
-                            logger.warning(f"Failed to parse raw result: {raw_result[:100]}")
-                            parsed_result = {}
-
-                    # The critical fix - handle empty responses first (highest priority)
-                    if parsed_result == {} or not parsed_result or (isinstance(parsed_result, dict) and len(parsed_result) == 0):
-                        logger.info("[TOOLS] Empty object detected, formatting as empty tool_calls")
-                        content = json.dumps({"tool_calls": []})
-                        has_tools = False
-                    # Then handle empty tool_calls array specifically
-                    elif isinstance(parsed_result, dict) and "tool_calls" in parsed_result and parsed_result["tool_calls"] == []:
-                        logger.info("[TOOLS] Empty tool_calls array detected")
-                        content = raw_result
-                        has_tools = False
-                    # Handle direct tool_calls format with content
-                    elif isinstance(parsed_result, dict) and "tool_calls" in parsed_result:
-                        logger.info("[TOOLS] Tool calls array found, using as-is")
-                        content = raw_result
-                        has_tools = len(parsed_result["tool_calls"]) > 0
-                        logger.info(f"[TOOLS] Has tools: {has_tools}")
-                    # Handle Claude's native tools format
-                    elif isinstance(parsed_result, dict) and "tools" in parsed_result:
-                        logger.info("[TOOLS] Detected tools array in response, modifying for OpenWebUI compatibility")
-                        logger.info(f"Original tools format: {json.dumps(parsed_result.get('tools', []))}")
-                        # Convert Claude's "tools" format to OpenWebUI's expected "tool_calls" format
-                        tool_calls = []
-                        for tool in parsed_result.get("tools", []):
-                            if "function" in tool and isinstance(tool["function"], dict):
-                                tool_call = {
-                                    "name": tool["function"].get("name", "unknown_tool"),
-                                    "parameters": {}
-                                }
-                                # Parse the arguments if they exist
-                                arguments = tool["function"].get("arguments", "{}")
-                                if isinstance(arguments, str):
-                                    try:
-                                        tool_call["parameters"] = json.loads(arguments)
-                                    except json.JSONDecodeError:
-                                        tool_call["parameters"] = {"raw_arguments": arguments}
-                                elif isinstance(arguments, dict):
-                                    tool_call["parameters"] = arguments
-                                
-                                tool_calls.append(tool_call)
-                        
-                        # Create the OpenWebUI expected format
-                        content = json.dumps({"tool_calls": tool_calls})
-                        logger.info(f"Converted to tool_calls format: {content}")
-                        
-                        # Set a flag to indicate we have tools
-                        has_tools = len(tool_calls) > 0
-                        logger.info(f"[TOOLS] Tools detected: {has_tools}")
-                    else:
-                        # Not tool-related, use as-is
-                        content = parsed_result
-                except json.JSONDecodeError:
-                    # If parsing fails, use the raw string
-                    content = raw_result
-                    logger.warning(f"Failed to parse result as JSON: {raw_result[:100]}... Using raw response.")
-                except Exception as e:
-                    # Catch-all error handler
-                    logger.error(f"Error in tool response handling: {str(e)}")
-                    content = json.dumps({"tool_calls": []})  # Default to empty tool calls on error
-                    has_tools = False
-            else:
-                content = raw_result
-            
-            # If cost_usd is available, log it
-            if "cost_usd" in claude_response:
-                logger.info(f"Claude request cost: ${claude_response['cost_usd']:.6f} USD")
-                
-        # Check for structured content array (sometimes used in Claude responses)
-        elif "content" in claude_response and isinstance(claude_response["content"], list):
-            for item in claude_response["content"]:
-                if item.get("type") == "text" and "text" in item:
-                    content += item["text"]
-            
-        # Fallback to result field
-        elif "result" in claude_response:
-            content = claude_response["result"]
-            
-    else:
-        # Not a dict, use as string
-        content = str(claude_response)
-    
-    # Use provided request_id or get from response or generate a new one
-    message_id = request_id or (claude_response.get("id") if isinstance(claude_response, dict) else None)
-    if not message_id:
-        message_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
-    
-    # If token counts aren't available, estimate them
-    if not prompt_tokens:
-        prompt_tokens = int((duration_ms / 10) if duration_ms else 100) 
-    if not completion_tokens:
-        completion_tokens = int((duration_ms / 20) if duration_ms else 50)
-    
-    # Add more detailed logging for debugging
-    logger.info(f"Final content type: {type(content)}")
-    if isinstance(content, str):
-        logger.info(f"Final content string (first 200 chars): {content[:200]}")
-        if content.startswith('{') and "tool_calls" in content:
-            logger.info("Content appears to be a JSON string containing tool_calls")
-    else:
-        logger.info(f"Final content dict/object: {json.dumps(content)[:200] if hasattr(content, '__dict__') else str(content)[:200]}")
-    
-    # Determine if we have tool calls and process them correctly for OpenAI format
-    finish_reason = "stop"
-    message = {
-        "role": "assistant",
-    }
-    
-    tool_calls_array = []
-    
-    # Check if content contains tool calls
-    if has_tools:
-        finish_reason = "tool_calls"
-        logger.info(f"Processing tool calls for OpenAI format")
-        
-        try:
-            # If content is a string that looks like JSON with tool_calls, parse it
-            if isinstance(content, str) and "tool_calls" in content:
-                tool_data = json.loads(content)
-                if "tool_calls" in tool_data and isinstance(tool_data["tool_calls"], list):
-                    # Extract the tool calls
-                    raw_tool_calls = tool_data["tool_calls"]
-                    
-                    # Format according to OpenAI's function calling spec
-                    for i, tool_call in enumerate(raw_tool_calls):
-                        formatted_tool_call = {
-                            "id": f"call_{uuid.uuid4().hex[:8]}",
-                            "type": "function",
-                            "function": {
-                                "name": tool_call.get("name", "unknown_tool"),
-                                "arguments": json.dumps(tool_call.get("parameters", {}))
-                            }
-                        }
-                        tool_calls_array.append(formatted_tool_call)
-                    
-                    logger.info(f"Formatted {len(tool_calls_array)} tool calls for OpenAI compatibility")
-            
-            # If we have tool calls, set them in the message and set content to null
-            if tool_calls_array:
-                message["content"] = None
-                message["tool_calls"] = tool_calls_array
-                logger.info(f"Set tool_calls in message and set content to null")
-            else:
-                # No tool calls, use the content as normal
-                message["content"] = content if isinstance(content, str) else json.dumps(content)
-                finish_reason = "stop"
-        except Exception as e:
-            # If there's any error in tool call formatting, fall back to content
-            logger.error(f"Error formatting tool calls: {str(e)}")
-            message["content"] = content if isinstance(content, str) else json.dumps(content)
-            finish_reason = "stop"
-    else:
-        # No tool calls detected, use normal content
-        message["content"] = content if isinstance(content, str) else json.dumps(content)
-    
-    logger.info(f"Non-streaming response finish_reason: {finish_reason}")
-    
-    # Format the response in OpenAI chat completion format
-    openai_response = {
-        "id": message_id,
-        "object": "chat.completion",
-        "created": timestamp,
-        "model": model,
-        "choices": [
-            {
-                "index": 0,
-                "message": message,
-                "finish_reason": finish_reason
-            }
-        ],
-        "usage": {
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion_tokens,
-            "total_tokens": prompt_tokens + completion_tokens
-        }
-    }
-    
-    # One more level of logging - exact message content that will be sent to OpenWebUI
-    logger.info(f"Final message.content in OpenAI response: {openai_response['choices'][0]['message']['content'][:200]}")
-    
-    logger.debug(f"Converted to OpenAI format: {str(openai_response)[:200]}...")
-    return openai_response
 
 # Stream response functions for both API formats
 
@@ -1579,9 +1271,6 @@ async def stream_openai_response(claude_prompt: str, model_name: str, conversati
     Handles both OpenAI-compatible and Ollama-compatible formats.
     Uses the request_id from the client if provided.
     """
-    import time
-    import datetime
-    
     # Check if this is an Ollama client request
     is_ollama_client = False
     if original_request:
@@ -2430,7 +2119,7 @@ async def chat(request_body: Request):
             # Format as OpenAI chat completion
             # IMPORTANT: Don't pass conversation_id as the request_id to prevent leakage
             # Only use the request ID for this
-            openai_response = format_to_openai_chat_completion(claude_response, request.model, request.id)
+            openai_response = formatters.format_to_openai_chat_completion(claude_response, request.model, request.id)
             
             # Log the formatted response
             logger.info(f"Formatted OpenAI response for request {request_id}")
@@ -2588,7 +2277,6 @@ async def openai_chat_completions(request_body: Request):
 @app.get("/models")
 async def list_models():
     """List available models (OpenAI-compatible models endpoint)."""
-    import time
     current_time = int(time.time())
 
     # Static list of Claude models in OpenAI format
@@ -2803,7 +2491,6 @@ async def ollama_chat(request: OllamaChatRequest):
             base_cmd = f"{CLAUDE_CMD}"
             if model:
                 base_cmd += f" --model {model}"
-            import shlex
             quoted_prompt = shlex.quote(claude_prompt)
             cmd = f"{base_cmd} -p {quoted_prompt} --output-format json"
             logger.debug(f"Non-streaming command: {cmd}")
@@ -2833,7 +2520,6 @@ async def ollama_chat(request: OllamaChatRequest):
             # Return a graceful error response with detailed info
             logger.error(f"ERROR in non-streaming response: {str(e)}")
             logger.error(f"Error type: {type(e)}")
-            import traceback
             logger.error(f"Traceback: {traceback.format_exc()}")
             
             ollama_model = get_ollama_model_name(model)
@@ -2998,7 +2684,7 @@ async def test_tool_calling(request: Request):
         }
         
         # Our enhanced handler should detect the tools array and replace it with text
-        response = format_to_openai_chat_completion(
+        response = formatters.format_to_openai_chat_completion(
             {"role": "system", "result": json.dumps(tool_response["choices"][0]["message"]["content"])},
             "anthropic/claude-3.7-sonnet"
         )
@@ -3157,164 +2843,7 @@ def run_self_test():
     print("All self-tests passed successfully!")
     return True
 
-def track_claude_process(pid, command, original_request=None):
-    """Track a Claude process launched by this proxy server"""
-    import time
-    
-    # If the pid is a string starting with "claude-process-", this is a temporary ID
-    # In that case, look up the real process to find the corresponding proxy process ID
-    temp_id = None
-    if isinstance(pid, str) and not pid.startswith("claude-process-"):
-        # This is a real system PID
-        numeric_pid = int(pid)
-        
-        # Create a basic process output entry as soon as process starts
-        # This ensures we can see in-progress processes in the dashboard
-        if original_request:
-            prompt = ""
-            if isinstance(original_request, dict) and "messages" in original_request:
-                for msg in original_request.get("messages", []):
-                    if msg.get("role") == "user" and "content" in msg:
-                        prompt += msg["content"] + "\n"
-            
-            store_process_output(
-                pid,
-                "",  # empty stdout since process is still running
-                "",  # empty stderr since process is still running
-                command,
-                prompt.strip(),
-                "Process is still running...",  # placeholder response
-                {"status": "running"},  # placeholder converted response
-                original_request.get("model", DEFAULT_MODEL),
-                original_request
-            )
-        
-        # Look for temporary process IDs that should be linked to this real PID
-        for temp_pid, process_info in process_tracking.proxy_launched_processes.items():
-            if isinstance(temp_pid, str) and temp_pid.startswith("claude-process-"):
-                # Check if this temp_pid was recently created and doesn't already have a real PID
-                if process_info.get("real_pid") is None:
-                    # Link this temporary ID to the real PID
-                    process_tracking.proxy_launched_processes[temp_pid]["real_pid"] = numeric_pid
-                    temp_id = temp_pid
-                    break
-    
-    # Store process information
-    process_tracking.proxy_launched_processes[pid] = {
-        "pid": pid,
-        "command": command,
-        "start_time": time.time(),
-        "status": "running",
-        "current_request": original_request,
-        "temp_id": temp_id  # Store the temp ID if applicable
-    }
-    
-    logger.info(f"Tracking new Claude process with PID {pid}")
 
-def untrack_claude_process(pid):
-    """Remove a Claude process from tracking or mark it as finished if needed"""
-    with process_tracking.process_lock:
-        if pid in process_tracking.proxy_launched_processes:
-            # Get the process info before removing it
-            process_info = process_tracking.proxy_launched_processes.get(pid, {})
-            
-            # Check if we should keep this process for record-keeping
-            if process_info.get("keep_record", False):
-                # Instead of removing, mark as finished
-                process_tracking.proxy_launched_processes[pid]["status"] = "finished"
-                logger.info(f"Marked Claude process with PID {pid} as finished (keeping record)")
-                return
-            
-            # Otherwise remove this process
-            process_tracking.proxy_launched_processes.pop(pid, None)
-            logger.info(f"Untracked Claude process with PID {pid}")
-            
-            # If this is a real PID (numeric), also clean up any temporary IDs linked to it
-            if not isinstance(pid, str) or not pid.startswith("claude-process-"):
-                # This is a real PID - check for any temporary IDs that link to it
-                for temp_pid, info in list(process_tracking.proxy_launched_processes.items()):
-                    if (isinstance(temp_pid, str) and temp_pid.startswith("claude-process-") and 
-                        info.get('real_pid') == pid):
-                        # Check if we should keep this process for record-keeping
-                        if info.get("keep_record", False):
-                            # Instead of removing, mark as finished
-                            process_tracking.proxy_launched_processes[temp_pid]["status"] = "finished" 
-                            logger.info(f"Marked linked temporary process with PID {temp_pid} as finished (keeping record)")
-                        else:
-                            process_tracking.proxy_launched_processes.pop(temp_pid, None)
-                            logger.info(f"Untracked linked temporary process with PID {temp_pid}")
-            
-            # If this is a temporary ID, also handle the real PID it links to
-            if isinstance(pid, str) and pid.startswith("claude-process-"):
-                real_pid = process_info.get('real_pid')
-                if real_pid and real_pid in process_tracking.proxy_launched_processes:
-                    # Check if we should keep this process for record-keeping
-                    if process_tracking.proxy_launched_processes[real_pid].get("keep_record", False):
-                        # Instead of removing, mark as finished
-                        process_tracking.proxy_launched_processes[real_pid]["status"] = "finished"
-                        logger.info(f"Marked linked real process with PID {real_pid} as finished (keeping record)")
-                    else:
-                        process_tracking.proxy_launched_processes.pop(real_pid, None)
-                        logger.info(f"Untracked linked real process with PID {real_pid}")
-
-def store_process_output(pid, stdout, stderr, command, prompt, response, converted_response=None, model=DEFAULT_MODEL, original_request=None):
-    """Store the output from a Claude process"""
-    timestamp = datetime.datetime.now().isoformat()
-    
-    # Check if we're updating an existing output for a streaming process
-    if pid in process_tracking.process_outputs and response != "Streaming response - output sent directly to client":
-        if process_tracking.process_outputs[pid].get("response") == "Streaming response - output sent directly to client":
-            # We're updating a streaming process with the final output
-            logger.info(f"Updating streaming process {pid} with final content")
-            process_tracking.process_outputs[pid]["response"] = response
-            
-            # Also update the converted response if it exists
-            if "converted_response" in process_tracking.process_outputs[pid] and converted_response:
-                process_tracking.process_outputs[pid]["converted_response"] = converted_response
-            elif "converted_response" in process_tracking.process_outputs[pid] and isinstance(response, (dict, str)):
-                try:
-                    # Update the message content in the existing converted response
-                    conv_resp = process_tracking.process_outputs[pid]["converted_response"]
-                    if isinstance(conv_resp, dict) and "choices" in conv_resp:
-                        for choice in conv_resp["choices"]:
-                            if "message" in choice:
-                                choice["message"]["content"] = response
-                    logger.info(f"Updated converted response content for streaming process {pid}")
-                except Exception as e:
-                    logger.error(f"Failed to update converted response: {e}")
-            return
-    
-    # Create a new entry for this process
-    entry = {
-        "pid": pid,
-        "timestamp": timestamp,
-        "command": command,
-        "prompt": prompt,
-        "stdout": stdout,
-        "stderr": stderr,
-        "response": response,
-        "original_request": original_request
-    }
-    
-    # If we have a converted response, add it
-    if converted_response:
-        entry["converted_response"] = converted_response
-    # Otherwise, try to convert it now
-    elif response and isinstance(response, (dict, str)) and response != "Streaming response - output sent directly to client":
-        try:
-            converted = format_to_openai_chat_completion(response, model)
-            entry["converted_response"] = converted
-        except Exception as e:
-            logger.error(f"Failed to convert response for storage: {e}")
-    
-    # Store the entry
-    process_tracking.process_outputs[pid] = entry
-    
-    # Limit the number of stored outputs
-    while len(process_tracking.process_outputs) > process_tracking.MAX_STORED_OUTPUTS:
-        process_tracking.process_outputs.popitem(last=False)  # Remove oldest item (FIFO)
-    
-    logger.info(f"Stored output for process {pid}")
 
 def update_streaming_process_output(pid, content):
     """Update a streaming process output with the full response content"""
@@ -3387,29 +2916,19 @@ def update_streaming_process_output(pid, content):
         logger.info(f"Final streaming content for {pid}: {content_sample}")
 
 
-
-# Dashboard functions and endpoints have been moved to dashboard.py
-
-# Dashboard endpoints have been moved to dashboard.py
-
 # Initialize dashboard if the module is available
 # Import dashboard at the end to avoid circular imports
 try:
-    import dashboard
     # Initialize dashboard with required dependencies
     dashboard.init_dashboard(
         app=app,
-        metrics_module=metrics,
+        claude_metrics=metrics,
     )
     logger.info("Dashboard module initialized")
 except (ImportError, AttributeError) as e:
-    logger.info(f"Dashboard module not found or error initializing: {e}, embedded dashboard will be used")
+    logger.error(f"Dashboard module not found or error initializing: {e}, embedded dashboard will be used", exc_info=True)
 
 if __name__ == "__main__":
-    import uvicorn
-    import sys
-    import argparse
-    
     # Parse command-line arguments
     parser = argparse.ArgumentParser(description="Claude Ollama API Server")
     parser.add_argument("--test", action="store_true", help="Run self-tests and exit")

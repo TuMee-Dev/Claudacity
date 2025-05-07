@@ -14,8 +14,9 @@ from unittest.mock import patch, MagicMock
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 # Import modules after path setup
-from fastapi.testclient import TestClient
+from fastapi.testclient import TestClient # type: ignore
 import claude_ollama_server
+import formatters
 from claude_ollama_server import app
 import process_tracking
 
@@ -34,7 +35,7 @@ class TestClaudeOllamaAPI(unittest.TestCase):
         self.mock_run_claude = self.run_claude_patcher.start()
         
         # Also mock the format_to_openai_chat_completion function to test our OpenWebUI compatibility conversion
-        self.format_openai_patcher = patch('claude_ollama_server.format_to_openai_chat_completion', wraps=claude_ollama_server.format_to_openai_chat_completion)
+        self.format_openai_patcher = patch('formatters.format_to_openai_chat_completion', wraps=formatters.format_to_openai_chat_completion)
         self.mock_format_openai = self.format_openai_patcher.start()
         
         # Configure the mock to return a valid response
@@ -198,7 +199,7 @@ class TestClaudeOllamaAPI(unittest.TestCase):
         }
         
         # Call the function directly to avoid test complexity
-        openai_response = claude_ollama_server.format_to_openai_chat_completion(claude_response, "claude-3.7-sonnet")
+        openai_response = formatters.format_to_openai_chat_completion(claude_response, "claude-3.7-sonnet")
         
         # Check the structure of the response
         self.assertIn("choices", openai_response)
@@ -259,7 +260,7 @@ class TestClaudeOllamaAPI(unittest.TestCase):
         }
         
         # Call the function directly to avoid test complexity
-        openai_response = claude_ollama_server.format_to_openai_chat_completion(claude_response, "claude-3.7-sonnet")
+        openai_response = formatters.format_to_openai_chat_completion(claude_response, "claude-3.7-sonnet")
         
         # Check the structure of the response
         self.assertIn("choices", openai_response)
@@ -341,7 +342,7 @@ class TestClaudeOllamaAPI(unittest.TestCase):
         }
         
         # Call the function directly to avoid test complexity
-        openai_response = claude_ollama_server.format_to_openai_chat_completion(claude_response, "claude-3.7-sonnet")
+        openai_response = formatters.format_to_openai_chat_completion(claude_response, "claude-3.7-sonnet")
         
         # Verify the details of the choice
         choice = openai_response["choices"][0]
@@ -412,7 +413,7 @@ class TestClaudeOllamaAPI(unittest.TestCase):
         self.format_openai_patcher.stop()  # Stop the wrapped mock
         
         # Create a fresh format_to_openai_chat_completion mock
-        fresh_format_patcher = patch('claude_ollama_server.format_to_openai_chat_completion')
+        fresh_format_patcher = patch('formatters.format_to_openai_chat_completion')
         mock_format = fresh_format_patcher.start()
         
         # Configure it to return a direct response with tool_calls finish_reason
@@ -496,8 +497,8 @@ class TestClaudeOllamaAPI(unittest.TestCase):
             # Clean up and restore the original mocks
             fresh_format_patcher.stop()
             # Restore the wrapped mock
-            self.format_openai_patcher = patch('claude_ollama_server.format_to_openai_chat_completion', 
-                                              wraps=claude_ollama_server.format_to_openai_chat_completion)
+            self.format_openai_patcher = patch('formatters.format_to_openai_chat_completion', 
+                                              wraps=formatters.format_to_openai_chat_completion)
             self.mock_format_openai = self.format_openai_patcher.start()
         
     def test_streaming_with_tools(self):

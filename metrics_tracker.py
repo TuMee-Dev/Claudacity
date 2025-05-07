@@ -10,22 +10,7 @@ import statistics
 import datetime
 import asyncio
 from typing import Dict, Optional, Any, Set, Deque, List
-
-# Import the actual metrics implementation
-# Try to import the real metrics, but provide fallbacks for tests
-try:
-    from claude_ollama_server import ClaudeMetrics, metrics as claude_metrics, generate_dashboard_html
-except (ImportError, AttributeError):
-    # For testing, create a dummy metrics instance
-    from claude_ollama_server import ClaudeMetrics
-    claude_metrics = ClaudeMetrics()
-    # For testing, create a dummy dashboard function
-    def generate_dashboard_html():
-        return """<!DOCTYPE html>
-        <html>
-        <head><title>Claude Proxy Dashboard</title></head>
-        <body><h1>Test Dashboard</h1></body>
-        </html>"""
+from claude_metrics import ClaudeMetrics
 
 class MetricsTracker:
     """
@@ -35,7 +20,7 @@ class MetricsTracker:
     This ensures backwards compatibility with existing tests.
     """
     
-    def __init__(self):
+    def __init__(self, metrics: Optional[ClaudeMetrics] = None):
         """
         Initialize a new MetricsTracker instance.
         
@@ -44,7 +29,7 @@ class MetricsTracker:
         """
         # Use the global metrics instance from claude_ollama_server
         # Most methods will delegate to this instance
-        self._metrics = claude_metrics
+        self._metrics = metrics
         
         # Initialize properties directly for testing
         self.total_invocations = getattr(self._metrics, 'total_invocations', 0)

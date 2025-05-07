@@ -6,35 +6,30 @@ including HTML generation, metrics visualization, and process management.
 """
 
 import time
-import psutil
+import json
 import logging
 import process_tracking
+import psutil # type: ignore
 import threading
 import metrics_tracker
 import process_tracking
+from fastapi import HTTPException # type: ignore
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse # type: ignore
+from claude_metrics import ClaudeMetrics
+
+logger = logging.getLogger(__name__)
 
 
 # Create a lock for process access
 dashboard_lock = threading.Lock()
 
 # Use the metrics module properly
-metrics = metrics_tracker.MetricsTracker()
-import json
-from fastapi import HTTPException
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
-
-logger = logging.getLogger(__name__)
-
-# These will be imported from the main module
 metrics = None
 
-def init_dashboard(app, metrics_module):
-    """Initialize the dashboard with required dependencies"""
+def init_dashboard(app, claude_metrics: ClaudeMetrics):
     global metrics
-    
-    # Set the dependencies
-    metrics = metrics_module
-    
+    """Initialize the dashboard with required dependencies"""
+    metrics = metrics_tracker.MetricsTracker(claude_metrics)
     # Register routes
     app.get("/")(root)
     app.get("/status")(status)
@@ -655,9 +650,6 @@ async def get_single_process_output(pid: str):
                 
                 if pid_int:
                     try:
-                        # Import here for better error isolation
-                        import psutil
-                        
                         # Final verification with psutil
                         if psutil.pid_exists(pid_int):
                             try:

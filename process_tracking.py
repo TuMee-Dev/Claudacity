@@ -1,11 +1,13 @@
 import collections
-import psutil
+import datetime
+import psutil # type: ignore
 import re
+import os
 import subprocess
 import time
 import threading
 import logging
-
+import formatters
 
 logger = logging.getLogger(__name__)
 
@@ -19,7 +21,207 @@ process_lock = threading.Lock()  # Must use threading.Lock() not asyncio.Lock() 
 
 # Initialize streaming buffer if needed
 streaming_content_buffer = {}
+
+# Try to find claude executable
+def find_claude_command():
+    """Find the claude command executable path"""
+    try:
+        # First try the simple case - claude in PATH
+        if subprocess.run(['which', 'claude'], capture_output=True, text=True, check=False).returncode == 0:
+            return "claude"
+        
+        # Next, try common installation locations
+        common_paths = [
+            "/opt/homebrew/bin/claude",
+            "/usr/local/bin/claude",
+            os.path.expanduser("~/.local/bin/claude")
+        ]
+        
+        for path in common_paths:
+            if os.path.exists(path) and os.access(path, os.X_OK):
+                logger.info(f"Found claude at: {path}")
+                return path
+        
+        # Last resort: try to run command discovery via shell
+        try:
+            result = subprocess.run(['bash', '-c', 'which claude'], 
+                                   capture_output=True, text=True, check=False)
+            if result.returncode == 0 and result.stdout.strip():
+                path = result.stdout.strip()
+                logger.info(f"Found claude via shell at: {path}")
+                return path
+        except:
+            pass
+            
+        # If we're here, we couldn't find claude
+        logger.warning("Could not find claude command. Default to 'claude' and hope for the best.")
+        return "claude"
+    except Exception as e:
+        logger.error(f"Error finding claude command: {e}")
+        return "claude"  # Fallback to simple command name
+
+def track_claude_process(pid, command, original_request=None):
+    """Track a Claude process launched by this proxy server"""
+    import time
     
+    # If the pid is a string starting with "claude-process-", this is a temporary ID
+    # In that case, look up the real process to find the corresponding proxy process ID
+    temp_id = None
+    if isinstance(pid, str) and not pid.startswith("claude-process-"):
+        # This is a real system PID
+        numeric_pid = int(pid)
+        
+        # Create a basic process output entry as soon as process starts
+        # This ensures we can see in-progress processes in the dashboard
+        if original_request:
+            prompt = ""
+            if isinstance(original_request, dict) and "messages" in original_request:
+                for msg in original_request.get("messages", []):
+                    if msg.get("role") == "user" and "content" in msg:
+                        prompt += msg["content"] + "\n"
+            
+            store_process_output(
+                pid,
+                "",  # empty stdout since process is still running
+                "",  # empty stderr since process is still running
+                command,
+                prompt.strip(),
+                "Process is still running...",  # placeholder response
+                {"status": "running"},  # placeholder converted response
+                original_request.get("model", "<DEFAULT_MODEL>"),  # default model if not specified
+                original_request
+            )
+        
+        # Look for temporary process IDs that should be linked to this real PID
+        for temp_pid, process_info in proxy_launched_processes.items():
+            if isinstance(temp_pid, str) and temp_pid.startswith("claude-process-"):
+                # Check if this temp_pid was recently created and doesn't already have a real PID
+                if process_info.get("real_pid") is None:
+                    # Link this temporary ID to the real PID
+                    proxy_launched_processes[temp_pid]["real_pid"] = numeric_pid
+                    temp_id = temp_pid
+                    break
+    
+    # Store process information
+    proxy_launched_processes[pid] = {
+        "pid": pid,
+        "command": command,
+        "start_time": time.time(),
+        "status": "running",
+        "current_request": original_request,
+        "temp_id": temp_id  # Store the temp ID if applicable
+    }
+    
+    logger.info(f"Tracking new Claude process with PID {pid}")
+
+
+
+def untrack_claude_process(pid):
+    """Remove a Claude process from tracking or mark it as finished if needed"""
+    with process_lock:
+        if pid in proxy_launched_processes:
+            # Get the process info before removing it
+            process_info = proxy_launched_processes.get(pid, {})
+            
+            # Check if we should keep this process for record-keeping
+            if process_info.get("keep_record", False):
+                # Instead of removing, mark as finished
+                proxy_launched_processes[pid]["status"] = "finished"
+                logger.info(f"Marked Claude process with PID {pid} as finished (keeping record)")
+                return
+            
+            # Otherwise remove this process
+            proxy_launched_processes.pop(pid, None)
+            logger.info(f"Untracked Claude process with PID {pid}")
+            
+            # If this is a real PID (numeric), also clean up any temporary IDs linked to it
+            if not isinstance(pid, str) or not pid.startswith("claude-process-"):
+                # This is a real PID - check for any temporary IDs that link to it
+                for temp_pid, info in list(proxy_launched_processes.items()):
+                    if (isinstance(temp_pid, str) and temp_pid.startswith("claude-process-") and 
+                        info.get('real_pid') == pid):
+                        # Check if we should keep this process for record-keeping
+                        if info.get("keep_record", False):
+                            # Instead of removing, mark as finished
+                            proxy_launched_processes[temp_pid]["status"] = "finished" 
+                            logger.info(f"Marked linked temporary process with PID {temp_pid} as finished (keeping record)")
+                        else:
+                            proxy_launched_processes.pop(temp_pid, None)
+                            logger.info(f"Untracked linked temporary process with PID {temp_pid}")
+            
+            # If this is a temporary ID, also handle the real PID it links to
+            if isinstance(pid, str) and pid.startswith("claude-process-"):
+                real_pid = process_info.get('real_pid')
+                if real_pid and real_pid in proxy_launched_processes:
+                    # Check if we should keep this process for record-keeping
+                    if proxy_launched_processes[real_pid].get("keep_record", False):
+                        # Instead of removing, mark as finished
+                        proxy_launched_processes[real_pid]["status"] = "finished"
+                        logger.info(f"Marked linked real process with PID {real_pid} as finished (keeping record)")
+                    else:
+                        proxy_launched_processes.pop(real_pid, None)
+                        logger.info(f"Untracked linked real process with PID {real_pid}")
+
+def store_process_output(pid, stdout, stderr, command, prompt, response, converted_response=None, model="<DEFAULT_MODEL>", original_request=None):
+    """Store the output from a Claude process"""
+    timestamp = datetime.datetime.now().isoformat()
+    
+    # Check if we're updating an existing output for a streaming process
+    if pid in process_outputs and response != "Streaming response - output sent directly to client":
+        if process_outputs[pid].get("response") == "Streaming response - output sent directly to client":
+            # We're updating a streaming process with the final output
+            logger.info(f"Updating streaming process {pid} with final content")
+            process_outputs[pid]["response"] = response
+            
+            # Also update the converted response if it exists
+            if "converted_response" in process_outputs[pid] and converted_response:
+                process_outputs[pid]["converted_response"] = converted_response
+            elif "converted_response" in process_outputs[pid] and isinstance(response, (dict, str)):
+                try:
+                    # Update the message content in the existing converted response
+                    conv_resp = process_outputs[pid]["converted_response"]
+                    if isinstance(conv_resp, dict) and "choices" in conv_resp:
+                        for choice in conv_resp["choices"]:
+                            if "message" in choice:
+                                choice["message"]["content"] = response
+                    logger.info(f"Updated converted response content for streaming process {pid}")
+                except Exception as e:
+                    logger.error(f"Failed to update converted response: {e}")
+            return
+    
+    # Create a new entry for this process
+    entry = {
+        "pid": pid,
+        "timestamp": timestamp,
+        "command": command,
+        "prompt": prompt,
+        "stdout": stdout,
+        "stderr": stderr,
+        "response": response,
+        "original_request": original_request
+    }
+    
+    # If we have a converted response, add it
+    if converted_response:
+        entry["converted_response"] = converted_response
+    # Otherwise, try to convert it now
+    elif response and isinstance(response, (dict, str)) and response != "Streaming response - output sent directly to client":
+        try:
+            converted = formatters.format_to_openai_chat_completion(response, model)
+            entry["converted_response"] = converted
+        except Exception as e:
+            logger.error(f"Failed to convert response for storage: {e}")
+    
+    # Store the entry
+    process_outputs[pid] = entry
+    
+    # Limit the number of stored outputs
+    while len(process_outputs) > MAX_STORED_OUTPUTS:
+        process_outputs.popitem(last=False)  # Remove oldest item (FIFO)
+    
+    logger.info(f"Stored output for process {pid}")
+
+
 def get_process_output(pid):
     """Get the stored output for a process"""
     return process_outputs.get(pid, None)
@@ -159,7 +361,7 @@ def get_running_claude_processes():
         for pid in pids_to_remove:
             # First mark as finished before untracking
             try:
-                process_tracking.proxy_launched_processes[pid]['status'] = 'finished'
+                proxy_launched_processes[pid]['status'] = 'finished'
                 logger.info(f"Marked process {pid} as finished before cleanup")
             except:
                 pass
