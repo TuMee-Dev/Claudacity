@@ -2,16 +2,15 @@
 Test implementation of an Ollama-compatible chat API endpoint.
 This is a standalone test script to show how the chat endpoint would work.
 """
-
-import asyncio
+import aiohttp # type: ignore
 import json
 import datetime
 import time
-import uvicorn
+import uvicorn # type: ignore
 from typing import Dict, List, Optional, Any, Union
-from fastapi import FastAPI, Request
-from fastapi.responses import StreamingResponse, JSONResponse
-from pydantic import BaseModel
+from fastapi import FastAPI, Request # type: ignore
+from fastapi.responses import StreamingResponse, JSONResponse # type: ignore
+from pydantic import BaseModel # type: ignore
 
 app = FastAPI()
 
@@ -54,8 +53,6 @@ async def proxy_to_claude_service(messages: List[dict], stream: bool = False):
     Proxy the request to the actual running Claude service.
     This allows us to use the real service instead of fake responses.
     """
-    import aiohttp
-    
     # The actual Claude service running on the default port
     CLAUDE_SERVICE_URL = "http://localhost:22434/v1/chat/completions"
     

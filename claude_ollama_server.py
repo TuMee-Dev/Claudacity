@@ -14,7 +14,6 @@ import logging
 import os
 import psutil # type: ignore
 import shlex
-import shutil
 import sys
 import tempfile
 import time
@@ -33,39 +32,10 @@ import formatters
 import process_tracking
 import streaming
 import models
-
 # Configuration
-
-# Debug mode - set to False in production
-DEBUG = False
-
-# Version information
-API_VERSION = "0.1.0"
-BUILD_NAME = "claudacity-server"
-GIT_SHA = ""  # Could be populated dynamically if needed
-BUILD_DATE = ""  # Could be populated dynamically if needed
-
-DEFAULT_MAX_TOKENS = 1000000  # 1m context length
-CONVERSATION_CACHE_TTL = 3600 * 3  # 3 hours in seconds
-
-# Define available models (currently just one, but in a list for future expansion)
-AVAILABLE_MODELS = [
-    {
-        "name": "claude-3.7-sonnet",  # Model tag
-        "modified_at": "2025-05-05T19:53:25.564072",  # Use actual timestamp if needed
-        "size": 0,  # Set to 0 if not applicable
-        "digest": "anthropic_claude_3_7_sonnet_20250505",  # Unique identifier for the model
-        "details": {
-            "model": "claude-3.7-sonnet",  # Repeats the tag
-            "parent_model": "",  # Match Ollama format
-            "format": "api",  # Using "api" instead of "gguf" since this is an API model
-            "family": "anthropic",
-            "families": ["anthropic", "claude"],  # Array of family names
-            "parameter_size": "13B",
-            "quantization_level": "none"
-        }
-    }
-]
+import config
+from config import AVAILABLE_MODELS, DEFAULT_MAX_TOKENS, CONVERSATION_CACHE_TTL
+from models import ChatRequest
 
 # Ensure logs directory exists
 os.makedirs("logs", exist_ok=True)
@@ -77,7 +47,7 @@ file_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelnam
 
 # Configure root logger
 logging.basicConfig(
-    level=logging.DEBUG if DEBUG else logging.INFO,  # Use DEBUG flag to control log verbosity
+    level=logging.DEBUG if config.DEBUG else logging.INFO,  # Use config.DEBUG flag to control log verbosity
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S'
 )
@@ -119,7 +89,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Claude Ollama API",
     description="OpenAI-compatible API server for Claude Code",
-    version=API_VERSION,
+    version=config.API_VERSION,
     lifespan=lifespan
 )
 
@@ -290,42 +260,6 @@ def set_conversation_id(request_id: str, conversation_id: str):
     conversation_cache[request_id] = (current_time, conversation_id)
     logger.info(f"Stored conversation ID {conversation_id} for request {request_id}")
 
-# Pydantic models for request/response validation
-
-class ChatMessage(BaseModel):
-    role: str
-    content: str
-
-class ChatRequest(BaseModel):
-    model: str = models.DEFAULT_MODEL
-    messages: List[ChatMessage]
-    stream: bool = True
-    options: Optional[Dict[str, Any]] = None
-    system: Optional[str] = None
-    format: Optional[str] = None
-    template: Optional[str] = None
-    keep_alive: Optional[str] = None
-    id: Optional[str] = None  # Request ID
-    conversation_id: Optional[str] = None  # Explicit conversation ID
-    tools: Optional[List[Dict[str, Any]]] = None  # Add tools field for function/tool calling
-
-# OpenAI-compatible models for request validation
-
-class OpenAIChatMessage(BaseModel):
-    role: str
-    content: str
-
-class OpenAIChatRequest(BaseModel):
-    model: str = models.DEFAULT_MODEL
-    messages: List[OpenAIChatMessage]
-    stream: bool = False
-    max_tokens: Optional[int] = None
-    temperature: Optional[float] = None
-    top_p: Optional[float] = None
-    id: Optional[str] = None  # Request ID
-    user: Optional[str] = None  # OpenAI field
-    conversation_id: Optional[str] = None  # Explicit conversation ID
-    ollama_client: Optional[bool] = False  # Flag for Ollama client
 
 # Utility functions for working with Claude Code CLI
 
@@ -824,10 +758,10 @@ async def chat(request_body: Request):
         
         # Configure response format based on client type
         if is_ollama_client:
-            logger.info("Using NDJSON format for Ollama streaming compatibility")
+            logger.debug("Using NDJSON format for Ollama streaming compatibility")
             media_type = "application/x-ndjson"
         else:
-            logger.info("Using SSE format for OpenAI streaming compatibility")
+            logger.debug("Using SSE format for OpenAI streaming compatibility")
             media_type = "text/event-stream"
             
         # Define headers for streaming response
@@ -1155,8 +1089,8 @@ async def options_chat():
 async def get_version():
     """Get API version info (OpenAI-compatible version endpoint)."""
     return {
-        "version": API_VERSION,
-        "build": BUILD_NAME
+        "version": config.API_VERSION,
+        "build": config.BUILD_NAME
     }
 
 @app.get("/api/version")
@@ -1164,7 +1098,7 @@ async def get_api_version():
     """Get API version info (Ollama-compatible API version endpoint)."""
     # Return simplified format to match Ollama's format exactly
     return {
-        "version": API_VERSION
+        "version": config.API_VERSION
     }
 
 @app.get("/api/tags")
@@ -1172,7 +1106,7 @@ async def get_tags():
     """Get list of available models (Ollama-compatible tags endpoint)."""
     models = []
     # Add all available models to the response
-    for model in AVAILABLE_MODELS:
+    for model in config.AVAILABLE_MODELS:
         # Use helper function to format model name with appropriate tag
         model_name = model['name']
         ollama_model_name = models.get_ollama_model_name(model_name)
@@ -1267,7 +1201,7 @@ async def ollama_chat(request: OllamaChatRequest):
     
     # If streaming, return the streaming response
     if request.stream:
-        logger.info(f"Using NDJSON format for Ollama streaming")
+        logger.debug(f"Using NDJSON format for Ollama streaming")
         
         # Create an Ollama-specific streaming function
         async def stream_ollama_response():
@@ -1407,7 +1341,7 @@ async def ollama_generate(request: OllamaGenerateRequest):
     
     # If streaming, return the streaming response
     if request.stream:
-        logger.info(f"Using NDJSON format for Ollama streaming")
+        logger.debug(f"Using NDJSON format for Ollama streaming")
         
         # Create an Ollama-specific streaming function
         async def stream_ollama_response():
@@ -1461,7 +1395,7 @@ async def ollama_generate(request: OllamaGenerateRequest):
 async def test_tool_calling(request: Request):
     """Test endpoint for OpenWebUI compatibility, especially for tool/function calling."""
     # Only accessible in debug mode
-    if not DEBUG:
+    if not config.DEBUG:
         raise HTTPException(status_code=404, detail="Endpoint not available in production mode")
     body = await request.json()
     response_type = body.get("response_type", "tool")  # tool, text, or error
@@ -1552,7 +1486,7 @@ async def test_tool_calling(request: Request):
 async def test_client_info(request: Request):
     """Special endpoint for diagnosing client compatibility issues."""
     # Only accessible in debug mode
-    if not DEBUG:
+    if not config.DEBUG:
         raise HTTPException(status_code=404, detail="Endpoint not available in production mode")
     body = await request.json()
     test_message = body.get("message", "This is a test response for OpenWebUI")

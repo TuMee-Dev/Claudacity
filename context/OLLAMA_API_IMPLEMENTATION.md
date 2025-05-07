@@ -5,11 +5,13 @@ This file contains the implementation of the `/api/chat` endpoint for Ollama API
 ## Overview
 
 Based on our analysis of the codebase, we already have:
+
 1. An OpenAI-compatible `/v1/chat/completions` endpoint
 2. Functions for handling both streaming and non-streaming responses
 3. Existing model definitions in the `AVAILABLE_MODELS` array
 
 Our implementation will:
+
 1. Reuse existing chat functionality but format responses according to Ollama's API
 2. Support both streaming and non-streaming modes
 3. Use our existing Claude service backend
@@ -190,13 +192,13 @@ async def ollama_chat(request: OllamaChatRequest):
     # Find the model or use default
     model_name = request.model
     model_exists = False
-    for model in AVAILABLE_MODELS:
+    for model in config.AVAILABLE_MODELS:
         if model["name"] == model_name:
             model_exists = True
             break
     
     if not model_exists:
-        model_name = AVAILABLE_MODELS[0]["name"] if AVAILABLE_MODELS else "claude-3.7-sonnet"
+        model_name = config.AVAILABLE_MODELS[0]["name"] if config.AVAILABLE_MODELS else "claude-3.7-sonnet"
         logger.info(f"Model {request.model} not found, using {model_name} instead")
     
     # Extract options
@@ -280,6 +282,7 @@ async def ollama_chat(request: OllamaChatRequest):
 ## Usage
 
 Once implemented, this endpoint will:
+
 1. Accept POST requests to `/api/chat`
 2. Process them using the Claude CLI
 3. Format responses in Ollama's format

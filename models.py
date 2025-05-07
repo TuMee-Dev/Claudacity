@@ -2,8 +2,10 @@ import logging
 import os
 import shutil
 import tempfile
+import time
 import uuid
-
+from pydantic import BaseModel # type: ignore
+from typing import List, Optional, Dict, Any
 
 logger = logging.getLogger(__name__)
 
@@ -15,6 +17,44 @@ CONV_TEMP_ROOT = os.path.join(tempfile.gettempdir(), "claude_conversations")
 os.makedirs(CONV_TEMP_ROOT, exist_ok=True)
 
 DEFAULT_MODEL = "anthropic/claude-3.7-sonnet"  # Default Claude model to report (must match /models endpoint)
+
+# Pydantic models for request/response validation
+
+class ChatMessage(BaseModel):
+    role: str
+    content: str
+
+class ChatRequest(BaseModel):
+    model: str = DEFAULT_MODEL
+    messages: List[ChatMessage]
+    stream: bool = True
+    options: Optional[Dict[str, Any]] = None
+    system: Optional[str] = None
+    format: Optional[str] = None
+    template: Optional[str] = None
+    keep_alive: Optional[str] = None
+    id: Optional[str] = None  # Request ID
+    conversation_id: Optional[str] = None  # Explicit conversation ID
+    tools: Optional[List[Dict[str, Any]]] = None  # Add tools field for function/tool calling
+
+# OpenAI-compatible models for request validation
+
+class OpenAIChatMessage_old(BaseModel):
+    role: str
+    content: str
+
+class OpenAIChatRequest_old(BaseModel):
+    model: str = DEFAULT_MODEL
+    messages: List[OpenAIChatMessage_old]
+    stream: bool = False
+    max_tokens: Optional[int] = None
+    temperature: Optional[float] = None
+    top_p: Optional[float] = None
+    id: Optional[str] = None  # Request ID
+    user: Optional[str] = None  # OpenAI field
+    conversation_id: Optional[str] = None  # Explicit conversation ID
+    ollama_client: Optional[bool] = False  # Flag for Ollama client
+
 
 # Helper function to handle Ollama model name convention
 def get_ollama_model_name(model_name: str) -> str:

@@ -15,7 +15,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 
 # Import modules after path setup
 from fastapi.testclient import TestClient # type: ignore
-import claude_ollama_server
+import config
 import formatters
 from claude_ollama_server import app
 import process_tracking
@@ -655,7 +655,7 @@ class TestClaudeOllamaAPI(unittest.TestCase):
         
         # Verify the response format matches Ollama's format
         self.assertIn("version", data)
-        self.assertEqual(data["version"], claude_ollama_server.API_VERSION)
+        self.assertEqual(data["version"], config.API_VERSION)
     
     def test_ollama_api_tags(self):
         """Test the Ollama-compatible /api/tags endpoint."""

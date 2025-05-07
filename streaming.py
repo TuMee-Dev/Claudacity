@@ -623,7 +623,7 @@ async def stream_claude_output(metrics, claude_cmd:str, prompt: str, conversatio
             # Set the current working directory for this conversation
             os.environ["CLAUDE_CWD"] = temp_dir
     else:
-        logger.info(f"[TOOLS] No conversation ID provided for streaming")
+        logger.info(f"[TOOLS] No conversation ID provided for streaming (session state not maintained by Claude)") 
 
     # Add the -p flag AFTER the conversation flag
     # The prompt needs to be directly after -p, not piped via stdin
