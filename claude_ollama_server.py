@@ -37,6 +37,9 @@ from starlette.background import BackgroundTask
 
 # Configuration
 
+# Debug mode - set to False in production
+DEBUG = False
+
 # Process and streaming response timeouts
 CLAUDE_STREAM_CHUNK_TIMEOUT = 18.0  # Seconds without output before checking process status (was 10, originally 5)
 CLAUDE_STREAM_MAX_SILENCE = 180.0  # Maximum seconds to wait with no output before assuming process hung (was 60, originally 15)
@@ -83,7 +86,7 @@ file_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelnam
 
 # Configure root logger
 logging.basicConfig(
-    level=logging.INFO,  # Set to DEBUG to get more detailed logs
+    level=logging.DEBUG if DEBUG else logging.INFO,  # Use DEBUG flag to control log verbosity
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S'
 )
@@ -543,7 +546,7 @@ async def log_requests(request: Request, call_next):
     is_chat_completion = path in ["/chat/completions", "/v1/chat/completions"]
     
     # Log request details
-    logger.info(f"Request {request_id}: {method} {url}")
+    logger.debug(f"Request {request_id}: {method} {url}")
     
     # Enhanced logging for chat completions
     if is_chat_completion:
@@ -553,7 +556,7 @@ async def log_requests(request: Request, call_next):
             user_agent = headers.get("user-agent", "Unknown")
             origin = headers.get("origin", "Unknown")
             
-            logger.info(f"Chat completion request from: UA={user_agent}, Origin={origin}")
+            logger.debug(f"Chat completion request from: UA={user_agent}, Origin={origin}")
             
             # Try to read the request body (without consuming it)
             body = await request.body()
@@ -570,7 +573,7 @@ async def log_requests(request: Request, call_next):
                     data = json.loads(content)
                     model = data.get("model", "not-specified")
                     stream = data.get("stream", False)
-                    logger.info(f"Chat completion details: model={model}, stream={stream}")
+                    logger.debug(f"Chat completion details: model={model}, stream={stream}")
                 except:
                     pass
             except:
@@ -586,14 +589,14 @@ async def log_requests(request: Request, call_next):
         duration_ms = (time.time() - start_time) * 1000
         
         # Log response code
-        logger.info(f"Response {request_id}: {response.status_code} ({int(duration_ms)}ms)")
+        logger.debug(f"Response {request_id}: {response.status_code} ({int(duration_ms)}ms)")
         
         # Enhanced logging for chat completions
         if is_chat_completion:
             # Log headers for debugging
             headers = dict(response.headers.items())
             content_type = headers.get("content-type", "Unknown")
-            logger.info(f"Chat completion response: Content-Type={content_type}")
+            logger.debug(f"Chat completion response: Content-Type={content_type}")
         
         return response
         
@@ -761,22 +764,22 @@ def cleanup_conversation_temp_dir(conversation_id: str):
 async def run_claude_command(prompt: str, conversation_id: str = None, original_request=None, timeout: float = CLAUDE_STREAM_MAX_SILENCE) -> str:
     """Run a Claude Code command and return the output."""
     # Log the request details for debugging
-    logger.info(f"run_claude_command called with:")
-    logger.info(f"  - prompt length: {len(prompt)}")
-    logger.info(f"  - conversation_id: {conversation_id}")
-    logger.info(f"  - timeout: {timeout}s")
+    logger.debug(f"run_claude_command called with:")
+    logger.debug(f"  - prompt length: {len(prompt)}")
+    logger.debug(f"  - conversation_id: {conversation_id}")
+    logger.debug(f"  - timeout: {timeout}s")
     
     # Start building the base command
     base_cmd = f"{CLAUDE_CMD}"
 
     # Log if tools are present for debugging purposes only
     if original_request and isinstance(original_request, dict) and original_request.get('tools'):
-        logger.info(f"[TOOLS] Detected tools in original_request for conversation: {conversation_id}")
-        logger.info(f"[TOOLS] Tools are detected but will NOT be passed to Claude directly")
+        logger.debug(f"[TOOLS] Detected tools in original_request for conversation: {conversation_id}")
+        logger.debug(f"[TOOLS] Tools are detected but will NOT be passed to Claude directly")
     
     # Always use conversation ID if provided (regardless of tools or message count)
     if conversation_id:
-        logger.info(f"[TOOLS] Using conversation ID: {conversation_id}")
+        logger.debug(f"[TOOLS] Using conversation ID: {conversation_id}")
         base_cmd += f" -c {conversation_id}"
         
         # Check if we're in test mode (only create temp dirs in production)
@@ -790,7 +793,7 @@ async def run_claude_command(prompt: str, conversation_id: str = None, original_
             # We'll use environment variable to pass it to the Claude CLI
             os.environ["CLAUDE_CWD"] = temp_dir
     else:
-        logger.info(f"[TOOLS] No conversation ID provided")
+        logger.debug(f"[TOOLS] No conversation ID provided")
 
     # Add the -p flag AFTER the conversation flag
     # The prompt needs to be directly after -p, not piped via stdin
@@ -798,7 +801,7 @@ async def run_claude_command(prompt: str, conversation_id: str = None, original_
     quoted_prompt = shlex.quote(prompt)
     cmd = f"{base_cmd} -p {quoted_prompt} --output-format json"
 
-    logger.info(f"Running command: {cmd}")
+    logger.debug(f"Running command: {cmd}")
     
     # Generate a unique process ID for tracking
     process_id = f"claude-process-{uuid.uuid4().hex[:8]}"
@@ -2965,8 +2968,8 @@ async def openai_list_models():
 # Add explicit OPTIONS handlers for critical endpoints to ensure CORS is working
 @app.options("/chat/completions")
 @app.options("/v1/chat/completions")
-@app.options("/openwebui_test")
-@app.options("/test_openwebui")
+@app.options("/test_client_info")
+@app.options("/test_tool_calling")
 async def options_chat():
     """Handle OPTIONS requests for API endpoints."""
     return JSONResponse(
@@ -3302,13 +3305,16 @@ async def ollama_generate(request: OllamaGenerateRequest):
             headers={"Access-Control-Allow-Origin": "*"}
         )
 
-@app.post("/test_openwebui")
-async def test_openwebui(request: Request):
+@app.post("/test_tool_calling")
+async def test_tool_calling(request: Request):
     """Test endpoint for OpenWebUI compatibility, especially for tool/function calling."""
+    # Only accessible in debug mode
+    if not DEBUG:
+        raise HTTPException(status_code=404, detail="Endpoint not available in production mode")
     body = await request.json()
     response_type = body.get("response_type", "tool")  # tool, text, or error
     
-    logger.info(f"Testing tool response with type: {response_type}")
+    logger.debug(f"Testing tool response with type: {response_type}")
     
     if response_type == "tool":
         # Simulate a tool response
@@ -3390,9 +3396,12 @@ async def test_openwebui(request: Request):
             }
         )
 
-@app.post("/openwebui_test")
-async def openwebui_test(request: Request):
-    """Special endpoint for diagnosing OpenWebUI compatibility issues."""
+@app.post("/test_client_info")
+async def test_client_info(request: Request):
+    """Special endpoint for diagnosing client compatibility issues."""
+    # Only accessible in debug mode
+    if not DEBUG:
+        raise HTTPException(status_code=404, detail="Endpoint not available in production mode")
     body = await request.json()
     test_message = body.get("message", "This is a test response for OpenWebUI")
     
