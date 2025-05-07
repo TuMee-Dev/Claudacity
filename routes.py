@@ -26,7 +26,6 @@ def register_routes(app: FastAPI):
         # Log the raw request
         logger.debug(f"Received chat completion request with content type: {request_body.headers.get('content-type', 'unknown')}")
 
-
         try:
             # Parse the request body based on content type
             if request_body.headers.get("content-type") == "application/json":
@@ -335,11 +334,11 @@ def register_routes(app: FastAPI):
                         process_info["current_request"] = request_dict
                         
                         # Check if we have output already stored
-                        pid_str = str(process_info.get("pid"))
-                        if pid_str in process_tracking.process_outputs:
+                        pid = process_info.get("pid")
+                        if pid in process_tracking.process_outputs:
                             # Update the existing output with the request data
-                            process_tracking.process_outputs[pid_str]["original_request"] = request_dict
-                            logger.info(f"Updated output with request data for process {pid_str}")
+                            process_tracking.process_outputs[pid]["original_request"] = request_dict
+                            logger.info(f"Updated output with request data for process {pid}")
                 
                 # No artificial delay - let FastAPI/Starlette handle the request normally
                 # This avoids potential issues with event loop and response handling

@@ -409,14 +409,14 @@ async def stream_openai_response(metrics, claude_cmd: str, claude_prompt: str, m
                             # Try to update all recent processes in case we missed the right one
                             for pid, info in list(process_tracking.proxy_launched_processes.items()):
                                 if (time.time() - info.get("start_time", 0) < 300):  # 5 minutes
-                                    update_streaming_process_output(str(pid), tool_calls_formatted)
+                                    update_streaming_process_output(pid, tool_calls_formatted)
                     else:
                         # For regular responses, update with the text content
                         with process_tracking.process_lock:
                             # Try to update all recent processes in case we missed the right one
                             for pid, info in list(process_tracking.proxy_launched_processes.items()):
                                 if (time.time() - info.get("start_time", 0) < 300):  # 5 minutes
-                                    update_streaming_process_output(str(pid), full_response)
+                                    update_streaming_process_output(pid, full_response)
                     
                     logger.info(f"Updated streaming processes with content length: {len(full_response)}")
                 except Exception as e:
@@ -533,14 +533,14 @@ async def stream_openai_response(metrics, claude_cmd: str, claude_prompt: str, m
                         # Try to update all recent processes in case we missed the right one
                         for pid, info in list(process_tracking.proxy_launched_processes.items()):
                             if (time.time() - info.get("start_time", 0) < 300):  # 5 minutes
-                                update_streaming_process_output(str(pid), tool_calls_formatted)
+                                update_streaming_process_output(pid, tool_calls_formatted)
                 else:
                     # For regular responses, update with the text content
                     with process_tracking.process_lock:
                         # Try to update all recent processes in case we missed the right one
                         for pid, info in list(process_tracking.proxy_launched_processes.items()):
                             if (time.time() - info.get("start_time", 0) < 300):  # 5 minutes
-                                update_streaming_process_output(str(pid), full_response)
+                                update_streaming_process_output(pid, full_response)
                 
                 logger.info(f"Updated streaming processes with content length: {len(full_response)} (fallback)")
             except Exception as e:

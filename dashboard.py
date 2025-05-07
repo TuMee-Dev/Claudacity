@@ -13,6 +13,7 @@ import psutil # type: ignore
 import threading
 import metrics_tracker
 import process_tracking
+from typing import Union
 from fastapi import HTTPException # type: ignore
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse # type: ignore
 import claude_metrics
@@ -586,7 +587,7 @@ async def list_process_outputs():
     
     return {"outputs": outputs_list}
 
-async def get_single_process_output(pid: str):
+async def get_single_process_output(pid: Union[str, int]):
     """Get the output for a specific process"""
     output = process_tracking.get_process_output(pid)
     if output:
