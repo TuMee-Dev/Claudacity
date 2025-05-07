@@ -1930,6 +1930,11 @@ async def stream_openai_response(claude_prompt: str, model_name: str, conversati
     import time
     import datetime
     
+    # Initialize streaming buffer if needed
+    global streaming_content_buffer
+    if 'streaming_content_buffer' not in globals():
+        streaming_content_buffer = {}
+    
     # Check if this is an Ollama client request
     is_ollama_client = False
     if original_request:
@@ -2095,6 +2100,36 @@ async def stream_openai_response(claude_prompt: str, model_name: str, conversati
                 
                 # Accumulate full response for logging
                 full_response += content
+                
+                # Update the streaming buffer directly - no locking needed
+                try:
+                    # Store in the global buffer using a common key
+                    if request_id:
+                        # Store in both formats - the ID and the claude-process-ID format
+                        streaming_content_buffer[request_id] = full_response
+                        streaming_content_buffer[f"claude-process-{request_id}"] = full_response
+                        
+                        # Also update any process outputs entries that match this request ID
+                        for pid, output in process_outputs.items():
+                            # Update any entries with matching request ID or similar formats
+                            if (pid == request_id or 
+                                pid == f"claude-process-{request_id}" or
+                                output.get("request_id") == request_id):
+                                
+                                # Update multiple fields to ensure we capture it
+                                output["stream_content"] = full_response
+                                output["stream_buffer"] = full_response
+                                output["streaming_content"] = full_response
+                                
+                                # If it was a placeholder, also update the main response field
+                                if output.get("response") == "Streaming response - output sent directly to client":
+                                    output["response"] = full_response
+                                    
+                                logger.debug(f"Updated process outputs for {pid} with streaming content")
+                        
+                        logger.debug(f"Updated streaming buffers for request {request_id} with content length {len(full_response)}")
+                except Exception as e:
+                    logger.error(f"Error updating streaming buffer: {e}")
                 
                 # For the first real content, log it specially
                 if content and is_first_chunk:
@@ -3640,25 +3675,73 @@ def store_process_output(pid, stdout, stderr, command, prompt, response, convert
 
 def update_streaming_process_output(pid, content):
     """Update a streaming process output with the full response content"""
-    global process_outputs
+    global process_outputs, streaming_content_buffer
+    logger.info(f"Updating streaming process output for PID {pid} with content length: {len(content)}")
     
-    if pid in process_outputs:
-        # Update the response content
-        process_outputs[pid]["response"] = content
+    # Create global buffer for streaming content if it doesn't exist
+    if 'streaming_content_buffer' not in globals():
+        global streaming_content_buffer
+        streaming_content_buffer = {}
+    
+    # Always store the streaming content in a global buffer for easy access
+    streaming_content_buffer[pid] = content
         
-        # Update the converted response if it exists
+    # Update in process_outputs
+    if pid in process_outputs:
+        # Set the actual response content directly - overwrite the placeholder
+        process_outputs[pid]["response"] = content
+        # Also store it in special fields for dashboard access
+        process_outputs[pid]["final_output"] = content
+        process_outputs[pid]["stream_buffer"] = content  # Add dedicated field for streaming buffer
+        process_outputs[pid]["stream_data"] = content    # Alternative name in case code looks for this
+        logger.info(f"Updated multiple content fields for process {pid}")
+        
+        # Also update the message content in the converted response
         if "converted_response" in process_outputs[pid]:
             try:
                 conv_resp = process_outputs[pid]["converted_response"]
                 if isinstance(conv_resp, dict) and "choices" in conv_resp:
                     for choice in conv_resp["choices"]:
                         if "message" in choice:
+                            # Replace the placeholder with actual content
                             choice["message"]["content"] = content
-                logger.info(f"Updated converted response content for streaming process {pid}")
-            except Exception as e:
-                logger.error(f"Failed to update converted response for streaming: {e}")
+                            logger.info(f"Updated converted response message content for {pid}")
                 
-        logger.info(f"Updated streaming process {pid} with content: {content[:50]}...")
+                # Also set status to finished if present
+                if isinstance(conv_resp, dict) and "status" in conv_resp:
+                    conv_resp["status"] = "finished"
+                    logger.info(f"Updated status to finished in converted response for {pid}")
+                    
+                # Store updated converted_response back in process_outputs
+                process_outputs[pid]["converted_response"] = conv_resp
+            except Exception as e:
+                logger.error(f"Error updating converted response: {e}")
+        
+        # Also update process status
+        if pid in proxy_launched_processes:
+            # Update the status to finished
+            proxy_launched_processes[pid]["status"] = "finished"
+            logger.info(f"Marked process {pid} as finished")
+            
+            # Store content in multiple places to make it accessible
+            proxy_launched_processes[pid]["content"] = content
+            proxy_launched_processes[pid]["stream_buffer"] = content
+            proxy_launched_processes[pid]["streaming_content"] = content
+            
+            # Add complete_response for the dashboard to display
+            complete_message = {
+                "role": "assistant",
+                "content": content
+            }
+            proxy_launched_processes[pid]["complete_response"] = {
+                "message": complete_message,
+                "finish_reason": "stop"
+            }
+            logger.info(f"Added content in multiple fields for process {pid}")
+        
+        # Log a sample of the content for debugging
+        content_sample = content[:50] + "..." if len(content) > 50 else content
+        logger.info(f"Final streaming content for {pid}: {content_sample}")
 
 def get_process_output(pid):
     """Get the stored output for a process"""

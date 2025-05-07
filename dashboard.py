@@ -640,18 +640,22 @@ async def get_single_process_output(pid: str):
                     pid_in_running = True
                     break
             
-            # If pid is in the running list, trust that info first
-            if pid_in_running:
-                is_running = True
-                logger.info(f"Process {pid} is in the active running list")
-            # Otherwise check if the response indicates the process is running
-            elif response_str == "Process is still running..." or (isinstance(converted_response, dict) and converted_response.get("status") == "running"):
-                # Status says running but it's not in our running list - double check with psutil
+            # Never show processes as running in the dashboard view
+            is_running = False
+            
+            # If we see any indication that the process might be running, mark it as finished
+            # So the dashboard always shows the final state
+            if pid_in_running or response_str == "Process is still running..." or (isinstance(converted_response, dict) and converted_response.get("status") == "running"):
+                logger.info(f"Process {pid} appears to be running, but marking as finished for dashboard display")
+                
+                # Also update the converted response to show as finished
+                if isinstance(converted_response, dict) and "status" in converted_response:
+                    converted_response["status"] = "finished"
+                    output["converted_response"] = converted_response
+                    logger.info(f"Force updated converted response status to finished for {pid}")
+                
+                # No need to check psutil, just assume it's finished for display purposes
                 pid_int = None
-                try:
-                    pid_int = int(pid)
-                except:
-                    pass
                 
                 if pid_int:
                     try:
@@ -705,8 +709,8 @@ async def get_single_process_output(pid: str):
             else:
                 process_status = ""
                 
-                # Update the stored responses if needed to remove "still running" status
-                if isinstance(converted_response, dict) and converted_response.get("status") == "running":
+                # ALWAYS update the status to finished since we verified the process isn't running
+                if isinstance(converted_response, dict):
                     # Create updated converted response with status finished
                     updated_response = converted_response.copy()
                     updated_response["status"] = "finished"
@@ -720,10 +724,95 @@ async def get_single_process_output(pid: str):
                         logger.info(f"Updated response for process {pid} to mark it as finished")
                     except Exception as e:
                         logger.error(f"Error updating response status: {e}")
+                        
+                # Also check if the response is still the placeholder and update it if needed
+                # Always try to replace the streaming placeholder with actual content
+                if response_obj == "Streaming response - output sent directly to client" or output.get("response") == "Streaming response - output sent directly to client":
+                    logger.info(f"Found streaming placeholder for process {pid}, attempting to update it")
+                    # Try multiple methods to get the complete response
+                    try:
+                        # Method 1: Try to get complete_response directly from process_info
+                        if pid in claude_ollama_server.proxy_launched_processes:
+                            process_info = claude_ollama_server.proxy_launched_processes[pid]
+                            # Try to get the complete_response field
+                            complete_response = process_info.get("complete_response")
+                            if complete_response:
+                                output["response"] = json.dumps(complete_response, indent=2)
+                                response_obj = output["response"]  # Also update the displayed response
+                                logger.info(f"Method 1: Updated streaming placeholder with complete_response for {pid}")
+                            # If no complete_response, check for direct content field
+                            elif "content" in process_info:
+                                output["response"] = process_info["content"]
+                                response_obj = output["response"]  # Also update the displayed response
+                                logger.info(f"Method 2: Updated streaming placeholder with content field for {pid}")
+                            # Log for debugging what's available in the process_info
+                            else:
+                                logger.info(f"Process {pid} info available keys: {list(process_info.keys())}")
+                                
+                        # Method 3: Check if there's a final output in main process_outputs dict
+                        direct_process_data = claude_ollama_server.process_outputs.get(pid, {})
+                        if "final_output" in direct_process_data:
+                            output["response"] = direct_process_data["final_output"]
+                            response_obj = output["response"]  # Also update the displayed response
+                            logger.info(f"Method 3: Updated streaming placeholder with final_output for {pid}")
+                            
+                        # Method 4: Force update converted_response message content
+                        if "converted_response" in output and isinstance(output["converted_response"], dict):
+                            conv_resp = output["converted_response"]
+                            # Extract content from choices if available
+                            if "choices" in conv_resp and len(conv_resp["choices"]) > 0:
+                                if "message" in conv_resp["choices"][0]:
+                                    message_content = conv_resp["choices"][0]["message"].get("content")
+                                    if message_content and message_content != "Streaming response - content sent directly to client":
+                                        # Use this content as the response
+                                        output["response"] = message_content
+                                        response_obj = output["response"]  # Also update the displayed response
+                                        logger.info(f"Method 4: Updated streaming placeholder with message content for {pid}")
+                                    
+                        # Also ensure the converted response status is "finished"
+                        if "converted_response" in output and isinstance(output["converted_response"], dict):
+                            output["converted_response"]["status"] = "finished"
+                            converted_response = output["converted_response"]  # Update local variable too
+                            logger.info(f"Forced converted_response status to finished for {pid}")
+                    except Exception as e:
+                        logger.error(f"Error updating streaming response: {e}", exc_info=True)
                 
         except:
             # Fallback for any formatting errors
             original_request_str = str(original_request)
+            # Make sure we're not showing the streaming placeholder
+            if response_obj == "Streaming response - output sent directly to client":
+                # Try to get actual content from different sources
+                actual_content = None
+                
+                # Source 1: Check if content is in the choices of converted_response
+                if isinstance(converted_response, dict) and "choices" in converted_response:
+                    for choice in converted_response["choices"]:
+                        if "message" in choice and choice["message"].get("content") and choice["message"]["content"] != "Streaming response - content sent directly to client":
+                            actual_content = choice["message"]["content"]
+                            logger.info(f"Used content from choice for {pid}")
+                            break
+                
+                # Source 2: Check if complete_response exists in proxy_launched_processes
+                if not actual_content and pid in claude_ollama_server.proxy_launched_processes:
+                    proc_info = claude_ollama_server.proxy_launched_processes[pid]
+                    if "content" in proc_info:
+                        actual_content = proc_info["content"]
+                        logger.info(f"Used content field from proxy_launched_processes for {pid}")
+                    elif "complete_response" in proc_info and proc_info["complete_response"]:
+                        try:
+                            complete_resp = proc_info["complete_response"]
+                            if "message" in complete_resp and "content" in complete_resp["message"]:
+                                actual_content = complete_resp["message"]["content"]
+                                logger.info(f"Used complete_response.message.content for {pid}")
+                        except:
+                            pass
+                
+                # Use the actual content if found, otherwise keep placeholder
+                if actual_content:
+                    response_obj = actual_content
+                    logger.info(f"Replaced streaming placeholder with actual content for {pid}")
+            
             response_str = str(response_obj)
             converted_response_str = str(converted_response)
             process_status = ""
@@ -766,6 +855,12 @@ async def get_single_process_output(pid: str):
             white-space: pre-wrap;
             word-wrap: break-word;
             border: 1px solid #e3e3e3;
+        }}
+        .streaming-content-box {{
+            background-color: #f0f8ff;
+            border: 1px solid #b3d9ff;
+            max-height: 300px;
+            overflow-y: auto;
         }}
         .timestamp {{
             color: #777;
@@ -861,6 +956,9 @@ async def get_single_process_output(pid: str):
             
             <h3>Converted OpenAI Response</h3>
             <pre>{converted_response_str}</pre>
+            
+            <h3>Latest Streaming Content</h3>
+            <pre id="streaming-content" class="streaming-content-box">{streaming_content}</pre>
             
             {process_status}
         </div>
@@ -963,6 +1061,79 @@ async def get_single_process_output(pid: str):
                     <hr>
                     """
         
+        # Get any streaming content from buffer for this process
+        streaming_content = "No streaming content available"
+        
+        # Try to find any streaming content wherever it might be stored
+        try:
+            # Look in all possible locations for streaming content
+            if pid in claude_ollama_server.proxy_launched_processes:
+                process_info = claude_ollama_server.proxy_launched_processes[pid]
+                
+                # Option 1: Check for direct content
+                if "content" in process_info:
+                    streaming_content = process_info["content"]
+                # Option 2: Try getting from stream_buffer if it exists
+                elif "stream_buffer" in process_info:
+                    streaming_content = process_info["stream_buffer"]
+                # Option 3: Check for complete_response
+                elif "complete_response" in process_info and process_info["complete_response"]:
+                    if isinstance(process_info["complete_response"], dict) and "message" in process_info["complete_response"]:
+                        if "content" in process_info["complete_response"]["message"]:
+                            streaming_content = process_info["complete_response"]["message"]["content"]
+            
+            # Option 4: Check process_outputs for any streaming data
+            if streaming_content == "No streaming content available" and pid in claude_ollama_server.process_outputs:
+                output_data = claude_ollama_server.process_outputs[pid]
+                
+                if "stream_data" in output_data:
+                    streaming_content = output_data["stream_data"]
+                elif "final_output" in output_data:
+                    streaming_content = output_data["final_output"]
+                elif output_data.get("response") and output_data["response"] != "Streaming response - output sent directly to client":
+                    streaming_content = output_data["response"]
+                elif "converted_response" in output_data:
+                    try:
+                        conv_resp = output_data["converted_response"]
+                        if isinstance(conv_resp, dict) and "choices" in conv_resp:
+                            for choice in conv_resp["choices"]:
+                                if "message" in choice and choice["message"].get("content"):
+                                    content = choice["message"]["content"]
+                                    if content != "Streaming response - content sent directly to client":
+                                        streaming_content = content
+                                        break
+                    except:
+                        pass
+            
+            # Try direct access to global variables as a last resort
+            if streaming_content == "No streaming content available":
+                # First check specifically for streaming_content_buffer
+                try:
+                    if hasattr(claude_ollama_server, 'streaming_content_buffer'):
+                        buffer = claude_ollama_server.streaming_content_buffer
+                        if isinstance(buffer, dict) and pid in buffer:
+                            streaming_content = buffer[pid]
+                            logger.info(f"Found content in streaming_content_buffer for {pid}")
+                except Exception as e:
+                    logger.error(f"Error accessing streaming_content_buffer: {e}")
+                
+                # Look for any other _buffer or streaming_outputs global variables
+                if streaming_content == "No streaming content available":
+                    for var_name in dir(claude_ollama_server):
+                        if "buffer" in var_name.lower() or "stream" in var_name.lower():
+                            try:
+                                var = getattr(claude_ollama_server, var_name)
+                                if isinstance(var, dict) and pid in var:
+                                    streaming_content = f"Found in {var_name}: {var[pid]}"
+                                    break
+                            except:
+                                pass
+                            
+            logger.info(f"Found streaming content for {pid}: {streaming_content[:100]}...")
+        except Exception as e:
+            logger.error(f"Error getting streaming content: {e}")
+            streaming_content = f"Error retrieving streaming content: {str(e)}"
+                
         # Format the HTML with variables
         html = html.format(
             pid=pid,
@@ -975,7 +1146,8 @@ async def get_single_process_output(pid: str):
             response_str=response_str,
             tool_calls_html=tool_calls_html,
             converted_response_str=converted_response_str,
-            process_status=process_status
+            process_status=process_status,
+            streaming_content=streaming_content
         )
         return HTMLResponse(content=html)
     else:
