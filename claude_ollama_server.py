@@ -8,48 +8,43 @@ a locally running Claude Code process. It implements both Ollama API and OpenAI 
 import argparse
 import asyncio
 import datetime
+from datetime import timezone
 import json
 import logging
 import os
-import pprint
 import psutil # type: ignore
 import shlex
 import shutil
 import sys
 import tempfile
 import time
-import timezone
 import traceback
 import uuid
 import uvicorn # type: ignore
 from contextlib import asynccontextmanager
-from typing import Dict, List, Optional, Any, Union, Deque
+from typing import Dict, List, Optional, Any
 from pydantic import BaseModel, Field # type: ignore
-from fastapi import FastAPI, Request, HTTPException, BackgroundTasks # type: ignore
-from fastapi.responses import StreamingResponse, JSONResponse, PlainTextResponse, HTMLResponse, Response # type: ignore
+from fastapi import FastAPI, Request, HTTPException # type: ignore
+from fastapi.responses import StreamingResponse, JSONResponse # type: ignore
 from fastapi.middleware.cors import CORSMiddleware # type: ignore
-from starlette.background import BackgroundTask # type: ignore
 from claude_metrics import ClaudeMetrics
 import dashboard
 import formatters
 import process_tracking
+import streaming
+import models
 
 # Configuration
 
 # Debug mode - set to False in production
 DEBUG = False
 
-# Process and streaming response timeouts
-CLAUDE_STREAM_CHUNK_TIMEOUT = 18.0  # Seconds without output before checking process status (was 10, originally 5)
-CLAUDE_STREAM_MAX_SILENCE = 180.0  # Maximum seconds to wait with no output before assuming process hung (was 60, originally 15)
-
 # Version information
 API_VERSION = "0.1.0"
-BUILD_NAME = "claude-ollama-server"
+BUILD_NAME = "claudacity-server"
 GIT_SHA = ""  # Could be populated dynamically if needed
 BUILD_DATE = ""  # Could be populated dynamically if needed
 
-DEFAULT_MODEL = "anthropic/claude-3.7-sonnet"  # Default Claude model to report (must match /models endpoint)
 DEFAULT_MAX_TOKENS = 1000000  # 1m context length
 CONVERSATION_CACHE_TTL = 3600 * 3  # 3 hours in seconds
 
@@ -96,38 +91,28 @@ logger.addHandler(file_handler)
 # Initialize metrics
 metrics = ClaudeMetrics()
 
-def debug_response(response, prefix=""):
-    """Helper to log response details for debugging"""
-    try:
-        if isinstance(response, dict):
-            pretty = pprint.pformat(response, indent=2)
-            logger.debug(f"{prefix} Response dict: {pretty}")
-        else:
-            logger.debug(f"{prefix} Response (not dict): {response}")
-    except Exception as e:
-        logger.error(f"Error in debug_response: {e}")
-
 # Conversation cache to track active conversations
 # Keys are conversation IDs, values are (timestamp, conversation_id) tuples
 conversation_cache = {}
-
-# Directory for storing temporary conversation directories
-CONV_TEMP_ROOT = os.path.join(tempfile.gettempdir(), "claude_conversations")
-os.makedirs(CONV_TEMP_ROOT, exist_ok=True)
-
-# Map of conversation IDs to their temporary directories
-conversation_temp_dirs = {}
 
 # Background task for cleanup
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Run background tasks when the server starts."""
     # Start background cleanup task
+    logger.info("Application startup: Starting periodic cleanup task.")
     periodic_cleanup_task = asyncio.create_task(periodic_cleanup())
     yield
     # Stop background cleanup task
-    #&? Impliment
-
+    if periodic_cleanup_task:
+        logger.info("Application shutdown: Stopping periodic cleanup task.") 
+        periodic_cleanup_task.cancel()
+        try:
+            await periodic_cleanup_task
+        except asyncio.CancelledError:
+            logger.info("Periodic cleanup task was successfully cancelled and has exited.")
+        except Exception as e: # Catch any other potential error during task shutdown
+            logger.error(f"Error during periodic cleanup task shutdown: {e}", exc_info=True)
 
 # Initialize FastAPI app
 
@@ -137,7 +122,6 @@ app = FastAPI(
     version=API_VERSION,
     lifespan=lifespan
 )
-
 
 async def periodic_cleanup():
     """Periodically clean up old data to prevent memory leaks."""
@@ -158,12 +142,17 @@ async def periodic_cleanup():
                     active_conversations.add(conv_id)
                 
                 # Clean up temp directories for inactive conversations
-                for conv_id in list(conversation_temp_dirs.keys()):
+                for conv_id in list(models.conversation_temp_dirs.keys()):
                     if conv_id not in active_conversations:
-                        cleanup_conversation_temp_dir(conv_id)
+                        models.cleanup_conversation_temp_dir(conv_id)
                         logger.debug(f"Cleaned up temp directory for inactive conversation: {conv_id}")
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
                 logger.error(f"Error cleaning up conversation temp dirs: {e}")
+        except asyncio.CancelledError: # <<< --- ADDED THIS EXCEPTION HANDLER
+            logger.info("Periodic cleanup task is stopping.")
+            break # Exit the loop to terminate the task
         except Exception as e:
             logger.error(f"Error in periodic cleanup: {e}")
             # Don't let the background task die
@@ -261,14 +250,8 @@ async def log_requests(request: Request, call_next):
             content={"error": f"Internal Server Error: {str(e)}"}
         )
 
-# Utils
-
-def get_iso_timestamp():
-    """Generate ISO-8601 timestamp for created_at field."""
-    return datetime.now(timezone.utc).isoformat("T", "milliseconds") + "Z"
 
 # Command to interact with Claude Code CLI
-
 
 CLAUDE_CMD = process_tracking.find_claude_command()
 
@@ -314,7 +297,7 @@ class ChatMessage(BaseModel):
     content: str
 
 class ChatRequest(BaseModel):
-    model: str = DEFAULT_MODEL
+    model: str = models.DEFAULT_MODEL
     messages: List[ChatMessage]
     stream: bool = True
     options: Optional[Dict[str, Any]] = None
@@ -333,7 +316,7 @@ class OpenAIChatMessage(BaseModel):
     content: str
 
 class OpenAIChatRequest(BaseModel):
-    model: str = DEFAULT_MODEL
+    model: str = models.DEFAULT_MODEL
     messages: List[OpenAIChatMessage]
     stream: bool = False
     max_tokens: Optional[int] = None
@@ -346,35 +329,8 @@ class OpenAIChatRequest(BaseModel):
 
 # Utility functions for working with Claude Code CLI
 
-def get_conversation_temp_dir(conversation_id: str) -> str:
-    """Get or create a temporary directory for a conversation."""
-    if conversation_id in conversation_temp_dirs:
-        # Return existing temp dir
-        temp_dir = conversation_temp_dirs[conversation_id]
-        if os.path.exists(temp_dir):
-            return temp_dir
-    
-    # Create a new temp dir for this conversation
-    temp_dir = os.path.join(CONV_TEMP_ROOT, f"conv_{conversation_id}_{uuid.uuid4().hex[:8]}")
-    os.makedirs(temp_dir, exist_ok=True)
-    conversation_temp_dirs[conversation_id] = temp_dir
-    logger.info(f"Created temporary directory for conversation {conversation_id}: {temp_dir}")
-    return temp_dir
 
-def cleanup_conversation_temp_dir(conversation_id: str):
-    """Clean up the temporary directory for a conversation."""
-    if conversation_id in conversation_temp_dirs:
-        temp_dir = conversation_temp_dirs[conversation_id]
-        if os.path.exists(temp_dir):
-            try:
-                shutil.rmtree(temp_dir)
-                logger.info(f"Cleaned up temporary directory for conversation {conversation_id}: {temp_dir}")
-            except Exception as e:
-                logger.error(f"Failed to clean up temporary directory {temp_dir}: {e}")
-        # Remove from the map regardless of success
-        del conversation_temp_dirs[conversation_id]
-
-async def run_claude_command(prompt: str, conversation_id: str = None, original_request=None, timeout: float = CLAUDE_STREAM_MAX_SILENCE) -> str:
+async def run_claude_command(prompt: str, conversation_id: str = None, original_request=None, timeout: float = streaming.CLAUDE_STREAM_MAX_SILENCE) -> str:
     """Run a Claude Code command and return the output."""
     # Log the request details for debugging
     logger.debug(f"run_claude_command called with:")
@@ -393,14 +349,14 @@ async def run_claude_command(prompt: str, conversation_id: str = None, original_
     # Always use conversation ID if provided (regardless of tools or message count)
     if conversation_id:
         logger.debug(f"[TOOLS] Using conversation ID: {conversation_id}")
-        base_cmd += f" -c {conversation_id}"
+        base_cmd += f" -r {conversation_id}"
         
         # Check if we're in test mode (only create temp dirs in production)
         is_test = 'unittest' in sys.modules or os.environ.get('TESTING') == '1'
         
         if not is_test:
             # Create or get a temporary directory for this conversation
-            temp_dir = get_conversation_temp_dir(conversation_id)
+            temp_dir = models.get_conversation_temp_dir(conversation_id)
             
             # Set the current working directory for this conversation
             # We'll use environment variable to pass it to the Claude CLI
@@ -418,7 +374,7 @@ async def run_claude_command(prompt: str, conversation_id: str = None, original_
     # Generate a unique process ID for tracking
     process_id = f"claude-process-{uuid.uuid4().hex[:8]}"
     start_time = time.time()
-    model = DEFAULT_MODEL
+    model = models.DEFAULT_MODEL
     
     # Record the Claude process start in metrics
     await metrics.record_claude_start(process_id, model, conversation_id)
@@ -433,8 +389,8 @@ async def run_claude_command(prompt: str, conversation_id: str = None, original_
     
     # Set appropriate timeout parameters based on prompt complexity
     # The longer/more complex the prompt, the more time Claude might need
-    current_chunk_timeout = CLAUDE_STREAM_CHUNK_TIMEOUT
-    current_max_silence = CLAUDE_STREAM_MAX_SILENCE
+    current_chunk_timeout = streaming.CLAUDE_STREAM_CHUNK_TIMEOUT
+    current_max_silence = streaming.CLAUDE_STREAM_MAX_SILENCE
     
     # Adjust timeout based on prompt length or complexity if needed
     process_tracking.proxy_launched_processes[process_id]['chunk_timeout'] = current_chunk_timeout
@@ -501,16 +457,7 @@ async def run_claude_command(prompt: str, conversation_id: str = None, original_
                     if "log in" in stderr_text.lower() or "authenticate" in stderr_text.lower() or "not authenticated" in stderr_text.lower() or "login" in stderr_text.lower() or "session expired" in stderr_text.lower():
                         logger.warning("Authentication issue detected in Claude CLI")
                         # Create an auth error response that can be propagated back to the client
-                        auth_error = {
-                            "error": {
-                                "message": "Claude CLI authentication required. Please log in using the Claude CLI.",
-                                "type": "auth_error",
-                                "param": None,
-                                "code": "claude_auth_required"
-                            },
-                            "auth_required": True,
-                            "user_message": "Authentication required: Please log in using the Claude CLI on your server."
-                        }
+                        auth_error = _create_auth_error_response("Claude CLI authentication required. Please log in using the Claude CLI.")
                         return json.dumps(auth_error)
             else:
                 logger.info("No stderr output from Claude process")
@@ -635,16 +582,7 @@ async def run_claude_command(prompt: str, conversation_id: str = None, original_
                 
                 logger.warning(f"Authentication error detected in Claude response: {response['result']}")
                 # Create an auth error response that can be propagated back to the client
-                auth_error = {
-                    "error": {
-                        "message": response["result"],
-                        "type": "auth_error",
-                        "param": None,
-                        "code": "claude_auth_required"
-                    },
-                    "auth_required": True,
-                    "user_message": "Authentication required: Please log in using the Claude CLI on your server."
-                }
+                auth_error = _create_auth_error_response(response["result"])
                 return json.dumps(auth_error)
             
             # Extract token count if available
@@ -716,488 +654,6 @@ async def run_claude_command(prompt: str, conversation_id: str = None, original_
         logger.error(f"Error running Claude command: {str(e)}")
         raise
 
-async def stream_claude_output(prompt: str, conversation_id: str = None, original_request=None):
-    """
-    Run Claude with streaming JSON output and extract the content.
-    Processes multiline JSON objects in the stream.
-    """
-    # Start building the base command
-    base_cmd = f"{CLAUDE_CMD}"
-    
-    # We don't need to extract model - Claude command only takes -p and --output-format
-    logger.info(f"[TOOLS] Preparing to run Claude in streaming mode with prompt length: {len(prompt)}")
-
-    # Log if tools are present for debugging purposes only
-    if original_request and isinstance(original_request, dict) and original_request.get('tools'):
-        logger.info(f"[TOOLS] Detected tools in original_request for streaming conversation: {conversation_id}")
-        logger.info(f"[TOOLS] Tools are detected but will NOT be passed to Claude directly for streaming")
-            
-    # Always use the conversation ID if provided (regardless of tools or message count)
-    if conversation_id:
-        logger.info(f"[TOOLS] Using conversation ID for streaming: {conversation_id}")
-        base_cmd += f" -c {conversation_id}"
-        
-        # Check if we're in test mode (only create temp dirs in production)
-        is_test = 'unittest' in sys.modules or os.environ.get('TESTING') == '1'
-        
-        if not is_test:
-            # Create or get a temporary directory for this conversation
-            temp_dir = get_conversation_temp_dir(conversation_id)
-            
-            # Set the current working directory for this conversation
-            os.environ["CLAUDE_CWD"] = temp_dir
-    else:
-        logger.info(f"[TOOLS] No conversation ID provided for streaming")
-
-    # Add the -p flag AFTER the conversation flag
-    # The prompt needs to be directly after -p, not piped via stdin
-    quoted_prompt = shlex.quote(prompt)
-    cmd = f"{base_cmd} -p {quoted_prompt} --output-format stream-json"
-
-    logger.info(f"Running command for streaming: {cmd}")
-    
-    # Generate a unique process ID for tracking
-    process_id = f"claude-process-{uuid.uuid4().hex[:8]}"
-    start_time = time.time()
-    model = DEFAULT_MODEL
-    
-    # Record the Claude process start in metrics
-    await metrics.record_claude_start(process_id, model, conversation_id)
-    
-    # Track this process with the original request data
-    process_tracking.proxy_launched_processes[process_id] = {
-        "command": cmd,
-        "start_time": time.time(),
-        "current_request": original_request,
-        "status": "running"  # Explicitly mark as running
-    }
-    logger.info(f"Tracking new Claude process with PID {process_id}")
-
-    logger.debug(f"[TOOLS] About to start Claude process with command: {cmd}")
-    try:
-        # Set appropriate timeout parameters based on prompt complexity
-        # The longer/more complex the prompt, the more time Claude might need
-        current_chunk_timeout = CLAUDE_STREAM_CHUNK_TIMEOUT
-        current_max_silence = CLAUDE_STREAM_MAX_SILENCE
-        
-        # Store these in the process info for reference during streaming
-        process_info = process_tracking.proxy_launched_processes.get(process_id, {})
-        if process_info:
-            process_info['chunk_timeout'] = current_chunk_timeout
-            process_info['max_silence'] = current_max_silence
-        
-        process = await asyncio.create_subprocess_shell(
-            cmd,
-            stdin=None,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        if process and process.pid:
-            logger.info(f"[TOOLS] Successfully started Claude process with PID: {process.pid}")
-        else:
-            logger.error(f"[TOOLS] Failed to start Claude process, no PID assigned")
-    except Exception as e:
-        logger.error(f"[TOOLS] Exception while starting Claude process: {str(e)}")
-        raise
-    
-    # Track this process
-    if process and process.pid:
-        # Transfer the original request from our process ID to the actual process ID
-        if original_request and process_id in process_tracking.proxy_launched_processes:
-            original_request_data = process_tracking.proxy_launched_processes[process_id].get("current_request")
-        else:
-            original_request_data = original_request
-            
-        process_tracking.track_claude_process(str(process.pid), cmd, original_request_data)
-
-    # No need to write to stdin - the prompt is in the command line
-    # Just log that we're ready to process
-    logger.debug("Claude process started with prompt in command line, ready to read output")
-
-    # Check for any auth errors in stderr first
-    stderr_data = b""
-    try:
-        # Try to read any early stderr output - non-blocking
-        stderr_data = await asyncio.wait_for(process.stderr.read(1024), timeout=0.5)
-    except asyncio.TimeoutError:
-        # No stderr output yet, which is fine
-        pass
-    except Exception as e:
-        logger.debug(f"Error reading initial stderr: {str(e)}")
-    
-    # If we got stderr data, check for auth issues
-    if stderr_data:
-        stderr_text = stderr_data.decode('utf-8')
-        logger.warning(f"Early stderr from Claude: {stderr_text}")
-        
-        # Check for auth-related errors
-        if any(term in stderr_text.lower() for term in ["log in", "authenticate", "not authenticated", "login", "session expired"]):
-            logger.warning("Authentication issue detected in Claude CLI")
-            # Return an auth error that can be passed back to client
-            yield {
-                "error": {
-                    "message": "Claude CLI authentication required. Please log in using the Claude CLI.",
-                    "type": "auth_error",
-                    "code": "claude_auth_required"
-                }
-            }
-            # Close the process
-            process.terminate()
-            return
-    
-    # Read the output
-    try:
-        # Buffer for collecting complete JSON objects
-        buffer = ""
-        output_tokens = 0
-        streaming_complete = False
-        last_chunk_time = time.time()
-        
-        # Read the output in chunks
-        while True:
-            try:
-                # Use a timeout to detect stalled output
-                chunk = await asyncio.wait_for(process.stdout.read(1024), timeout=2.0)
-                if not chunk:
-                    # End of stream reached
-                    logger.debug("End of stream reached from Claude CLI")
-                    break
-                
-                last_chunk_time = time.time()  # Update last chunk time
-                buffer += chunk.decode('utf-8')
-                
-                # Try to find and parse complete JSON objects in the buffer
-                # We're looking for matching braces to identify complete objects
-                open_braces = 0
-                start_pos = None
-                
-                for i, char in enumerate(buffer):
-                    if char == '{':
-                        if open_braces == 0:
-                            start_pos = i
-                        open_braces += 1
-                    elif char == '}':
-                        open_braces -= 1
-                        if open_braces == 0 and start_pos is not None:
-                            # We've found a complete JSON object
-                            json_str = buffer[start_pos:i+1]
-                            try:
-                                json_obj = json.loads(json_str)
-                                logger.debug(f"Parsed complete JSON object: {str(json_obj)[:200]}...")
-                                
-                                # Process the JSON object based on its structure
-                                if "type" in json_obj and json_obj["type"] == "message":
-                                    if "content" in json_obj and isinstance(json_obj["content"], list):
-                                        for item in json_obj["content"]:
-                                            if item.get("type") == "text" and "text" in item:
-                                                content = item["text"]
-                                                logger.info(f"Extracted text content: {content[:50]}...")
-                                                output_tokens += len(content.split()) / 0.75  # Rough token count estimate
-                                                # Return plain dict object, let the higher-level formatters handle it
-                                                yield {"content": content}
-                                elif "stop_reason" in json_obj:
-                                    # End of message - this is an explicit completion signal
-                                    logger.info("Received explicit stop_reason from Claude")
-                                    streaming_complete = True
-                                    
-                                    # Record completion in metrics
-                                    duration_ms = (time.time() - start_time) * 1000
-                                    await metrics.record_claude_completion(
-                                        process_id, 
-                                        duration_ms, 
-                                        output_tokens=int(output_tokens),
-                                        conversation_id=conversation_id
-                                    )
-                                    
-                                    # Immediately send completion signal
-                                    # Return plain dict object, let the higher-level formatters handle it
-                                    yield {"done": True}
-                                    
-                                    # Break out of the main loop after completion
-                                    break
-                                # Additional handling for system messages with cost info
-                                elif "role" in json_obj and json_obj["role"] == "system":
-                                    # Check for authentication errors in system message
-                                    if ("result" in json_obj and 
-                                        isinstance(json_obj["result"], str) and 
-                                        ("Invalid API key" in json_obj["result"] or 
-                                         "Please run /login" in json_obj["result"])):
-                                        
-                                        logger.warning(f"Authentication error detected in streaming response: {json_obj['result']}")
-                                        # Return an auth error that can be passed back to client
-                                        yield {
-                                            "error": {
-                                                "message": json_obj["result"],
-                                                "type": "auth_error",
-                                                "code": "claude_auth_required"
-                                            }
-                                        }
-                                        # Mark as complete
-                                        streaming_complete = True
-                                        break
-                                    
-                                    # This is a system message with additional info
-                                    elif "cost_usd" in json_obj or "duration_ms" in json_obj:
-                                        # Extract execution duration if available
-                                        duration_ms = json_obj.get("duration_ms", (time.time() - start_time) * 1000)
-                                        streaming_complete = True
-                                        
-                                        # Record completion in metrics
-                                        await metrics.record_claude_completion(
-                                            process_id, 
-                                            duration_ms, 
-                                            output_tokens=int(output_tokens),
-                                            conversation_id=conversation_id
-                                        )
-                                        
-                                        # Immediately send completion signal
-                                        logger.info("Received system message with completion info from Claude")
-                                        # Return plain dict object, let the higher-level formatters handle it
-                                        yield {"done": True}
-                                        
-                                        # Break out of the main loop after completion
-                                        break
-                                
-                            except json.JSONDecodeError as e:
-                                logger.warning(f"Failed to parse JSON: {e}")
-                            
-                            # Remove the processed object from the buffer
-                            buffer = buffer[i+1:]
-                            # Reset to scan the buffer from the beginning
-                            break
-                            
-                # Check if we've received a completion signal to break the main loop
-                if streaming_complete:
-                    break
-                
-            except asyncio.TimeoutError:
-                # No data received within timeout - check if process is still running
-                if process.returncode is not None:
-                    logger.info(f"Claude process completed with return code {process.returncode}")
-                    break
-                
-                # Get process-specific timeout if available (or use the default)
-                process_info = process_tracking.proxy_launched_processes.get(process.pid, {})
-                chunk_timeout = process_info.get('chunk_timeout', CLAUDE_STREAM_CHUNK_TIMEOUT)
-                
-                # Check if we've gone too long without output - using the process-specific timeout
-                if time.time() - last_chunk_time > chunk_timeout:
-                    logger.warning(f"No output from Claude for {chunk_timeout} seconds, checking if process is still active")
-                    
-                    # Try to get process status without killing it
-                    try:
-                        # On Unix systems we can check if the process exists without affecting it
-                        if os.name != 'nt':  # Not Windows
-                            try:
-                                os.kill(process.pid, 0)  # This just checks if the process exists
-                                logger.info(f"Claude process {process.pid} still exists, continuing to wait")
-                            except ProcessLookupError:
-                                logger.info(f"Claude process {process.pid} no longer exists")
-                                break
-                        
-                        # If we're still waiting, check if it's been too long since the last chunk
-                        # For complex prompts, Claude may need more time between chunks
-                        if time.time() - last_chunk_time > CLAUDE_STREAM_MAX_SILENCE:
-                            logger.warning(f"No output for {CLAUDE_STREAM_MAX_SILENCE} seconds, assuming Claude is finished or hung")
-                            # Log the command to help diagnose hanging issues
-                            cmd_to_log = cmd if 'cmd' in locals() else "Unknown command"
-                            logger.warning(f"Command that may have hung: {cmd_to_log}")
-                            
-                            # Try to terminate the process if it's hung
-                            try:
-                                logger.warning(f"Attempting to terminate hung Claude process {process.pid}")
-                                process.kill()
-                                # If successful, untrack this process
-                                process_tracking.untrack_claude_process(process.pid)
-                            except Exception as kill_error:
-                                logger.error(f"Failed to kill hung process: {kill_error}")
-                            
-                            break
-                    except Exception as e:
-                        logger.warning(f"Error checking process status: {e}")
-                        # Continue waiting
-        
-        # If any data remains in the buffer, try to parse it
-        if buffer and not streaming_complete:
-            try:
-                json_obj = json.loads(buffer)
-                logger.debug(f"Parsed final JSON object from buffer: {str(json_obj)[:200]}...")
-                
-                if "type" in json_obj and json_obj["type"] == "message":
-                    if "content" in json_obj and isinstance(json_obj["content"], list):
-                        for item in json_obj["content"]:
-                            if item.get("type") == "text" and "text" in item:
-                                content = item["text"]
-                                logger.info(f"Extracted final text content: {content[:50]}...")
-                                output_tokens += len(content.split()) / 0.75  # Rough token count estimate
-                                # Return plain dict object, let the higher-level formatters handle it
-                                yield {"content": content}
-                elif "stop_reason" in json_obj:
-                    streaming_complete = True
-                    # Return plain dict object, let the higher-level formatters handle it
-                    yield {"done": True}
-            except json.JSONDecodeError:
-                logger.warning(f"Failed to parse final buffer: {buffer[:200]}...")
-        
-        # Check for any errors
-        stderr_data = await process.stderr.read()
-        if stderr_data:
-            stderr_str = stderr_data.decode('utf-8').strip()
-            if stderr_str:
-                logger.error(f"Error from Claude: {stderr_str}")
-                
-                # Record error in metrics
-                duration_ms = (time.time() - start_time) * 1000
-                await metrics.record_claude_completion(process_id, duration_ms, error=stderr_str, conversation_id=conversation_id)
-                
-                # Return plain dict object, let the higher-level formatters handle it
-                yield {"error": stderr_str}
-                return
-        
-        # Ensure we've read all available output before completing
-        # This is important to prevent any buffered data from being lost
-        try:
-            # Set a short timeout to get any remaining data without blocking too long
-            remaining_output = await asyncio.wait_for(process.stdout.read(), timeout=0.5)
-            if remaining_output:
-                logger.info(f"Found additional {len(remaining_output)} bytes in stdout before completion")
-                buffer = remaining_output.decode('utf-8')
-                
-                # Try to parse any complete JSON objects in the buffer
-                try:
-                    json_obj = json.loads(buffer)
-                    logger.debug(f"Parsed final JSON object: {str(json_obj)[:200]}...")
-                    
-                    # Check for content or completion messages
-                    if ("type" in json_obj and json_obj["type"] == "message" and 
-                        "content" in json_obj and isinstance(json_obj["content"], list)):
-                        for item in json_obj["content"]:
-                            if item.get("type") == "text" and "text" in item:
-                                content = item["text"]
-                                logger.info(f"Extracted final buffered content: {content[:50]}...")
-                                # Return plain dict object, let the higher-level formatters handle it
-                                yield {"content": content}
-                    elif "stop_reason" in json_obj:
-                        streaming_complete = True
-                        # Return plain dict object, let the higher-level formatters handle it
-                        yield {"done": True}
-                        return
-                except json.JSONDecodeError:
-                    # Not a complete JSON object, see if we can extract any text
-                    logger.warning(f"Final buffer couldn't be parsed as JSON: {buffer[:100]}...")
-                    # Just continue to completion 
-        except asyncio.TimeoutError:
-            logger.debug("No additional output available in stdout buffer")
-        except Exception as e:
-            logger.warning(f"Error reading final output buffer: {e}")
-        
-        # If we didn't see an explicit completion, record it now and send completion
-        if not streaming_complete:
-            logger.info("No explicit completion signal received, sending completion")
-            duration_ms = (time.time() - start_time) * 1000
-            await metrics.record_claude_completion(process_id, duration_ms, output_tokens=int(output_tokens), conversation_id=conversation_id)
-            # Return plain dict object, let the higher-level formatters handle it
-            yield {"done": True}
-                
-    except Exception as e:
-        logger.error(f"Error processing Claude output stream: {str(e)}", exc_info=True)
-        
-        # Record error in metrics
-        duration_ms = (time.time() - start_time) * 1000
-        await metrics.record_claude_completion(process_id, duration_ms, error=e, conversation_id=conversation_id)
-        
-        # Return plain dict object, let the higher-level formatters handle it
-        yield {"error": str(e)}
-        
-    finally:
-        # Wait for process to complete normally if it hasn't already
-        if process:
-            if process.returncode is None:
-                try:
-                    # First try to wait for graceful completion (may already be done)
-                    logger.debug("Waiting for Claude process to complete...")
-                    await asyncio.wait_for(process.wait(), timeout=1.0)
-                    logger.debug(f"Claude process completed with return code {process.returncode}")
-                except asyncio.TimeoutError:
-                    # If still running, try to terminate gracefully
-                    logger.info("Claude process still running, sending SIGTERM")
-                    try:
-                        process.terminate()
-                        await asyncio.wait_for(process.wait(), timeout=1.0)
-                        logger.debug("Claude process terminated cleanly")
-                    except (asyncio.TimeoutError, ProcessLookupError):
-                        # If still doesn't exit, force kill it
-                        logger.warning("Claude process didn't terminate, forcing kill")
-                        try:
-                            process.kill()
-                            logger.debug("Claude process killed")
-                        except ProcessLookupError:
-                            logger.debug("Claude process already gone")
-                            pass
-            else:
-                logger.debug(f"Claude process already completed with return code {process.returncode}")
-                
-            # Store the output and then untrack the process
-            if process.pid:
-                try:
-                    # For streaming processes, collect output differently
-                    # We'll collect the response from stdout and any errors from stderr
-                    stdout_text = "Streaming process - output sent directly to client"
-                    
-                    # Try to read any stderr data
-                    stderr_data = b""
-                    try:
-                        stderr_data = await asyncio.wait_for(process.stderr.read(), timeout=0.1)
-                    except (asyncio.TimeoutError, AttributeError):
-                        pass
-                    
-                    stderr_text = stderr_data.decode() if stderr_data else ""
-                    
-                    # Store what we have
-                    # Get the original request for storing
-                    original_request = None
-                    if "current_request" in process_tracking.proxy_launched_processes.get(str(process.pid), {}):
-                        original_request = process_tracking.proxy_launched_processes[str(process.pid)]["current_request"]
-                    
-                    process_tracking.store_process_output(
-                        str(process.pid),
-                        stdout_text,
-                        stderr_text,
-                        cmd,
-                        prompt,
-                        "Streaming response - output sent directly to client",
-                        {
-                            "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
-                            "object": "chat.completion",
-                            "created": int(time.time()),
-                            "model": model,
-                            "choices": [
-                                {
-                                    "index": 0,
-                                    "message": {
-                                        "role": "assistant",
-                                        "content": "Streaming response - content sent directly to client"
-                                    },
-                                    "finish_reason": "stop"
-                                }
-                            ],
-                            "usage": {
-                                "prompt_tokens": 0,
-                                "completion_tokens": 0,
-                                "total_tokens": 0
-                            },
-                            "note": "This was a streaming response where content was sent directly to the client."
-                        },
-                        model,
-                        original_request
-                    )
-                except Exception as e:
-                    logger.error(f"Error storing streaming process output: {e}")
-                
-                # Now untrack the process
-                process_tracking.untrack_claude_process(str(process.pid))
-
-# Message formatting functions
 
 def format_messages_for_claude(request: ChatRequest) -> str:
     """Format messages from Ollama request into a prompt for Claude Code CLI."""
@@ -1218,625 +674,6 @@ def format_messages_for_claude(request: ChatRequest) -> str:
 
     return prompt
 
-def format_openai_to_claude(request: OpenAIChatRequest) -> str:
-    """Format messages from OpenAI request into a prompt for Claude Code CLI."""
-    prompt = ""
-
-    # Process all messages in conversation
-    for msg in request.messages:
-        if msg.role == "user":
-            prompt += f"Human: {msg.content}\n\n"
-        elif msg.role == "assistant":
-            prompt += f"Assistant: {msg.content}\n\n"
-        elif msg.role == "system":
-            prompt += f"System: {msg.content}\n\n"
-
-    return prompt
-
-
-# Stream response functions for both API formats
-
-def get_real_process_id(request_info):
-    """
-    Get the real process ID from either the request info or the global process dict.
-    Handles both temporary string IDs and numeric process IDs.
-    """
-    if not request_info:
-        return None
-    
-    # Try to get PID from request info
-    pid = None
-    if isinstance(request_info, dict) and "pid" in request_info:
-        pid = request_info["pid"]
-    elif hasattr(request_info, "pid"):
-        pid = request_info.pid
-    
-    if not pid:
-        return None
-    
-    # Check if it's a temporary ID that maps to a real PID
-    with process_tracking.process_lock:
-        if isinstance(pid, str) and pid.startswith("claude-process-") and pid in process_tracking.proxy_launched_processes:
-            # Get the real PID if it exists
-            real_pid = process_tracking.proxy_launched_processes[pid].get("real_pid")
-            if real_pid:
-                return real_pid
-    
-    # Otherwise return the pid directly
-    return pid
-
-async def stream_openai_response(claude_prompt: str, model_name: str, conversation_id: str = None, request_id: str = None, original_request=None):
-    """
-    Stream responses from Claude in the appropriate format based on the client.
-    Handles both OpenAI-compatible and Ollama-compatible formats.
-    Uses the request_id from the client if provided.
-    """
-    # Check if this is an Ollama client request
-    is_ollama_client = False
-    if original_request:
-        if isinstance(original_request, dict):
-            is_ollama_client = original_request.get('ollama_client', False)
-        elif hasattr(original_request, 'ollama_client'):
-            is_ollama_client = original_request.ollama_client
-    
-    # Log based on client type
-    if is_ollama_client:
-        logger.info(f"Starting unified streaming with Ollama format, request_id={request_id}")
-    else:
-        logger.info(f"Starting unified streaming with OpenAI format, request_id={request_id}")
-    
-    # Use the request_id if provided, otherwise generate one
-    message_id = request_id if request_id else f"chatcmpl-{uuid.uuid4().hex}"
-    created = int(time.time())
-    is_first_chunk = True
-    full_response = ""
-    tool_calls_collection = []  # Store all detected tool calls for dashboard
-    completion_sent = False
-    has_tools = False  # Initialize the flag to track if tools are detected
-    start_time = time.time()
-
-    try:
-        # Use Claude's streaming JSON output
-        async for chunk in stream_claude_output(claude_prompt, conversation_id, original_request):
-            # Add detailed logging for tools troubleshooting
-            logger.info(f"[TOOLS] Received chunk: {str(chunk)[:100]}...")
-            logger.debug(f"Processing OpenAI stream chunk: {chunk}")
-            
-            # Check for errors or auth issues
-            if "error" in chunk:
-                # Check if this is an auth error
-                if isinstance(chunk["error"], dict) and chunk["error"].get("type") == "auth_error":
-                    logger.warning("Authentication error detected in stream, passing to client")
-                    
-                    # Format as OpenAI error response for streaming
-                    auth_error_msg = {
-                        "id": message_id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": model_name,
-                        "choices": [{
-                            "index": 0,
-                            "delta": {
-                                "role": "assistant",
-                                "content": "Authentication required: " + chunk["error"].get("message", "Please log in with Claude CLI")
-                            },
-                            "finish_reason": "error"
-                        }]
-                    }
-                    
-                    # Send the error as a regular chunk
-                    yield f"data: {json.dumps(auth_error_msg)}\n\n"
-                    
-                    # Send completion marker
-                    yield "data: [DONE]\n\n"
-                    
-                    # Mark as completed
-                    completion_sent = True
-                    return
-                logger.error(f"Error in OpenAI stream: {chunk['error']}")
-                error_response = {
-                    "error": {
-                        "message": f"Error: {chunk['error']}",
-                        "type": "server_error",
-                        "code": 500
-                    }
-                }
-                # Format error response based on client type
-                if is_ollama_client:
-                    # Ollama format error
-                    ollama_model = get_ollama_model_name(model_name)
-                    ollama_error = {
-                        "model": ollama_model,
-                        "created_at": datetime.datetime.now().isoformat() + "Z",
-                        "error": error_response["error"]["message"],
-                        "done": False
-                    }
-                    yield f"{json.dumps(ollama_error)}\n"
-                else:
-                    # OpenAI format error (SSE)
-                    yield f"data: {json.dumps(error_response)}\n\n"
-                # Format done marker based on client type
-                if is_ollama_client:
-                    # Ollama expects a final message with done=true
-                    ollama_done = {
-                        "model": model_name,
-                        "created_at": created,
-                        "done": True
-                    }
-                    yield f"{json.dumps(ollama_done)}\n"
-                else:
-                    # OpenAI clients expect "data: [DONE]" marker
-                    yield "data: [DONE]\n\n"
-                completion_sent = True
-                return
-                
-            # Extract content based on chunk format
-            content = ""
-            
-            if "content" in chunk:
-                content = chunk["content"]
-                
-                # Skip empty content
-                if not content:
-                    continue
-                
-                # Check if the content is a JSON string containing a tools array
-                # Note: We don't reset has_tools here - it should persist across chunks
-                if isinstance(content, str):
-                    try:
-                        # Check if it's a JSON string starting and ending with braces
-                        if content.strip().startswith('{') and content.strip().endswith('}'):
-                            # Try to parse as JSON
-                            parsed_content = json.loads(content)
-                            
-                            # Handle empty object response for tools (high priority)
-                            if parsed_content == {} or (isinstance(parsed_content, dict) and len(parsed_content) == 0):
-                                logger.info("[TOOLS] Empty object in streaming response, formatting as empty tool_calls")
-                                content = json.dumps({"tool_calls": []})
-                            # Handle existing tool_calls array
-                            elif "tool_calls" in parsed_content:
-                                # Already in correct format, just check if tools being used
-                                has_tools = len(parsed_content["tool_calls"]) > 0
-                                logger.info(f"[TOOLS] Tool calls array found in stream: has_tools={has_tools}")
-                                
-                            # Check if it contains a tools array
-                            elif isinstance(parsed_content, dict) and "tools" in parsed_content:
-                                logger.info("[TOOLS] Detected tools array in streaming response, modifying for OpenWebUI compatibility")
-                                # Convert Claude's "tools" format to OpenWebUI's expected "tool_calls" format
-                                tool_calls = []
-                                for tool in parsed_content.get("tools", []):
-                                    if "function" in tool and isinstance(tool["function"], dict):
-                                        tool_call = {
-                                            "name": tool["function"].get("name", "unknown_tool"),
-                                            "parameters": {}
-                                        }
-                                        # Parse the arguments if they exist
-                                        arguments = tool["function"].get("arguments", "{}")
-                                        if isinstance(arguments, str):
-                                            try:
-                                                tool_call["parameters"] = json.loads(arguments)
-                                            except json.JSONDecodeError:
-                                                tool_call["parameters"] = {"raw_arguments": arguments}
-                                        elif isinstance(arguments, dict):
-                                            tool_call["parameters"] = arguments
-                                        
-                                        tool_calls.append(tool_call)
-                                
-                                # Mark that we have tools for finish_reason - IMPORTANT: for the entire session
-                                if len(tool_calls) > 0:
-                                    has_tools = True
-                                    logger.info(f"[TOOLS] Detected tools in content: has_tools={has_tools}")
-                                    logger.info("Setting has_tools=True for the entire streaming session")
-                                
-                                # Create the OpenWebUI expected format
-                                content = json.dumps({"tool_calls": tool_calls})
-                    except json.JSONDecodeError:
-                        # Not valid JSON, proceed with original content
-                        pass
-                
-                # Accumulate full response for logging
-                full_response += content
-                
-                # Update the streaming buffer directly - no locking needed
-                try:
-                    # Store in the global buffer using a common key
-                    if request_id:
-                        # Store in both formats - the ID and the claude-process-ID format
-                        streaming_content_buffer[request_id] = full_response
-                        streaming_content_buffer[f"claude-process-{request_id}"] = full_response
-                        
-                        # Also update any process outputs entries that match this request ID
-                        for pid, output in process_tracking.process_outputs.items():
-                            # Update any entries with matching request ID or similar formats
-                            if (pid == request_id or 
-                                pid == f"claude-process-{request_id}" or
-                                output.get("request_id") == request_id):
-                                
-                                # Update multiple fields to ensure we capture it
-                                output["stream_content"] = full_response
-                                output["stream_buffer"] = full_response
-                                output["streaming_content"] = full_response
-                                
-                                # If it was a placeholder, also update the main response field
-                                if output.get("response") == "Streaming response - output sent directly to client":
-                                    output["response"] = full_response
-                                    
-                                logger.debug(f"Updated process outputs for {pid} with streaming content")
-                        
-                        logger.debug(f"Updated streaming buffers for request {request_id} with content length {len(full_response)}")
-                except Exception as e:
-                    logger.error(f"Error updating streaming buffer: {e}")
-                
-                # For the first real content, log it specially
-                if content and is_first_chunk:
-                    logger.info(f"First OpenAI content chunk received: {content[:50]}...")
-                    
-                # Format in OpenAI delta format
-                # Check if content might be a tool call
-                is_tool_call = False
-                tool_call_content = None
-                
-                # Handle tool calls for streaming
-                if isinstance(content, str) and "tool_calls" in content and content.strip().startswith("{") and content.strip().endswith("}"):
-                    try:
-                        tool_data = json.loads(content)
-                        if "tool_calls" in tool_data and isinstance(tool_data["tool_calls"], list) and tool_data["tool_calls"]:
-                            # We have tool calls - format them properly
-                            is_tool_call = True
-                            
-                            # Set up delta for tool calls
-                            delta = {
-                                # Only include role in the first chunk
-                                "role": "assistant" if is_first_chunk else ""
-                            }
-                            
-                            # If this is the first chunk with tools, include the tool calls array
-                            if is_first_chunk or not has_tools:
-                                # Extract the tool calls
-                                raw_tool_calls = tool_data["tool_calls"]
-                                
-                                # Format according to OpenAI's function calling spec
-                                tool_calls_array = []
-                                for i, tool_call in enumerate(raw_tool_calls):
-                                    formatted_tool_call = {
-                                        "id": f"call_{uuid.uuid4().hex[:8]}",
-                                        "type": "function",
-                                        "function": {
-                                            "name": tool_call.get("name", "unknown_tool"),
-                                            "arguments": json.dumps(tool_call.get("parameters", {}))
-                                        }
-                                    }
-                                    tool_calls_array.append(formatted_tool_call)
-                                
-                                # Set tool_calls in delta and make content null
-                                delta["content"] = None
-                                delta["tool_calls"] = tool_calls_array
-                                
-                                # Store the tool calls for the dashboard
-                                tool_calls_collection.extend(tool_calls_array)
-                                
-                                # Mark that we have detected tools
-                                has_tools = True
-                                logger.info(f"[TOOLS] Detected and formatted {len(tool_calls_array)} tool calls for streaming")
-                    except Exception as e:
-                        logger.error(f"Error formatting tool calls in streaming: {str(e)}")
-                        # Fall back to regular content
-                        is_tool_call = False
-                
-                # Format the actual response
-                if is_tool_call:
-                    response = {
-                        "id": message_id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": model_name,
-                        "choices": [
-                            {
-                                "index": 0,
-                                "delta": delta,
-                                "finish_reason": None
-                            }
-                        ]
-                    }
-                else:
-                    # Regular content format
-                    response = {
-                        "id": message_id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": model_name,
-                        "choices": [
-                            {
-                                "index": 0,
-                                "delta": {
-                                    # Only include role in the first chunk
-                                    "role": "assistant" if is_first_chunk else "",
-                                    "content": content
-                                },
-                                "finish_reason": None
-                            }
-                        ]
-                    }
-                
-                if is_first_chunk:
-                    is_first_chunk = False
-                    
-                # Format data based on client type
-                if is_ollama_client:
-                    # Ollama uses NDJSON format (one JSON object per line, no SSE formatting)
-                    # Convert to Ollama model name format if needed
-                    ollama_model = get_ollama_model_name(model_name)
-                    ollama_response = {
-                        "model": ollama_model,
-                        "created_at": datetime.datetime.now().isoformat() + "Z",
-                        "message": {"role": "assistant", "content": content},
-                        "done": False
-                    }
-                    ndjson_data = f"{json.dumps(ollama_response)}\n"
-                    logger.debug(f"Sending Ollama NDJSON chunk: {ndjson_data[:100]}...")
-                    yield ndjson_data
-                else:
-                    # OpenAI uses SSE format (data: prefix and double newlines)
-                    sse_data = f"data: {json.dumps(response)}\n\n"
-                    logger.debug(f"Sending OpenAI SSE chunk: {sse_data[:100]}...")
-                    yield sse_data
-                
-            elif "done" in chunk and chunk["done"]:
-                # This is the completion signal - send final chunk with finish_reason
-                # CRITICAL: This is a completion marker from Claude
-                logger.info("Received completion signal from Claude, sending final chunks")
-                
-                # Check if we had tools in the response to set proper finish_reason
-                finish_reason = "tool_calls" if has_tools else "stop"
-                logger.info(f"[TOOLS] Sending completion with finish_reason={finish_reason}")
-                logger.info(f"Setting finish_reason to: {finish_reason}")
-                
-                # Add detailed log about tool call status
-                if has_tools:
-                    logger.info(f"[TOOLS] Completing a response with tool calls - this should trigger tool execution in the client")
-                
-                # Send the completion message with finish_reason
-                final_response = {
-                    "id": message_id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": model_name,
-                    "choices": [
-                        {
-                            "index": 0,
-                            "delta": {},  # Empty delta for the final chunk
-                            "finish_reason": finish_reason
-                        }
-                    ]
-                }
-                yield f"data: {json.dumps(final_response)}\n\n"
-                
-                # Format done marker based on client type
-                if is_ollama_client:
-                    # Ollama expects a final message with done=true and more detailed stats
-                    total_duration = int((time.time() - start_time) * 1000000)  # microseconds
-                    ollama_model = get_ollama_model_name(model_name)
-                    ollama_done = {
-                        "model": ollama_model,
-                        "created_at": datetime.datetime.now().isoformat() + "Z",
-                        "message": {"role": "assistant", "content": ""},
-                        "done_reason": finish_reason,
-                        "done": True,
-                        "total_duration": total_duration,
-                        "load_duration": int(total_duration * 0.1),
-                        "prompt_eval_count": len(claude_prompt),
-                        "prompt_eval_duration": int(total_duration * 0.3),
-                        "eval_count": len(full_response),
-                        "eval_duration": int(total_duration * 0.6)
-                    }
-                    yield f"{json.dumps(ollama_done)}\n"
-                else:
-                    # OpenAI clients expect "data: [DONE]" marker
-                    yield "data: [DONE]\n\n"
-                completion_sent = True
-                
-                # Log complete response summary
-                logger.info(f"Complete OpenAI response length: {len(full_response)} chars")
-                if len(full_response) < 500:
-                    logger.debug(f"Complete OpenAI response: {full_response}")
-                
-                # Call our new function to update streaming process outputs
-                try:
-                    # Call the dedicated function to update streaming outputs
-                    if has_tools and tool_calls_collection:
-                        # For tool calls, create a proper response
-                        tool_calls_response = {
-                            "role": "assistant",
-                            "content": None,
-                            "tool_calls": tool_calls_collection
-                        }
-                        # Record in a format that would make sense as output
-                        tool_calls_formatted = json.dumps(tool_calls_response, indent=2)
-                        with process_tracking.process_lock:
-                            # Try to update all recent processes in case we missed the right one
-                            for pid, info in list(process_tracking.proxy_launched_processes.items()):
-                                if (time.time() - info.get("start_time", 0) < 300):  # 5 minutes
-                                    update_streaming_process_output(str(pid), tool_calls_formatted)
-                    else:
-                        # For regular responses, update with the text content
-                        with process_tracking.process_lock:
-                            # Try to update all recent processes in case we missed the right one
-                            for pid, info in list(process_tracking.proxy_launched_processes.items()):
-                                if (time.time() - info.get("start_time", 0) < 300):  # 5 minutes
-                                    update_streaming_process_output(str(pid), full_response)
-                    
-                    logger.info(f"Updated streaming processes with content length: {len(full_response)}")
-                except Exception as e:
-                    logger.error(f"Error updating streaming process output: {e}")
-                
-                # Store the complete response for the dashboard, including tool calls
-                if has_tools and tool_calls_collection:
-                    # Create a complete message that includes all tool calls
-                    complete_message = {
-                        "role": "assistant",
-                        "content": None,
-                        "tool_calls": tool_calls_collection
-                    }
-                    
-                    # Log the tool calls for debugging
-                    logger.info(f"[TOOLS] Have {len(tool_calls_collection)} tool calls to store")
-                    for i, tc in enumerate(tool_calls_collection):
-                        if "function" in tc:
-                            logger.info(f"[TOOLS] Tool call {i+1}: {tc['function'].get('name', 'unknown')} with args: {tc['function'].get('arguments', '{}')[:100]}")
-                    
-                    # Find all running Claude processes and store the tool calls in all of them
-                    # This ensures we don't miss the process due to ID mapping issues
-                    with process_tracking.process_lock:
-                        stored = False
-                        for pid, process_info in process_tracking.proxy_launched_processes.items():
-                            # Only update running processes started within the last few minutes
-                            if (process_info.get("status") == "running" and 
-                                time.time() - process_info.get("start_time", 0) < 300):  # 5 minutes
-                                
-                                # Store the complete response
-                                process_info["complete_response"] = {
-                                    "message": complete_message,
-                                    "finish_reason": "tool_calls"
-                                }
-                                logger.info(f"[TOOLS] Stored complete tool response for process {pid} with {len(tool_calls_collection)} tool calls")
-                                stored = True
-                        
-                        if not stored:
-                            logger.warning(f"[TOOLS] Failed to find a running Claude process to store tool calls")
-                
-                return  # Exit the generator after sending completion
-            else:
-                # Log unrecognized format but don't interrupt the stream
-                logger.warning(f"Unrecognized OpenAI chunk format: {chunk}")
-                continue
-        
-        # If we reached here, the stream ended without a formal "done" marker
-        # This is a safeguard - we should always properly terminate the stream
-        if not completion_sent:
-            logger.warning("Stream ended without completion signal, sending final markers")
-            
-            # Send the completion message with finish_reason
-            # Use the existing has_tools flag to determine finish_reason
-            finish_reason = "tool_calls" if has_tools else "stop"
-            logger.info(f"[TOOLS] Sending completion with finish_reason={finish_reason}")
-            logger.info(f"Fallback finish_reason: {finish_reason}")
-            
-            final_response = {
-                "id": message_id,
-                "object": "chat.completion.chunk",
-                "created": created,
-                "model": model_name,
-                "choices": [
-                    {
-                        "index": 0,
-                        "delta": {},  # Empty delta for the final chunk
-                        "finish_reason": finish_reason
-                    }
-                ]
-            }
-            yield f"data: {json.dumps(final_response)}\n\n"
-            
-            # Format done marker based on client type
-            if is_ollama_client:
-                # Ollama expects a final message with done=true and more detailed stats
-                total_duration = int((time.time() - start_time) * 1000000)  # microseconds
-                ollama_model = get_ollama_model_name(model_name)
-                ollama_done = {
-                    "model": ollama_model,
-                    "created_at": datetime.datetime.now().isoformat() + "Z",
-                    "message": {"role": "assistant", "content": ""},
-                    "done_reason": finish_reason,
-                    "done": True,
-                    "total_duration": total_duration,
-                    "load_duration": int(total_duration * 0.1),
-                    "prompt_eval_count": len(claude_prompt),
-                    "prompt_eval_duration": int(total_duration * 0.3),
-                    "eval_count": len(full_response),
-                    "eval_duration": int(total_duration * 0.6)
-                }
-                yield f"{json.dumps(ollama_done)}\n"
-            else:
-                # OpenAI clients expect "data: [DONE]" marker
-                yield "data: [DONE]\n\n"
-            
-            # Log complete response summary
-            logger.info(f"Complete OpenAI response length: {len(full_response)} chars")
-            if len(full_response) < 500:
-                logger.debug(f"Complete OpenAI response: {full_response}")
-                
-            # Call our new function to update streaming process outputs (fallback case)
-            try:
-                # Call the dedicated function to update streaming outputs
-                if has_tools and tool_calls_collection:
-                    # For tool calls, create a proper response
-                    tool_calls_response = {
-                        "role": "assistant",
-                        "content": None,
-                        "tool_calls": tool_calls_collection
-                    }
-                    # Record in a format that would make sense as output
-                    tool_calls_formatted = json.dumps(tool_calls_response, indent=2)
-                    with process_tracking.process_lock:
-                        # Try to update all recent processes in case we missed the right one
-                        for pid, info in list(process_tracking.proxy_launched_processes.items()):
-                            if (time.time() - info.get("start_time", 0) < 300):  # 5 minutes
-                                update_streaming_process_output(str(pid), tool_calls_formatted)
-                else:
-                    # For regular responses, update with the text content
-                    with process_tracking.process_lock:
-                        # Try to update all recent processes in case we missed the right one
-                        for pid, info in list(process_tracking.proxy_launched_processes.items()):
-                            if (time.time() - info.get("start_time", 0) < 300):  # 5 minutes
-                                update_streaming_process_output(str(pid), full_response)
-                
-                logger.info(f"Updated streaming processes with content length: {len(full_response)} (fallback)")
-            except Exception as e:
-                logger.error(f"Error updating streaming process output (fallback): {e}")
-            
-    except Exception as e:
-        logger.error(f"Error streaming from Claude with OpenAI format: {str(e)}", exc_info=True)
-        
-        # Send error response based on client type
-        error_message = f"Streaming error: {str(e)}"
-        
-        if is_ollama_client:
-            # Ollama format error
-            ollama_error = {
-                "model": model_name,
-                "created_at": created,
-                "error": error_message,
-                "done": False
-            }
-            yield f"{json.dumps(ollama_error)}\n"
-        else:
-            # OpenAI format error
-            error_response = {
-                "error": {
-                    "message": error_message,
-                    "type": "server_error",
-                    "code": 500
-                }
-            }
-            yield f"data: {json.dumps(error_response)}\n\n"
-        
-        # Format done marker based on client type
-        if is_ollama_client:
-            # For Ollama errors, return a properly formatted error message and done marker
-            ollama_model = get_ollama_model_name(model_name)
-            error_obj = {
-                "model": ollama_model,
-                "created_at": datetime.datetime.now().isoformat() + "Z",
-                "message": {
-                    "role": "assistant",
-                    "content": f"Error: {str(e)}"
-                },
-                "done_reason": "error",
-                "done": True
-            }
-            yield f"{json.dumps(error_obj)}\n"
-        else:
-            # OpenAI clients expect "data: [DONE]" marker
-            yield "data: [DONE]\n\n"
 
 # Unified function to parse request body
 async def parse_request_body(request: Request):
@@ -1869,6 +706,19 @@ async def parse_request_body(request: Request):
 
 # API endpoints - Chat completions endpoint
 
+def _create_auth_error_response(error_message):
+    """Create a standardized Claude authentication error response"""
+    return {
+        "error": {
+            "message": error_message,
+            "type": "auth_error",
+            "param": None,
+            "code": "claude_auth_required"
+        },
+        "auth_required": True,
+        "user_message": "Authentication required: Please log in using the Claude CLI."
+    }
+
 @app.post("/chat/completions")
 async def chat(request_body: Request):
     """
@@ -1876,6 +726,7 @@ async def chat(request_body: Request):
     """
     # Log the raw request
     logger.debug(f"Received chat completion request with content type: {request_body.headers.get('content-type', 'unknown')}")
+
 
     try:
         # Parse the request body based on content type
@@ -1993,7 +844,7 @@ async def chat(request_body: Request):
         
         # Use the same streaming function regardless of client type
         return StreamingResponse(
-            stream_openai_response(claude_prompt, request.model, conversation_id, request.id, request_dict),
+            streaming.stream_openai_response(metrics, claude_prompt, request.model, conversation_id, request.id, request_dict),
             media_type=media_type,
             headers=headers
         )
@@ -2047,14 +898,7 @@ async def chat(request_body: Request):
                             # Return error response in OpenAI format
                             return JSONResponse(
                                 status_code=401,  # Unauthorized
-                                content={
-                                    "error": {
-                                        "message": error_message,
-                                        "type": "auth_error",
-                                        "param": None,
-                                        "code": "claude_auth_required"
-                                    }
-                                },
+                                content=_create_auth_error_response(error_message),
                                 headers={"WWW-Authenticate": "Basic realm=\"Claude CLI Authentication Required\""}
                             )
                         
@@ -2070,14 +914,7 @@ async def chat(request_body: Request):
                             # Return error response in OpenAI format
                             return JSONResponse(
                                 status_code=401,  # Unauthorized
-                                content={
-                                    "error": {
-                                        "message": response_obj["result"],
-                                        "type": "auth_error",
-                                        "param": None,
-                                        "code": "claude_auth_required"
-                                    }
-                                },
+                                content=_create_auth_error_response(response_obj["result"]),
                                 headers={"WWW-Authenticate": "Basic realm=\"Claude CLI Authentication Required\""}
                             )
                     except json.JSONDecodeError:
@@ -2338,7 +1175,7 @@ async def get_tags():
     for model in AVAILABLE_MODELS:
         # Use helper function to format model name with appropriate tag
         model_name = model['name']
-        ollama_model_name = get_ollama_model_name(model_name)
+        ollama_model_name = models.get_ollama_model_name(model_name)
         
         model_entry = {
             "name": ollama_model_name,  # Use name with appropriate tag
@@ -2371,23 +1208,6 @@ class OllamaChatRequest(BaseModel):
     stream: bool = True
     options: Optional[Dict[str, Any]] = None
     format: Optional[str] = None
-
-# Helper function to handle Ollama model name convention
-def get_ollama_model_name(model_name: str) -> str:
-    """
-    Apply Ollama model naming conventions:
-    - Extract base model name for internal processing by stripping tags (everything after ":")
-    - Add ":latest" tag if no tag is present in the model name
-    
-    Args:
-        model_name: Original model name, may include a tag (e.g. "model:tag")
-        
-    Returns:
-        Ollama-formatted model name with appropriate tag
-    """
-    if ":" not in model_name:
-        return f"{model_name}:latest"
-    return model_name
 
 # Helper function to extract base model name
 def get_base_model_name(model_name: str) -> str:
@@ -2451,11 +1271,11 @@ async def ollama_chat(request: OllamaChatRequest):
         
         # Create an Ollama-specific streaming function
         async def stream_ollama_response():
-            async for chunk in stream_claude_output(claude_prompt, None, request_dict):
+            async for chunk in streaming.stream_claude_output(metrics, CLAUDE_CMD, claude_prompt, None, request_dict):
                 if "content" in chunk:
                     content = chunk["content"]
                     # Format in Ollama format
-                    ollama_model = get_ollama_model_name(model)
+                    ollama_model = models.get_ollama_model_name(model)
                     response = {
                         "model": ollama_model,
                         "created_at": datetime.datetime.now().isoformat() + "Z",
@@ -2468,7 +1288,7 @@ async def ollama_chat(request: OllamaChatRequest):
                     yield json.dumps(response) + "\n"
                 elif "done" in chunk and chunk["done"]:
                     # Final message with done flag
-                    ollama_model = get_ollama_model_name(model)
+                    ollama_model = models.get_ollama_model_name(model)
                     done_msg = {
                         "model": ollama_model,
                         "created_at": datetime.datetime.now().isoformat() + "Z",
@@ -2502,17 +1322,19 @@ async def ollama_chat(request: OllamaChatRequest):
             logger.info(f"Non-streaming request completed successfully, response type: {type(claude_response)}")
             if isinstance(claude_response, dict):
                 logger.info(f"Response keys: {list(claude_response.keys())}")
+                content_str = claude_response.get("content", "")
             else:
                 logger.info(f"Response (not a dict): {str(claude_response)[:100]}...")
-            
+                content_str = str(claude_response)
+                
             # Format as Ollama response
-            ollama_model = get_ollama_model_name(model)
+            ollama_model = models.get_ollama_model_name(model)
             ollama_response = {
                 "model": ollama_model,
                 "created_at": datetime.datetime.now().isoformat() + "Z",
                 "message": {
                     "role": "assistant",
-                    "content": claude_response.get("content", "")
+                    "content": content_str
                 },
                 "done": True
             }
@@ -2522,7 +1344,7 @@ async def ollama_chat(request: OllamaChatRequest):
             logger.error(f"Error type: {type(e)}")
             logger.error(f"Traceback: {traceback.format_exc()}")
             
-            ollama_model = get_ollama_model_name(model)
+            ollama_model = models.get_ollama_model_name(model)
             ollama_response = {
                 "model": ollama_model,
                 "created_at": datetime.datetime.now().isoformat() + "Z",
@@ -2589,11 +1411,11 @@ async def ollama_generate(request: OllamaGenerateRequest):
         
         # Create an Ollama-specific streaming function
         async def stream_ollama_response():
-            async for chunk in stream_claude_output(claude_prompt, None, request_dict):
+            async for chunk in streaming.stream_claude_output(metrics, CLAUDE_CMD, claude_prompt, None, request_dict):
                 if "content" in chunk:
                     content = chunk["content"]
                     # Format in Ollama format
-                    ollama_model = get_ollama_model_name(model)
+                    ollama_model = models.get_ollama_model_name(model)
                     response = {
                         "model": ollama_model,
                         "created_at": datetime.datetime.now().isoformat() + "Z",
@@ -2603,7 +1425,7 @@ async def ollama_generate(request: OllamaGenerateRequest):
                     yield json.dumps(response) + "\n"
                 elif "done" in chunk and chunk["done"]:
                     # Final message with done flag
-                    ollama_model = get_ollama_model_name(model)
+                    ollama_model = models.get_ollama_model_name(model)
                     done_msg = {
                         "model": ollama_model,
                         "created_at": datetime.datetime.now().isoformat() + "Z",
@@ -2621,7 +1443,7 @@ async def ollama_generate(request: OllamaGenerateRequest):
         claude_response = await run_claude_command(claude_prompt, conversation_id=None, original_request=request_dict)
         
         # Format as Ollama response
-        ollama_model = get_ollama_model_name(model)
+        ollama_model = models.get_ollama_model_name(model)
         ollama_response = {
             "model": ollama_model,
             "created_at": datetime.datetime.now().isoformat() + "Z",
@@ -2844,78 +1666,6 @@ def run_self_test():
     return True
 
 
-
-def update_streaming_process_output(pid, content):
-    """Update a streaming process output with the full response content"""
-    global streaming_content_buffer
-    logger.info(f"Updating streaming process output for PID {pid} with content length: {len(content)}")
-    
-    # Create global buffer for streaming content if it doesn't exist
-    if 'streaming_content_buffer' not in globals():
-        global streaming_content_buffer
-        streaming_content_buffer = {}
-    
-    # Always store the streaming content in a global buffer for easy access
-    streaming_content_buffer[pid] = content
-        
-    # Update in process_tracking.process_outputs
-    if pid in process_tracking.process_outputs:
-        # Set the actual response content directly - overwrite the placeholder
-        process_tracking.process_outputs[pid]["response"] = content
-        # Also store it in special fields for dashboard access
-        process_tracking.process_outputs[pid]["final_output"] = content
-        process_tracking.process_outputs[pid]["stream_buffer"] = content  # Add dedicated field for streaming buffer
-        process_tracking.process_outputs[pid]["stream_data"] = content    # Alternative name in case code looks for this
-        logger.info(f"Updated multiple content fields for process {pid}")
-        
-        # Also update the message content in the converted response
-        if "converted_response" in process_tracking.process_outputs[pid]:
-            try:
-                conv_resp = process_tracking.process_outputs[pid]["converted_response"]
-                if isinstance(conv_resp, dict) and "choices" in conv_resp:
-                    for choice in conv_resp["choices"]:
-                        if "message" in choice:
-                            # Replace the placeholder with actual content
-                            choice["message"]["content"] = content
-                            logger.info(f"Updated converted response message content for {pid}")
-                
-                # Also set status to finished if present
-                if isinstance(conv_resp, dict) and "status" in conv_resp:
-                    conv_resp["status"] = "finished"
-                    logger.info(f"Updated status to finished in converted response for {pid}")
-                    
-                # Store updated converted_response back in process_tracking.process_outputs
-                process_tracking.process_outputs[pid]["converted_response"] = conv_resp
-            except Exception as e:
-                logger.error(f"Error updating converted response: {e}")
-        
-        # Also update process status
-        if pid in process_tracking.proxy_launched_processes:
-            # Update the status to finished
-            process_tracking.proxy_launched_processes[pid]["status"] = "finished"
-            logger.info(f"Marked process {pid} as finished")
-            
-            # Store content in multiple places to make it accessible
-            process_tracking.proxy_launched_processes[pid]["content"] = content
-            process_tracking.proxy_launched_processes[pid]["stream_buffer"] = content
-            process_tracking.proxy_launched_processes[pid]["streaming_content"] = content
-            
-            # Add complete_response for the dashboard to display
-            complete_message = {
-                "role": "assistant",
-                "content": content
-            }
-            process_tracking.proxy_launched_processes[pid]["complete_response"] = {
-                "message": complete_message,
-                "finish_reason": "stop"
-            }
-            logger.info(f"Added content in multiple fields for process {pid}")
-        
-        # Log a sample of the content for debugging
-        content_sample = content[:50] + "..." if len(content) > 50 else content
-        logger.info(f"Final streaming content for {pid}: {content_sample}")
-
-
 # Initialize dashboard if the module is available
 # Import dashboard at the end to avoid circular imports
 try:
@@ -2926,7 +1676,7 @@ try:
     )
     logger.info("Dashboard module initialized")
 except (ImportError, AttributeError) as e:
-    logger.error(f"Dashboard module not found or error initializing: {e}, embedded dashboard will be used", exc_info=True)
+    logger.error(f"Dashboard module not found or error initializing: {e}", exc_info=True)
 
 if __name__ == "__main__":
     # Parse command-line arguments

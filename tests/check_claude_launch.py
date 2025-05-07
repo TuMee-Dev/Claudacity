@@ -2,7 +2,7 @@
 """
 Simple script to check if Claude processes are being launched
 """
-import aiohttp
+import aiohttp # type: ignore
 import asyncio
 import time
 import sys

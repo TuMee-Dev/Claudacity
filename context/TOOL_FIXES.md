@@ -1,4 +1,4 @@
-# Claude-Ollama-Server Tool Response Fixes
+# Claudacity-Server Tool Response Fixes
 
 ## Issue Summary
 
