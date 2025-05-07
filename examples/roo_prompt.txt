@@ -10057,7 +10057,7 @@ services:
       - QUEUE_BULL_REDIS_HOST=redis
       - QUEUE_BULL_REDIS_PORT=6379
       - OFFLOAD_MANUAL_EXECUTIONS_TO_WORKERS=true
-      - QUEUE_BULL_REDIS_PASSWORD=E1GCK6DJgkUIQImBUxxz9JSguiD8fhaf
+      - QUEUE_BULL_REDIS_PASSWORD=removed
     depends_on:
       - redis
     volumes:
@@ -10068,7 +10068,7 @@ services:
     image: redis:6
     container_name: redis
     restart: always
-    command: redis-server --requirepass E1GCK6DJgkUIQImBUxxz9JSguiD8fhaf
+    command: redis-server --requirepass removed
     volumes:
       - ~/redis-data:/data
 
@@ -10101,7 +10101,7 @@ services:
       - DB_POSTGRESDB_USER=n8n
       - DB_POSTGRESDB_PASSWORD=0jisrXndveKy1NCRI8hB
       - N8N_ENCRYPTION_KEY=mYHmAeohSoEFZdl9DbNYgC1sjOrCidQy
-      - QUEUE_BULL_REDIS_PASSWORD=E1GCK6DJgkUIQImBUxxz9JSguiD8fhaf
+      - QUEUE_BULL_REDIS_PASSWORD=
 
   openwebui:
     image: ghcr.io/open-webui/open-webui
