@@ -77,7 +77,27 @@ def generate_dashboard_html():
     
     # Use our own lock
     with dashboard_lock:
-        # Access proxy_launched_processes safely
+        # First check and update any stale processes
+        current_time = time.time()
+        for pid, process_info in list(claude_ollama_server.proxy_launched_processes.items()):
+            if process_info.get('status', '') == 'running':
+                # Check if this is a numeric PID we can verify
+                try:
+                    pid_int = int(pid)
+                    # Check if process actually exists
+                    if not psutil.pid_exists(pid_int):
+                        # Process no longer exists, mark as finished
+                        process_info['status'] = 'finished'
+                        logger.info(f"Auto-marked non-existent process {pid} as finished")
+                except:
+                    # Not a numeric PID or other error, check age instead
+                    process_age = current_time - process_info.get('start_time', 0)
+                    # If process has been running for more than 5 minutes, mark as finished
+                    if process_age > 300:  # 5 minutes
+                        process_info['status'] = 'finished'
+                        logger.info(f"Auto-marked long-running process {pid} as finished (age: {process_age:.1f}s)")
+                        
+        # Now get the running processes for display
         for pid, process_info in list(claude_ollama_server.proxy_launched_processes.items()):
             # Only include processes with status 'running'
             if process_info.get('status', '') == 'running':
@@ -668,6 +688,14 @@ async def get_single_process_output(pid: str):
                             if pid in claude_ollama_server.proxy_launched_processes:
                                 claude_ollama_server.proxy_launched_processes[pid]["status"] = "finished"
                                 logger.info(f"Updated process {pid} status to finished in proxy_launched_processes")
+                                
+                                # Also update the converted response status here if it exists
+                                if isinstance(converted_response, dict) and converted_response.get("status") == "running":
+                                    # Update the status
+                                    converted_response["status"] = "finished"
+                                    # And update the process output
+                                    output["converted_response"] = converted_response
+                                    logger.info(f"Updated converted response status to finished for {pid}")
                     except Exception as e:
                         logger.warning(f"Error updating process status: {str(e)}")
             
