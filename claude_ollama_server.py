@@ -815,7 +815,8 @@ async def run_claude_command(prompt: str, conversation_id: str = None, original_
     proxy_launched_processes[process_id] = {
         "command": cmd,
         "start_time": time.time(),
-        "current_request": original_request
+        "current_request": original_request,
+        "status": "running"  # Explicitly mark as running
     }
     
     # Set appropriate timeout parameters based on prompt complexity
@@ -1120,7 +1121,8 @@ async def stream_claude_output(prompt: str, conversation_id: str = None, origina
     proxy_launched_processes[process_id] = {
         "command": cmd,
         "start_time": time.time(),
-        "current_request": original_request
+        "current_request": original_request,
+        "status": "running"  # Explicitly mark as running
     }
     logger.info(f"Tracking new Claude process with PID {process_id}")
 
@@ -1301,7 +1303,8 @@ async def stream_claude_output(prompt: str, conversation_id: str = None, origina
                         if time.time() - last_chunk_time > CLAUDE_STREAM_MAX_SILENCE:
                             logger.warning(f"No output for {CLAUDE_STREAM_MAX_SILENCE} seconds, assuming Claude is finished or hung")
                             # Log the command to help diagnose hanging issues
-                            logger.warning(f"Command that may have hung: {command}")
+                            cmd_to_log = cmd if 'cmd' in locals() else "Unknown command"
+                            logger.warning(f"Command that may have hung: {cmd_to_log}")
                             
                             # Try to terminate the process if it's hung
                             try:
@@ -1721,11 +1724,59 @@ def format_to_openai_chat_completion(claude_response, model, request_id=None):
     else:
         logger.info(f"Final content dict/object: {json.dumps(content)[:200] if hasattr(content, '__dict__') else str(content)[:200]}")
     
-    # Ensure content is correctly formatted for OpenWebUI
-    final_content = content if isinstance(content, str) else json.dumps(content)
+    # Determine if we have tool calls and process them correctly for OpenAI format
+    finish_reason = "stop"
+    message = {
+        "role": "assistant",
+    }
     
-    # Determine the appropriate finish_reason based on whether tools were used
-    finish_reason = "tool_calls" if has_tools else "stop"
+    tool_calls_array = []
+    
+    # Check if content contains tool calls
+    if has_tools:
+        finish_reason = "tool_calls"
+        logger.info(f"Processing tool calls for OpenAI format")
+        
+        try:
+            # If content is a string that looks like JSON with tool_calls, parse it
+            if isinstance(content, str) and "tool_calls" in content:
+                tool_data = json.loads(content)
+                if "tool_calls" in tool_data and isinstance(tool_data["tool_calls"], list):
+                    # Extract the tool calls
+                    raw_tool_calls = tool_data["tool_calls"]
+                    
+                    # Format according to OpenAI's function calling spec
+                    for i, tool_call in enumerate(raw_tool_calls):
+                        formatted_tool_call = {
+                            "id": f"call_{uuid.uuid4().hex[:8]}",
+                            "type": "function",
+                            "function": {
+                                "name": tool_call.get("name", "unknown_tool"),
+                                "arguments": json.dumps(tool_call.get("parameters", {}))
+                            }
+                        }
+                        tool_calls_array.append(formatted_tool_call)
+                    
+                    logger.info(f"Formatted {len(tool_calls_array)} tool calls for OpenAI compatibility")
+            
+            # If we have tool calls, set them in the message and set content to null
+            if tool_calls_array:
+                message["content"] = None
+                message["tool_calls"] = tool_calls_array
+                logger.info(f"Set tool_calls in message and set content to null")
+            else:
+                # No tool calls, use the content as normal
+                message["content"] = content if isinstance(content, str) else json.dumps(content)
+                finish_reason = "stop"
+        except Exception as e:
+            # If there's any error in tool call formatting, fall back to content
+            logger.error(f"Error formatting tool calls: {str(e)}")
+            message["content"] = content if isinstance(content, str) else json.dumps(content)
+            finish_reason = "stop"
+    else:
+        # No tool calls detected, use normal content
+        message["content"] = content if isinstance(content, str) else json.dumps(content)
+    
     logger.info(f"Non-streaming response finish_reason: {finish_reason}")
     
     # Format the response in OpenAI chat completion format
@@ -1737,10 +1788,7 @@ def format_to_openai_chat_completion(claude_response, model, request_id=None):
         "choices": [
             {
                 "index": 0,
-                "message": {
-                    "role": "assistant",
-                    "content": final_content
-                },
+                "message": message,
                 "finish_reason": finish_reason
             }
         ],
@@ -1758,6 +1806,35 @@ def format_to_openai_chat_completion(claude_response, model, request_id=None):
     return openai_response
 
 # Stream response functions for both API formats
+
+def get_real_process_id(request_info):
+    """
+    Get the real process ID from either the request info or the global process dict.
+    Handles both temporary string IDs and numeric process IDs.
+    """
+    if not request_info:
+        return None
+    
+    # Try to get PID from request info
+    pid = None
+    if isinstance(request_info, dict) and "pid" in request_info:
+        pid = request_info["pid"]
+    elif hasattr(request_info, "pid"):
+        pid = request_info.pid
+    
+    if not pid:
+        return None
+    
+    # Check if it's a temporary ID that maps to a real PID
+    with process_lock:
+        if isinstance(pid, str) and pid.startswith("claude-process-") and pid in proxy_launched_processes:
+            # Get the real PID if it exists
+            real_pid = proxy_launched_processes[pid].get("real_pid")
+            if real_pid:
+                return real_pid
+    
+    # Otherwise return the pid directly
+    return pid
 
 async def stream_openai_response(claude_prompt: str, model_name: str, conversation_id: str = None, request_id: str = None, original_request=None):
     """
@@ -1787,6 +1864,7 @@ async def stream_openai_response(claude_prompt: str, model_name: str, conversati
     created = int(time.time())
     is_first_chunk = True
     full_response = ""
+    tool_calls_collection = []  # Store all detected tool calls for dashboard
     completion_sent = False
     has_tools = False  # Initialize the flag to track if tools are detected
     start_time = time.time()
@@ -1909,23 +1987,91 @@ async def stream_openai_response(claude_prompt: str, model_name: str, conversati
                     logger.info(f"First OpenAI content chunk received: {content[:50]}...")
                     
                 # Format in OpenAI delta format
-                response = {
-                    "id": message_id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": model_name,
-                    "choices": [
-                        {
-                            "index": 0,
-                            "delta": {
+                # Check if content might be a tool call
+                is_tool_call = False
+                tool_call_content = None
+                
+                # Handle tool calls for streaming
+                if isinstance(content, str) and "tool_calls" in content and content.strip().startswith("{") and content.strip().endswith("}"):
+                    try:
+                        tool_data = json.loads(content)
+                        if "tool_calls" in tool_data and isinstance(tool_data["tool_calls"], list) and tool_data["tool_calls"]:
+                            # We have tool calls - format them properly
+                            is_tool_call = True
+                            
+                            # Set up delta for tool calls
+                            delta = {
                                 # Only include role in the first chunk
-                                "role": "assistant" if is_first_chunk else "",
-                                "content": content
-                            },
-                            "finish_reason": None
-                        }
-                    ]
-                }
+                                "role": "assistant" if is_first_chunk else ""
+                            }
+                            
+                            # If this is the first chunk with tools, include the tool calls array
+                            if is_first_chunk or not has_tools:
+                                # Extract the tool calls
+                                raw_tool_calls = tool_data["tool_calls"]
+                                
+                                # Format according to OpenAI's function calling spec
+                                tool_calls_array = []
+                                for i, tool_call in enumerate(raw_tool_calls):
+                                    formatted_tool_call = {
+                                        "id": f"call_{uuid.uuid4().hex[:8]}",
+                                        "type": "function",
+                                        "function": {
+                                            "name": tool_call.get("name", "unknown_tool"),
+                                            "arguments": json.dumps(tool_call.get("parameters", {}))
+                                        }
+                                    }
+                                    tool_calls_array.append(formatted_tool_call)
+                                
+                                # Set tool_calls in delta and make content null
+                                delta["content"] = None
+                                delta["tool_calls"] = tool_calls_array
+                                
+                                # Store the tool calls for the dashboard
+                                tool_calls_collection.extend(tool_calls_array)
+                                
+                                # Mark that we have detected tools
+                                has_tools = True
+                                logger.info(f"[TOOLS] Detected and formatted {len(tool_calls_array)} tool calls for streaming")
+                    except Exception as e:
+                        logger.error(f"Error formatting tool calls in streaming: {str(e)}")
+                        # Fall back to regular content
+                        is_tool_call = False
+                
+                # Format the actual response
+                if is_tool_call:
+                    response = {
+                        "id": message_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model_name,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": delta,
+                                "finish_reason": None
+                            }
+                        ]
+                    }
+                else:
+                    # Regular content format
+                    response = {
+                        "id": message_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model_name,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {
+                                    # Only include role in the first chunk
+                                    "role": "assistant" if is_first_chunk else "",
+                                    "content": content
+                                },
+                                "finish_reason": None
+                            }
+                        ]
+                    }
                 
                 if is_first_chunk:
                     is_first_chunk = False
@@ -1959,6 +2105,10 @@ async def stream_openai_response(claude_prompt: str, model_name: str, conversati
                 finish_reason = "tool_calls" if has_tools else "stop"
                 logger.info(f"[TOOLS] Sending completion with finish_reason={finish_reason}")
                 logger.info(f"Setting finish_reason to: {finish_reason}")
+                
+                # Add detailed log about tool call status
+                if has_tools:
+                    logger.info(f"[TOOLS] Completing a response with tool calls - this should trigger tool execution in the client")
                 
                 # Send the completion message with finish_reason
                 final_response = {
@@ -2004,6 +2154,41 @@ async def stream_openai_response(claude_prompt: str, model_name: str, conversati
                 logger.info(f"Complete OpenAI response length: {len(full_response)} chars")
                 if len(full_response) < 500:
                     logger.debug(f"Complete OpenAI response: {full_response}")
+                
+                # Store the complete response for the dashboard, including tool calls
+                if has_tools and tool_calls_collection:
+                    # Create a complete message that includes all tool calls
+                    complete_message = {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": tool_calls_collection
+                    }
+                    
+                    # Log the tool calls for debugging
+                    logger.info(f"[TOOLS] Have {len(tool_calls_collection)} tool calls to store")
+                    for i, tc in enumerate(tool_calls_collection):
+                        if "function" in tc:
+                            logger.info(f"[TOOLS] Tool call {i+1}: {tc['function'].get('name', 'unknown')} with args: {tc['function'].get('arguments', '{}')[:100]}")
+                    
+                    # Find all running Claude processes and store the tool calls in all of them
+                    # This ensures we don't miss the process due to ID mapping issues
+                    with process_lock:
+                        stored = False
+                        for pid, process_info in proxy_launched_processes.items():
+                            # Only update running processes started within the last few minutes
+                            if (process_info.get("status") == "running" and 
+                                time.time() - process_info.get("start_time", 0) < 300):  # 5 minutes
+                                
+                                # Store the complete response
+                                process_info["complete_response"] = {
+                                    "message": complete_message,
+                                    "finish_reason": "tool_calls"
+                                }
+                                logger.info(f"[TOOLS] Stored complete tool response for process {pid} with {len(tool_calls_collection)} tool calls")
+                                stored = True
+                        
+                        if not stored:
+                            logger.warning(f"[TOOLS] Failed to find a running Claude process to store tool calls")
                 
                 return  # Exit the generator after sending completion
             else:
@@ -3121,30 +3306,50 @@ def track_claude_process(pid, command, original_request=None):
     logger.info(f"Tracking new Claude process with PID {pid}")
 
 def untrack_claude_process(pid):
-    """Remove a Claude process from tracking"""
-    if pid in proxy_launched_processes:
-        # Get the process info before removing it
-        process_info = proxy_launched_processes.get(pid, {})
-        
-        # Remove this process
-        proxy_launched_processes.pop(pid, None)
-        logger.info(f"Untracked Claude process with PID {pid}")
-        
-        # If this is a real PID (numeric), also remove any temporary IDs linked to it
-        if not isinstance(pid, str) or not pid.startswith("claude-process-"):
-            # This is a real PID - check for any temporary IDs that link to it
-            for temp_pid, info in list(proxy_launched_processes.items()):
-                if (isinstance(temp_pid, str) and temp_pid.startswith("claude-process-") and 
-                    info.get('real_pid') == pid):
-                    proxy_launched_processes.pop(temp_pid, None)
-                    logger.info(f"Untracked linked temporary process with PID {temp_pid}")
-        
-        # If this is a temporary ID, also remove the real PID it links to
-        if isinstance(pid, str) and pid.startswith("claude-process-"):
-            real_pid = process_info.get('real_pid')
-            if real_pid and real_pid in proxy_launched_processes:
-                proxy_launched_processes.pop(real_pid, None)
-                logger.info(f"Untracked linked real process with PID {real_pid}")
+    """Remove a Claude process from tracking or mark it as finished if needed"""
+    with process_lock:
+        if pid in proxy_launched_processes:
+            # Get the process info before removing it
+            process_info = proxy_launched_processes.get(pid, {})
+            
+            # Check if we should keep this process for record-keeping
+            if process_info.get("keep_record", False):
+                # Instead of removing, mark as finished
+                proxy_launched_processes[pid]["status"] = "finished"
+                logger.info(f"Marked Claude process with PID {pid} as finished (keeping record)")
+                return
+            
+            # Otherwise remove this process
+            proxy_launched_processes.pop(pid, None)
+            logger.info(f"Untracked Claude process with PID {pid}")
+            
+            # If this is a real PID (numeric), also clean up any temporary IDs linked to it
+            if not isinstance(pid, str) or not pid.startswith("claude-process-"):
+                # This is a real PID - check for any temporary IDs that link to it
+                for temp_pid, info in list(proxy_launched_processes.items()):
+                    if (isinstance(temp_pid, str) and temp_pid.startswith("claude-process-") and 
+                        info.get('real_pid') == pid):
+                        # Check if we should keep this process for record-keeping
+                        if info.get("keep_record", False):
+                            # Instead of removing, mark as finished
+                            proxy_launched_processes[temp_pid]["status"] = "finished" 
+                            logger.info(f"Marked linked temporary process with PID {temp_pid} as finished (keeping record)")
+                        else:
+                            proxy_launched_processes.pop(temp_pid, None)
+                            logger.info(f"Untracked linked temporary process with PID {temp_pid}")
+            
+            # If this is a temporary ID, also handle the real PID it links to
+            if isinstance(pid, str) and pid.startswith("claude-process-"):
+                real_pid = process_info.get('real_pid')
+                if real_pid and real_pid in proxy_launched_processes:
+                    # Check if we should keep this process for record-keeping
+                    if proxy_launched_processes[real_pid].get("keep_record", False):
+                        # Instead of removing, mark as finished
+                        proxy_launched_processes[real_pid]["status"] = "finished"
+                        logger.info(f"Marked linked real process with PID {real_pid} as finished (keeping record)")
+                    else:
+                        proxy_launched_processes.pop(real_pid, None)
+                        logger.info(f"Untracked linked real process with PID {real_pid}")
 
 def store_process_output(pid, stdout, stderr, command, prompt, response, converted_response=None, model=DEFAULT_MODEL, original_request=None):
     """Store the output from a Claude process"""
@@ -3203,8 +3408,18 @@ def get_running_claude_processes():
         
         # Check each tracked process to see if it's still running
         pids_to_remove = []
-        for pid, process_info in proxy_launched_processes.items():
+        max_process_age = 1800  # 30 minutes - remove processes older than this
+        current_time = time.time()
+        
+        for pid, process_info in list(proxy_launched_processes.items()):  # Use list() to avoid dict changing during iteration
             try:
+                # Check for stale processes regardless of type
+                process_age = current_time - process_info.get('start_time', 0)
+                if process_age > max_process_age:
+                    logger.info(f"Removing stale process {pid} (age: {process_age:.1f}s)")
+                    pids_to_remove.append(pid)
+                    continue
+                
                 # Skip if already processed (avoids duplicates)
                 real_pid = process_info.get('real_pid')
                 if real_pid and real_pid in processed_pids:
@@ -3212,39 +3427,74 @@ def get_running_claude_processes():
                 
                 # Handle different process ID types
                 if isinstance(pid, str) and pid.startswith("claude-process-"):
-                    # Check if this process has a real PID assigned - if so, skip it as we'll
-                    # process it when we encounter the real PID
+                    # Check if this process has a real PID assigned
                     if real_pid:
-                        continue
-                        
-                    # For string-based process IDs without real PID, include in the list but mark as non-psutil
-                    runtime_secs = int(time.time() - process_info['start_time'])
-                    hours, remainder = divmod(runtime_secs, 3600)
-                    minutes, seconds = divmod(remainder, 60)
-                    runtime = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+                        # Check if the real PID process exists
+                        try:
+                            if not psutil.pid_exists(real_pid):
+                                logger.info(f"Temporary process {pid} refers to non-existent real PID {real_pid}")
+                                pids_to_remove.append(pid)
+                                continue
+                            else:
+                                # Skip as we'll process when we encounter the real PID
+                                continue
+                        except:
+                            # Error checking real PID
+                            continue
+                            
+                    # Set status to finished for processes that have been around too long
+                    if process_age > 300:  # 5 minutes
+                        process_info['status'] = 'finished'
+                        logger.info(f"Marking temp process {pid} as finished due to age: {process_age:.1f}s")
                     
-                    active_processes.append({
-                        "user": "claude",
-                        "pid": pid,
-                        "cpu": "N/A",
-                        "memory": "N/A",
-                        "started": time.strftime("%H:%M:%S", time.localtime(process_info['start_time'])),
-                        "runtime": runtime,
-                        "command": process_info.get('command', 'Claude Process')[:80]
-                    })
+                    # Only include running processes in the dashboard
+                    if process_info.get('status') == 'running':
+                        # For string-based process IDs without real PID, include in the list but mark as non-psutil
+                        runtime_secs = int(current_time - process_info['start_time'])
+                        hours, remainder = divmod(runtime_secs, 3600)
+                        minutes, seconds = divmod(remainder, 60)
+                        runtime = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+                        
+                        active_processes.append({
+                            "user": "claude",
+                            "pid": pid,
+                            "cpu": "N/A",
+                            "memory": "N/A",
+                            "started": time.strftime("%H:%M:%S", time.localtime(process_info['start_time'])),
+                            "runtime": runtime,
+                            "command": process_info.get('command', 'Claude Process')[:80]
+                        })
                     continue
                 
                 # For numeric PIDs, convert and check if process exists
                 try:
                     numeric_pid = int(pid) if isinstance(pid, str) else pid
+                    
+                    # Check if the process exists before creating Process object
+                    if not psutil.pid_exists(numeric_pid):
+                        pids_to_remove.append(pid)
+                        logger.info(f"Process {numeric_pid} no longer exists")
+                        continue
+                    
+                    # Check if it's actually a Claude process
                     process = psutil.Process(numeric_pid)
-                except (psutil.NoSuchProcess, ValueError):
+                    cmdline = process.cmdline()
+                    if not ("claude" in process.name().lower() or any("claude" in arg.lower() for arg in cmdline)):
+                        # Not a Claude process - either reused PID or wrong process
+                        logger.info(f"Process {numeric_pid} exists but is not a Claude process: {' '.join(cmdline)}")
+                        pids_to_remove.append(pid)
+                        continue
+                except (psutil.NoSuchProcess, ValueError, psutil.AccessDenied) as e:
                     # Process no longer exists or invalid PID format
+                    logger.info(f"Error checking process {pid}: {str(e)}")
                     pids_to_remove.append(pid)
                     continue
                 
                 # Mark as processed to avoid duplicates
                 processed_pids.add(numeric_pid)
+                
+                # Update the status in the process_info
+                process_info['status'] = 'running'
                 
                 # Get process info
                 with process.oneshot():
@@ -3255,7 +3505,7 @@ def get_running_claude_processes():
                     command = " ".join(process.cmdline())[:80] + ("..." if len(" ".join(process.cmdline())) > 80 else "")
                     
                     # Calculate runtime
-                    runtime_secs = int(time.time() - process_info['start_time'])
+                    runtime_secs = int(current_time - process_info['start_time'])
                     hours, remainder = divmod(runtime_secs, 3600)
                     minutes, seconds = divmod(remainder, 60)
                     runtime = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
@@ -3269,13 +3519,15 @@ def get_running_claude_processes():
                         "runtime": runtime,
                         "command": command
                     })
-            except (psutil.NoSuchProcess, psutil.AccessDenied, ValueError):
+            except (psutil.NoSuchProcess, psutil.AccessDenied, ValueError) as e:
                 # Process no longer exists, can't be accessed, or invalid PID format
+                logger.info(f"Error processing {pid}: {str(e)}")
                 pids_to_remove.append(pid)
                 
         # Clean up processes that no longer exist
         for pid in pids_to_remove:
             untrack_claude_process(pid)
+            logger.info(f"Untracked Claude process with PID {pid}")
         
         return active_processes
     except Exception as e:

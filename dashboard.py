@@ -8,6 +8,15 @@ including HTML generation, metrics visualization, and process management.
 import time
 import psutil
 import logging
+import claude_ollama_server
+import threading
+import metrics_tracker
+
+# Create a lock for process access
+dashboard_lock = threading.Lock()
+
+# Use the metrics module properly
+metrics = metrics_tracker.MetricsTracker()
 import json
 from fastapi import HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
@@ -40,13 +49,62 @@ def init_dashboard(app, metrics_module, get_process_output_fn, process_outputs_d
     
     return app
 
+def update_process_count_in_metrics():
+    """Update the current running process count in metrics based on actual running processes"""
+    try:
+        # Get the list of actually running processes
+        running_processes = get_running_claude_processes()
+        
+        # Count only truly running processes (not ones that should be marked finished)
+        actual_running_count = len(running_processes)
+        
+        # Get the current count from metrics
+        current_count = metrics.current_processes
+        
+        # If the counts don't match, update the metrics
+        if current_count != actual_running_count:
+            logger.info(f"Fixing process count mismatch: metrics has {current_count}, actual count is {actual_running_count}")
+            
+            # Update the metrics count
+            metrics.current_processes = actual_running_count
+    except Exception as e:
+        logger.error(f"Error updating process count in metrics: {str(e)}")
+
 def generate_dashboard_html():
     """Generate HTML for the dashboard page"""
-    # Get current metrics
-    metrics_data = metrics.get_metrics()
+    # Get currently running Claude processes directly from the server module
+    running_processes = []
     
-    # Get currently running Claude processes
-    running_processes = get_running_claude_processes()
+    # Use our own lock
+    with dashboard_lock:
+        # Access proxy_launched_processes safely
+        for pid, process_info in list(claude_ollama_server.proxy_launched_processes.items()):
+            # Only include processes with status 'running'
+            if process_info.get('status', '') == 'running':
+                # Calculate runtime
+                start_time = process_info.get('start_time', time.time())
+                runtime_secs = int(time.time() - start_time)
+                hours, remainder = divmod(runtime_secs, 3600)
+                minutes, seconds = divmod(remainder, 60)
+                runtime = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+                
+                # Get command
+                command = process_info.get('command', 'Claude Process')
+                
+                # Add to running processes
+                running_processes.append({
+                    'pid': pid,
+                    'command': command,
+                    'cpu': 'N/A',
+                    'memory': 'N/A',
+                    'runtime': runtime
+                })
+    
+    # Set metrics based on actual running processes
+    metrics.current_processes = len(running_processes)
+    
+    # Get updated metrics
+    metrics_data = metrics.get_metrics()
     
     # Format metrics for display - convert from ms to minutes and seconds
     def format_time_ms(time_ms):
@@ -527,6 +585,7 @@ async def get_single_process_output(pid: str):
         original_request = output.get("original_request", {})
         response_obj = output.get("response", {})
         converted_response = output.get("converted_response", {})
+        complete_response = output.get("complete_response", {})
         
         # Format the JSON objects for display
         try:
@@ -547,8 +606,27 @@ async def get_single_process_output(pid: str):
             
             # Check if this is a running process
             process_status = ""
-            if response_str == "Process is still running..." or (isinstance(converted_response, dict) and converted_response.get("status") == "running"):
-                # Check if the process is still actually running
+            
+            # By default, assume not running
+            is_running = False
+            
+            # Get the master list of running processes for more accurate status
+            running_processes = get_running_claude_processes()
+            
+            # Check if this PID is in the running processes list
+            pid_in_running = False
+            for proc in running_processes:
+                if str(proc.get('pid', '')) == str(pid):
+                    pid_in_running = True
+                    break
+            
+            # If pid is in the running list, trust that info first
+            if pid_in_running:
+                is_running = True
+                logger.info(f"Process {pid} is in the active running list")
+            # Otherwise check if the response indicates the process is running
+            elif response_str == "Process is still running..." or (isinstance(converted_response, dict) and converted_response.get("status") == "running"):
+                # Status says running but it's not in our running list - double check with psutil
                 pid_int = None
                 try:
                     pid_int = int(pid)
@@ -557,17 +635,45 @@ async def get_single_process_output(pid: str):
                 
                 if pid_int:
                     try:
+                        # Import here for better error isolation
                         import psutil
+                        
+                        # Final verification with psutil
                         if psutil.pid_exists(pid_int):
-                            process = psutil.Process(pid_int)
-                            if "claude" in process.name().lower() or any("claude" in arg.lower() for arg in process.cmdline()):
-                                # Process is still running
-                                process_status = '<div class="running-process-alert"><h3 style="color: #0277bd;">Process is still running</h3><p>This process is currently active. The response will be updated when the process completes.</p><p>Process running time: {} seconds</p></div>'.format(
-                                    int(time.time() - process.create_time())
-                                )
-                    except:
-                        # In case of any errors, assume process might be running
-                        process_status = '<div class="running-process-alert"><h3 style="color: #0277bd;">Process may still be running</h3><p>The response will be updated when the process completes.</p></div>'
+                            try:
+                                process = psutil.Process(pid_int)
+                                cmd_line = process.cmdline()
+                                
+                                # If it's actually a Claude process, mark as running
+                                if "claude" in process.name().lower() or any("claude" in arg.lower() for arg in cmd_line):
+                                    is_running = True
+                                    logger.info(f"Process {pid_int} verified as running via psutil")
+                                else:
+                                    # Not a Claude process
+                                    logger.info(f"Process {pid_int} exists but is not a Claude process: {' '.join(cmd_line)}")
+                            except psutil.NoSuchProcess:
+                                # Process disappeared during check
+                                logger.info(f"Process {pid_int} disappeared during verification")
+                        else:
+                            # Process doesn't exist anymore
+                            logger.info(f"Process {pid_int} marked as running but verified as non-existent")
+                    except Exception as e:
+                        # Log the error for debugging
+                        logger.warning(f"Error checking process {pid}: {str(e)}")
+                
+                # If still marked as running but it shouldn't be, update the status in proxy_launched_processes
+                if not is_running:
+                    try:
+                        with dashboard_lock:
+                            if pid in claude_ollama_server.proxy_launched_processes:
+                                claude_ollama_server.proxy_launched_processes[pid]["status"] = "finished"
+                                logger.info(f"Updated process {pid} status to finished in proxy_launched_processes")
+                    except Exception as e:
+                        logger.warning(f"Error updating process status: {str(e)}")
+            
+            # Set the process status message based on our determination
+            if is_running:
+                process_status = '<div class="running-process-alert"><h3 style="color: #0277bd;">Process is still running</h3><p>This process is currently active. The response will be updated when the process completes.</p></div>'
             else:
                 process_status = ""
                 
@@ -692,6 +798,7 @@ async def get_single_process_output(pid: str):
             <button class="tablinks" onclick="openTab(event, 'Response')">Response</button>
             <button class="tablinks" onclick="openTab(event, 'Command')">Command</button>
             <button class="tablinks" onclick="openTab(event, 'Logs')">Logs</button>
+            <button class="tablinks" onclick="openTab(event, 'ToolCalls')">Tool Calls</button>
         </div>
         
         <div id="Prompt" class="tabcontent">
@@ -726,10 +833,92 @@ async def get_single_process_output(pid: str):
             <h3>Standard Error</h3>
             <pre class="error">{stderr}</pre>
         </div>
+        
+        <div id="ToolCalls" class="tabcontent">
+            <h3>Tool Calls</h3>
+            <div id="tool-calls-container">
+                {tool_calls_html}
+            </div>
+        </div>
     </div>
 </body>
 </html>
 """
+        # Prepare tool calls HTML if available
+        tool_calls_html = "<p>No tool calls detected</p>"
+        
+        # Log what we have for debugging
+        logger.info(f"Process output complete_response: {json.dumps(complete_response)[:500] if complete_response else 'None'}")
+        
+        # First check our dedicated complete_response field
+        if complete_response and isinstance(complete_response, dict) and "message" in complete_response:
+            message = complete_response.get("message", {})
+            logger.info(f"Complete response message: {json.dumps(message)[:500] if message else 'None'}")
+            
+            if "tool_calls" in message and message["tool_calls"]:
+                tool_calls = message["tool_calls"]
+                logger.info(f"Found {len(tool_calls)} tool calls in complete_response")
+            
+        # If no tool calls in complete_response, try checking converted_response as backup
+        elif converted_response and isinstance(converted_response, dict):
+            logger.info(f"Checking converted_response for tool_calls: {json.dumps(converted_response)[:500]}")
+            
+            # Check for tool calls in message
+            if "choices" in converted_response and converted_response["choices"]:
+                choices = converted_response["choices"]
+                for choice in choices:
+                    if "message" in choice and choice["message"]:
+                        message = choice["message"]
+                        
+                        # Check if message contains tool_calls
+                        if "tool_calls" in message and message["tool_calls"]:
+                            tool_calls = message["tool_calls"]
+                            logger.info(f"Found {len(tool_calls)} tool calls in converted_response message")
+                        
+                        # Also check if content contains a JSON with tool_calls
+                        elif "content" in message and message["content"]:
+                            content = message["content"]
+                            if isinstance(content, str) and "tool_calls" in content:
+                                try:
+                                    content_obj = json.loads(content)
+                                    if "tool_calls" in content_obj and content_obj["tool_calls"]:
+                                        tool_calls = content_obj["tool_calls"]
+                                        logger.info(f"Found {len(tool_calls)} tool calls in converted_response content")
+                                except:
+                                    pass
+        
+        # Generate HTML for the tool calls if we found any
+        if "tool_calls" in locals() and tool_calls:
+                tool_calls_html = ""
+                for i, tool_call in enumerate(tool_calls):
+                    tool_name = "unknown tool"
+                    tool_args = "{}"
+                    
+                    if "function" in tool_call:
+                        func = tool_call["function"]
+                        tool_name = func.get("name", "unknown tool")
+                        raw_args = func.get("arguments", "{}")
+                        
+                        # Attempt to parse and re-format arguments as pretty JSON if it's a string
+                        if isinstance(raw_args, str):
+                            try:
+                                args_obj = json.loads(raw_args)
+                                tool_args = json.dumps(args_obj, indent=2)
+                            except:
+                                tool_args = raw_args
+                        else:
+                            tool_args = json.dumps(raw_args, indent=2)
+                    
+                    tool_calls_html += f"""
+                    <div class="tool-call">
+                        <h4>Tool Call #{i+1}</h4>
+                        <p><strong>Tool:</strong> {tool_name}</p>
+                        <p><strong>Arguments:</strong></p>
+                        <pre>{tool_args}</pre>
+                    </div>
+                    <hr>
+                    """
+        
         # Format the HTML with variables
         html = html.format(
             pid=pid,
@@ -740,6 +929,7 @@ async def get_single_process_output(pid: str):
             timestamp=timestamp,
             original_request_str=original_request_str,
             response_str=response_str,
+            tool_calls_html=tool_calls_html,
             converted_response_str=converted_response_str,
             process_status=process_status
         )
@@ -747,43 +937,142 @@ async def get_single_process_output(pid: str):
     else:
         raise HTTPException(status_code=404, detail=f"No output found for process {pid}")
 
+def ensure_accurate_process_count():
+    """Ensure the process count in metrics is accurate and fix it if not"""
+    # Count running processes directly from proxy_launched_processes
+    actual_count = 0
+    
+    with dashboard_lock:
+        # Count processes with status 'running'
+        for pid, info in claude_ollama_server.proxy_launched_processes.items():
+            if info.get('status') == 'running':
+                actual_count += 1
+                logger.info(f"Running process found: PID {pid}")
+    
+    # Get current metrics count
+    metrics_count = metrics.current_processes
+    
+    # Fix any discrepancy
+    if metrics_count != actual_count:
+        logger.info(f"Fixing process count mismatch: metrics has {metrics_count}, actual count is {actual_count}")
+        metrics.current_processes = actual_count
+    
+    return actual_count
+
 async def terminate_process(pid: str):
     """
     Terminate a specific process by PID.
     This is used for the process management UI.
     """
     try:
-        pid = int(pid)
+        pid_int = int(pid)
         import os
         import signal
         
         # Safety check - only terminate Claude-related processes
-        process = psutil.Process(pid)
-        if "claude" in process.name().lower() or any("claude" in arg.lower() for arg in process.cmdline()):
-            # First try SIGTERM for clean shutdown
-            logger.info(f"Attempting to terminate Claude process {pid} with SIGTERM")
-            process.terminate()
+        try:
+            process = psutil.Process(pid_int)
+            is_claude = False
             
-            # Wait up to 3 seconds for process to terminate
+            # Check if it's a Claude process
             try:
-                process.wait(timeout=3)
-                return {"status": "success", "message": f"Process {pid} terminated successfully"}
-            except psutil.TimeoutExpired:
-                # If process doesn't terminate, use SIGKILL
-                logger.warning(f"Process {pid} did not terminate with SIGTERM, using SIGKILL")
-                process.kill()
-                return {"status": "success", "message": f"Process {pid} forcibly terminated with SIGKILL"}
-        else:
-            logger.warning(f"Attempted to terminate non-Claude process {pid}, request denied")
-            return JSONResponse(
-                status_code=403,
-                content={"status": "error", "message": "Can only terminate Claude-related processes"}
-            )
+                if "claude" in process.name().lower() or any("claude" in arg.lower() for arg in process.cmdline()):
+                    is_claude = True
+            except:
+                # If we can't get the command line, don't assume it's a Claude process
+                pass
+                
+            if is_claude:
+                # First try SIGTERM for clean shutdown
+                logger.info(f"Attempting to terminate Claude process {pid} with SIGTERM")
+                process.terminate()
+                
+                # Wait up to 3 seconds for process to terminate
+                try:
+                    process.wait(timeout=3)
+                    
+                    # Process terminated - update its status and metrics
+                    with dashboard_lock:
+                        if pid_int in claude_ollama_server.proxy_launched_processes:
+                            claude_ollama_server.proxy_launched_processes[pid_int]["status"] = "finished"
+                            logger.info(f"Updated process {pid} status to finished")
+                    
+                    # Ensure metrics are updated
+                    ensure_accurate_process_count()
+                    
+                    return {"status": "success", "message": f"Process {pid} terminated successfully"}
+                except psutil.TimeoutExpired:
+                    # If process doesn't terminate, use SIGKILL
+                    logger.warning(f"Process {pid} did not terminate with SIGTERM, using SIGKILL")
+                    process.kill()
+                    
+                    # Process killed - update its status and metrics
+                    with dashboard_lock:
+                        if pid_int in claude_ollama_server.proxy_launched_processes:
+                            claude_ollama_server.proxy_launched_processes[pid_int]["status"] = "finished"
+                            logger.info(f"Updated process {pid} status to finished after SIGKILL")
+                    
+                    # Ensure metrics are updated
+                    ensure_accurate_process_count()
+                    
+                    return {"status": "success", "message": f"Process {pid} forcibly terminated with SIGKILL"}
+            else:
+                logger.warning(f"Attempted to terminate non-Claude process {pid}, request denied")
+                return JSONResponse(
+                    status_code=403,
+                    content={"status": "error", "message": "Can only terminate Claude-related processes"}
+                )
+        except psutil.NoSuchProcess:
+            # Process doesn't exist, but still update any references to it
+            try:
+                with dashboard_lock:
+                    if pid_int in claude_ollama_server.proxy_launched_processes:
+                        claude_ollama_server.proxy_launched_processes[pid_int]["status"] = "finished"
+                        logger.info(f"Updated non-existent process {pid} status to finished")
+                
+                # Ensure metrics are updated
+                ensure_accurate_process_count()
+            except:
+                pass
+                
+            return {"status": "success", "message": f"Process {pid} no longer exists"}
+            
     except ValueError:
-        return JSONResponse(
-            status_code=400,
-            content={"status": "error", "message": "Invalid PID format"}
-        )
+        # Not a numeric PID, could be a temp process ID
+        try:
+            with dashboard_lock:
+                if pid in claude_ollama_server.proxy_launched_processes:
+                    # Found the temp process, mark it as finished
+                    claude_ollama_server.proxy_launched_processes[pid]["status"] = "finished"
+                    logger.info(f"Updated temp process {pid} status to finished")
+                    
+                    # If it has a real PID, try to terminate that too
+                    real_pid = claude_ollama_server.proxy_launched_processes[pid].get("real_pid")
+                    if real_pid:
+                        try:
+                            process = psutil.Process(real_pid)
+                            process.terminate()
+                            logger.info(f"Terminated real process {real_pid} linked to temp process {pid}")
+                        except:
+                            pass
+                    
+                    # Ensure metrics are updated
+                    ensure_accurate_process_count()
+                    return {"status": "success", "message": f"Process {pid} terminated"}
+            
+            # If we got here, the temp PID wasn't found
+            ensure_accurate_process_count()  # Still update metrics to be safe
+            return JSONResponse(
+                status_code=400,
+                content={"status": "error", "message": "Process not found"}
+            )
+        except Exception as e:
+            # If anything fails, still try to update metrics
+            ensure_accurate_process_count()
+            return JSONResponse(
+                status_code=400,
+                content={"status": "error", "message": f"Invalid PID format: {str(e)}"}
+            )
     except psutil.NoSuchProcess:
         return JSONResponse(
             status_code=404,
