@@ -8,7 +8,7 @@ to ensure tests continue to work as expected.
 import datetime
 import statistics
 from typing import Dict, Optional, Any, Set, Deque, List
-from claude_metrics import ClaudeMetrics
+from internal.claude_metrics import ClaudeMetrics
 
 class MetricsTracker:
     """

@@ -29,7 +29,7 @@ try:
         CLAUDE_STREAM_CHUNK_TIMEOUT,
         CLAUDE_STREAM_MAX_SILENCE,
     )
-    from process_tracking import (
+    from internal.process_tracking import (
         track_claude_process,
         untrack_claude_process,
         proxy_launched_processes

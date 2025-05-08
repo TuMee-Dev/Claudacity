@@ -1,4 +1,4 @@
-import models
+import internal.models as models
 import time
 import logging
 import config

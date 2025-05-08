@@ -13,7 +13,7 @@ from datetime import datetime, timedelta
 # Add the parent directory to the path to import the module
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from metrics_tracker import MetricsTracker
+from internal.metrics_tracker import MetricsTracker
 
 class TestMetricsTracker(unittest.TestCase):
     """Tests for the MetricsTracker class."""
@@ -25,7 +25,7 @@ class TestMetricsTracker(unittest.TestCase):
         if 'metrics_tracker' in sys.modules:
             if hasattr(sys.modules['metrics_tracker'], 'claude_metrics'):
                 # Reset the shared metrics state
-                from metrics_tracker import claude_metrics
+                from internal.metrics_tracker import claude_metrics
                 claude_metrics.total_invocations = 0
                 claude_metrics.current_processes = 0
                 claude_metrics.max_concurrent_processes = 0

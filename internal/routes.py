@@ -5,14 +5,14 @@ import time
 import traceback
 from fastapi import FastAPI, Request, HTTPException # type: ignore
 from fastapi.responses import StreamingResponse, JSONResponse # type: ignore
-import claude_metrics
-from claude_metrics import ClaudeMetrics
-import process_tracking
-import models
-import formatters
-from models import ChatRequest
-import conversations
-import streaming
+import internal.claude_metrics as claude_metrics
+from internal.claude_metrics import ClaudeMetrics
+import internal.process_tracking as process_tracking
+import internal.models as models
+import internal.formatters as formatters
+from internal.models import ChatRequest
+import internal.conversations as conversations
+import internal.streaming as streaming
 import logging
 
 logger = logging.getLogger(__name__)

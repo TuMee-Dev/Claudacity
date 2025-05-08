@@ -6,8 +6,8 @@ import shlex
 import sys
 import time
 import uuid
-import process_tracking
-import models
+import internal.process_tracking as process_tracking
+import internal.models as models
 import logging
 
 logger = logging.getLogger(__name__)

@@ -22,19 +22,19 @@ from pydantic import BaseModel, Field # type: ignore
 from fastapi import FastAPI, Request, HTTPException # type: ignore
 from fastapi.responses import StreamingResponse, JSONResponse # type: ignore
 from fastapi.middleware.cors import CORSMiddleware # type: ignore
-import claude_metrics
-from claude_metrics import ClaudeMetrics
-import dashboard
-import formatters
-import process_tracking
-import streaming
-import models
-import conversations
-import routes
+import internal.claude_metrics as claude_metrics
+from internal.claude_metrics import ClaudeMetrics
+import internal.dashboard as dashboard
+import internal.formatters as formatters
+import internal.process_tracking as process_tracking
+import internal.streaming as streaming
+import internal.models as models
+import internal.conversations as conversations
+import internal.routes as routes
 # Configuration
 import config
 
-from logging_config import setup_logging
+from internal.logging_config import setup_logging
 debug = False
 logger = setup_logging(debug)
 

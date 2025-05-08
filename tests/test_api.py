@@ -16,12 +16,12 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 # Import modules after path setup
 from fastapi.testclient import TestClient # type: ignore
 import config
-import formatters
+import internal.formatters as formatters
 from claude_ollama_server import app
-import process_tracking
+import internal.process_tracking as process_tracking
 
 # Import our metrics adapter for tests
-import metrics_tracker
+import internal.metrics_tracker as metrics_tracker
 
 class TestClaudeOllamaAPI(unittest.TestCase):
     """Tests for the FastAPI endpoints in Claude Ollama Proxy."""

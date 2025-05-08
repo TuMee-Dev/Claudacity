@@ -14,7 +14,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 
 # Import modules after path setup
 import claude_ollama_server
-from metrics_tracker import MetricsTracker
+from internal.metrics_tracker import MetricsTracker
 
 class TestDashboard(unittest.TestCase):
     """Tests for dashboard HTML generation."""
@@ -198,7 +198,7 @@ class TestDashboard(unittest.TestCase):
     def test_dashboard_html_generation(self):
         """Test that the dashboard HTML generates correctly."""
         # Call the dashboard generator - now from the dashboard module
-        import dashboard
+        import internal.dashboard as dashboard
         html = dashboard.generate_dashboard_html()
         
         # Basic structure checks
