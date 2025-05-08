@@ -304,7 +304,7 @@ async def run_claude_command(claude_cmd: str, prompt: str, conversation_id: str 
             logger.error(f"Claude command failed with return code {process.returncode}: {error_msg}")
             
             # Record completion with error
-            await claude_metrics.global_metrics.record_claude_completion(process_id, duration_ms, error=error_msg, conversation_id=conversation_id)
+            await claude_metrics.global_metrics.record_claude_completion(process_id, duration_ms, error=error_msg, memory_mb=0, conversation_id=conversation_id)
             
             raise Exception(f"Claude command failed: {error_msg}")
         
@@ -343,8 +343,19 @@ async def run_claude_command(claude_cmd: str, prompt: str, conversation_id: str 
                 cost_usd = response.get("cost_usd", 0)
                 result = response["result"]
                 
-                # Record completion metrics
-                await claude_metrics.global_metrics.record_claude_completion(process_id, response_duration_ms, output_tokens, conversation_id=conversation_id)
+                # Record completion metrics with memory usage
+                try:
+                    memory_mb = 0
+                    # Try to get current memory usage if this is a real process
+                    if process and process.pid and psutil.pid_exists(process.pid):
+                        proc = psutil.Process(process.pid)
+                        memory_info = proc.memory_info()
+                        memory_mb = memory_info.rss / (1024 * 1024)  # Convert to MB
+                    await claude_metrics.global_metrics.record_claude_completion(process_id, response_duration_ms, output_tokens, memory_mb=memory_mb, conversation_id=conversation_id)
+                except Exception as e:
+                    # If we can't get memory, just record the standard metrics
+                    logger.error(f"Error getting memory usage for completion: {e}")
+                    await claude_metrics.global_metrics.record_claude_completion(process_id, response_duration_ms, output_tokens, conversation_id=conversation_id)
                 
                 # Try to parse as JSON if it looks like JSON
                 try:
@@ -378,8 +389,19 @@ async def run_claude_command(claude_cmd: str, prompt: str, conversation_id: str 
                     "cost_usd": cost_usd
                 }
             
-            # Record completion metrics using our calculated duration
-            await claude_metrics.global_metrics.record_claude_completion(process_id, duration_ms, output_tokens, conversation_id=conversation_id)
+            # Record completion metrics using our calculated duration - with memory usage
+            try:
+                memory_mb = 0
+                # Try to get current memory usage if this is a real process
+                if process and process.pid and psutil.pid_exists(process.pid):
+                    proc = psutil.Process(process.pid)
+                    memory_info = proc.memory_info()
+                    memory_mb = memory_info.rss / (1024 * 1024)  # Convert to MB
+                await claude_metrics.global_metrics.record_claude_completion(process_id, duration_ms, output_tokens, memory_mb=memory_mb, conversation_id=conversation_id)
+            except Exception as e:
+                # If we can't get memory, just record the standard metrics
+                logger.error(f"Error getting memory usage for completion: {e}")
+                await claude_metrics.global_metrics.record_claude_completion(process_id, duration_ms, output_tokens, conversation_id=conversation_id)
             
             # Return the response as-is if it doesn't match expected format
             # Untrack the temporary process ID before returning
@@ -389,17 +411,36 @@ async def run_claude_command(claude_cmd: str, prompt: str, conversation_id: str 
         except json.JSONDecodeError:
             logger.warning("Failed to parse JSON response, returning raw output")
             
-            # Record completion metrics
-            await claude_metrics.global_metrics.record_claude_completion(process_id, duration_ms, conversation_id=conversation_id)
+            # Record completion metrics with memory usage
+            try:
+                memory_mb = 0
+                # Try to get current memory usage if this is a real process
+                if process and process.pid and psutil.pid_exists(process.pid):
+                    proc = psutil.Process(process.pid)
+                    memory_info = proc.memory_info()
+                    memory_mb = memory_info.rss / (1024 * 1024)  # Convert to MB
+                await claude_metrics.global_metrics.record_claude_completion(process_id, duration_ms, None, memory_mb=memory_mb, conversation_id=conversation_id)
+            except Exception as e:
+                # If we can't get memory, just record the standard metrics
+                logger.error(f"Error getting memory usage for completion: {e}")
+                await claude_metrics.global_metrics.record_claude_completion(process_id, duration_ms, None, conversation_id=conversation_id)
             
             # Untrack the temporary process ID before returning
             untrack_claude_process(process_id)
             return output
             
     except Exception as e:
-        # Record error in metrics
+        # Record error in metrics with memory info if possible
         duration_ms = (time.time() - start_time) * 1000
-        await claude_metrics.global_metrics.record_claude_completion(process_id, duration_ms, error=e, conversation_id=conversation_id)
+        try:
+            memory_mb = 0
+            # Try to get system memory instead since process may have failed
+            memory_mb = psutil.virtual_memory().used / (1024 * 1024)  # Convert to MB
+            await claude_metrics.global_metrics.record_claude_completion(process_id, duration_ms, None, memory_mb=memory_mb, error=e, conversation_id=conversation_id)
+        except Exception as mem_error:
+            # If we can't get memory, just record the standard metrics
+            logger.error(f"Error getting memory usage for error completion: {mem_error}")
+            await claude_metrics.global_metrics.record_claude_completion(process_id, duration_ms, error=e, conversation_id=conversation_id)
         
         # Untrack the process if it's still tracked
         if process and process.pid:
@@ -643,14 +684,21 @@ def get_running_claude_processes():
                         minutes, seconds = divmod(remainder, 60)
                         runtime = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
                         
+                        # Generate a temp numeric PID for display purposes only
+                        # This is important since dashboard filters by numeric PIDs
+                        display_pid = hash(pid) % 100000
+                        if display_pid < 0:
+                            display_pid += 100000
+                        
                         active_processes.append({
                             "user": "claude",
-                            "pid": pid,
-                            "cpu": "N/A",
-                            "memory": "N/A",
+                            "pid": display_pid,  # Use a derived numeric pid for filtering
+                            "cpu_percent": 0.0,  # Use consistent field name
+                            "memory_mb": 0.0,    # Use consistent field name 
                             "started": time.strftime("%H:%M:%S", time.localtime(process_info['start_time'])),
                             "runtime": runtime,
-                            "command": process_info.get('command', 'Claude Process')[:80]
+                            "command": process_info.get('command', 'Claude Process')[:80],
+                            "original_id": pid   # Keep original ID for reference
                         })
                     continue
                 
@@ -687,8 +735,25 @@ def get_running_claude_processes():
                 # Get process info
                 with process.oneshot():
                     user = process.username()
-                    cpu = f"{process.cpu_percent(interval=0.1):.1f}"
-                    mem = f"{process.memory_percent():.1f}"
+                    
+                    # Get CPU usage as a numeric value for proper formatting
+                    cpu_percent = process.cpu_percent(interval=0.1)
+                    
+                    # Get memory info in MB rather than percentage
+                    try:
+                        memory_info = process.memory_info()
+                        memory_mb = memory_info.rss / (1024 * 1024)  # Convert bytes to MB
+                    except:
+                        # Fallback to percentage if detailed memory info fails
+                        memory_mb = psutil.virtual_memory().total * process.memory_percent() / 100 / (1024 * 1024)
+                    
+                    # Record these metrics in the metrics system too (important for Resource stats)
+                    # This ensures the Resources section at the top of the dashboard has accurate data
+                    if 'claude_metrics' in globals() and hasattr(claude_metrics, 'global_metrics'):
+                        # Add to CPU and memory collections
+                        claude_metrics.global_metrics.cpu_usage.append(cpu_percent)
+                        claude_metrics.global_metrics.memory_usage.append(memory_mb)
+                    
                     started = time.strftime("%H:%M:%S", time.localtime(process.create_time()))
                     command = " ".join(process.cmdline())[:80] + ("..." if len(" ".join(process.cmdline())) > 80 else "")
                     
@@ -700,9 +765,9 @@ def get_running_claude_processes():
                     
                     active_processes.append({
                         "user": user,
-                        "pid": pid,
-                        "cpu": cpu,
-                        "memory": mem,
+                        "pid": numeric_pid,  # Use numeric PID for dashboard filtering
+                        "cpu_percent": cpu_percent,  # Store numeric value
+                        "memory_mb": memory_mb,  # Store in MB
                         "started": started,
                         "runtime": runtime,
                         "command": command
