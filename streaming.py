@@ -23,6 +23,10 @@ async def stream_openai_response(metrics, claude_cmd: str, claude_prompt: str, m
     Stream responses from Claude in the appropriate format based on the client.
     Handles both OpenAI-compatible and Ollama-compatible formats.
     Uses the request_id from the client if provided.
+    
+    The original_request parameter is critical - it contains the full client request data
+    which is needed for the dashboard Request tab. Make sure this is propagated
+    all the way through the streaming process.
     """
     # Check if this is an Ollama client request
     is_ollama_client = False
@@ -647,6 +651,13 @@ async def stream_claude_output(metrics, claude_cmd:str, prompt: str, conversatio
         "current_request": original_request,
         "status": "running"  # Explicitly mark as running
     }
+    
+    # Log whether we have original_request data to help with debugging
+    if original_request:
+        logger.info(f"Tracking streaming Claude process {process_id} WITH original request data")
+    else:
+        logger.warning(f"Tracking streaming Claude process {process_id} WITHOUT original request data")
+        
     logger.info(f"Tracking new Claude process with PID {process_id}")
 
     logger.debug(f"[TOOLS] About to start Claude process with command: {cmd}")
@@ -1036,6 +1047,22 @@ async def stream_claude_output(metrics, claude_cmd:str, prompt: str, conversatio
                     if "current_request" in process_tracking.proxy_launched_processes.get(str(process.pid), {}):
                         original_request = process_tracking.proxy_launched_processes[str(process.pid)]["current_request"]
                     
+                    # Also check the temp process ID for the original request if needed
+                    if original_request is None and "current_request" in process_tracking.proxy_launched_processes.get(process_id, {}):
+                        original_request = process_tracking.proxy_launched_processes[process_id]["current_request"]
+                        logger.info(f"Found original request in temp process ID {process_id}")
+                    
+                    # Last chance - use the original_request parameter that was passed to this function
+                    if original_request is None and 'original_request' in locals():
+                        original_request = locals()['original_request']  # Use the parameter passed to this function
+                        logger.info("Using original request from function parameter")
+                    
+                    # Log what we found
+                    if original_request is not None:
+                        logger.info(f"Found original request to store with streaming process output")
+                    else:
+                        logger.warning(f"No original request found for streaming process {process.pid}")
+                    
                     process_tracking.store_process_output(
                         str(process.pid),
                         stdout_text,
@@ -1083,6 +1110,9 @@ def update_streaming_process_output(pid, content):
         
     # Update in process_tracking.process_outputs
     if pid in process_tracking.process_outputs:
+        # Get original_request before overwriting anything else
+        original_request = process_tracking.process_outputs[pid].get("original_request")
+        
         # Set the actual response content directly - overwrite the placeholder
         process_tracking.process_outputs[pid]["response"] = content
         # Also store it in special fields for dashboard access
@@ -1090,6 +1120,11 @@ def update_streaming_process_output(pid, content):
         process_tracking.process_outputs[pid]["stream_buffer"] = content  # Add dedicated field for streaming buffer
         process_tracking.process_outputs[pid]["stream_data"] = content    # Alternative name in case code looks for this
         logger.info(f"Updated multiple content fields for process {pid}")
+        
+        # If we had a stored original_request, make sure it persists
+        if original_request is not None:
+            process_tracking.process_outputs[pid]["original_request"] = original_request
+            logger.info(f"Preserved original_request during streaming update for {pid}")
         
         # Also update the message content in the converted response
         if "converted_response" in process_tracking.process_outputs[pid]:
@@ -1132,6 +1167,15 @@ def update_streaming_process_output(pid, content):
                 "message": complete_message,
                 "finish_reason": "stop"
             }
+            
+            # Make sure we copy the original_request from proxy_launched_processes to process_outputs
+            # This ensures the Request tab in the dashboard shows the request details
+            if "current_request" in process_tracking.proxy_launched_processes[pid]:
+                current_request = process_tracking.proxy_launched_processes[pid]["current_request"]
+                if current_request is not None:
+                    process_tracking.process_outputs[pid]["original_request"] = current_request
+                    logger.info(f"Copied original_request from proxy_launched_processes to process_outputs for {pid}")
+            
             logger.info(f"Added content in multiple fields for process {pid}")
         
         # Log a sample of the content for debugging

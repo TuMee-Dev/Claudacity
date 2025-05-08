@@ -523,6 +523,11 @@ def store_process_output(pid, stdout, stderr, command, prompt, response, convert
             logger.info(f"Updating streaming process {pid} with final content")
             process_outputs[pid]["response"] = response
             
+            # If we're passed an original request and the current one is None/empty, update it
+            if original_request is not None and not process_outputs[pid].get("original_request"):
+                process_outputs[pid]["original_request"] = original_request
+                logger.info(f"Updated original_request for streaming process {pid}")
+            
             # Also update the converted response if it exists
             if "converted_response" in process_outputs[pid] and converted_response:
                 process_outputs[pid]["converted_response"] = converted_response

@@ -339,6 +339,13 @@ def register_routes(app: FastAPI):
                             # Update the existing output with the request data
                             process_tracking.process_outputs[pid]["original_request"] = request_dict
                             logger.info(f"Updated output with request data for process {pid}")
+                            
+                        # Also update the original process ID if this is a numeric PID linked to a temp ID
+                        temp_pid = process_info.get("temp_id")
+                        if temp_pid and temp_pid in process_tracking.process_outputs:
+                            # Update the temporary process ID's output data too
+                            process_tracking.process_outputs[temp_pid]["original_request"] = request_dict
+                            logger.info(f"Updated output for temp process {temp_pid} with request data")
                 
                 # No artificial delay - let FastAPI/Starlette handle the request normally
                 # This avoids potential issues with event loop and response handling
