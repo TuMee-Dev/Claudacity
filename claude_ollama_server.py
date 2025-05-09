@@ -255,11 +255,12 @@ async def get_api_version():
 @app.get("/api/tags")
 async def get_tags():
     """Get list of available models (Ollama-compatible tags endpoint)."""
-    models = []
+    model_list = []
     # Add all available models to the response
     for model in config.AVAILABLE_MODELS:
         # Use helper function to format model name with appropriate tag
         model_name = model['name']
+        # Use the get_ollama_model_name function from the models module that's already imported
         ollama_model_name = models.get_ollama_model_name(model_name)
         
         model_entry = {
@@ -278,9 +279,9 @@ async def get_tags():
                 "quantization_level": model["details"]["quantization_level"]
             }
         }
-        models.append(model_entry)
+        model_list.append(model_entry)
     
-    return {"models": models}
+    return {"models": model_list}
 
 # Ollama API Chat Request Model
 class OllamaChatMessage(BaseModel):
