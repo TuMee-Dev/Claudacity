@@ -17,6 +17,9 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+# Use the find_claude_command function from process_tracking
+CLAUDE_CMD = process_tracking.find_claude_command()
+
 def register_routes(app: FastAPI):
     @app.post("/chat/completions")
     async def chat(request_body: Request):
@@ -179,7 +182,13 @@ def register_routes(app: FastAPI):
                     logger.info(f"About to run Claude in non-streaming mode with prompt length: {len(claude_prompt)}")
                     
                     # Actually run the command
-                    claude_response = await process_tracking.run_claude_command(claude_prompt, conversation_id=conversation_id, original_request=request_dict)
+                    claude_response = await process_tracking.run_claude_command(
+                        claude_cmd=CLAUDE_CMD,
+                        prompt=claude_prompt,
+                        conversation_id=conversation_id,
+                        original_request=request_dict,
+                        stream=False
+                    )
                     
                     # Check if response is a string that looks like JSON
                     if isinstance(claude_response, str) and claude_response.strip().startswith('{') and claude_response.strip().endswith('}'):

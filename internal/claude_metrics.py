@@ -1,3 +1,4 @@
+# @guard:ai:w
 import asyncio
 import datetime
 import collections
@@ -64,7 +65,8 @@ class ClaudeMetrics:
         
         # Synchronization lock for updating concurrent process count
         self._lock = asyncio.Lock() if 'asyncio' in globals() else None
-    
+
+# @guard:ai:r.1
     async def record_claude_start(self, process_id, model=None, conversation_id=None, memory_mb=None, cpu_percent=None):
         """Record a new Claude CLI process start"""
         now = datetime.datetime.now()
@@ -73,7 +75,7 @@ class ClaudeMetrics:
         # Update invocation timestamps
         if self.first_invocation_time is None:
             self.first_invocation_time = iso_now
-        self.last_invocation_time = iso_now
+        self.last_invocation_time = iso_now 
         
         # Record invocation time
         self.invocation_times.append(now)
@@ -128,8 +130,10 @@ class ClaudeMetrics:
             self.current_processes += 1
             if self.current_processes > self.max_concurrent_processes:
                 self.max_concurrent_processes = self.current_processes
-    
+
+# @guard:ai:r.1
     async def record_claude_completion(self, process_id, duration_ms, output_tokens=None, memory_mb=None, error=None, conversation_id=None):
+
         """Record completion of a Claude CLI process"""
         now = datetime.datetime.now()
         self.last_completion_time = now.isoformat()
@@ -270,7 +274,7 @@ class ClaudeMetrics:
     def get_invocations_per_hour(self):
         """Get the average invocations per hour over the last hour"""
         return self.get_invocations_per_minute(60)
-    
+   
     def get_avg_memory_usage(self):
         """Get the average memory usage in MB"""
         if not self.memory_usage:
@@ -283,6 +287,7 @@ class ClaudeMetrics:
             return 0
         return max(self.memory_usage)
     
+   
     def get_avg_cpu_usage(self):
         """Get the average CPU usage percentage"""
         if not self.cpu_usage:
@@ -293,6 +298,7 @@ class ClaudeMetrics:
         """Get the uptime in seconds"""
         return (datetime.datetime.now() - self.start_time).total_seconds()
     
+   
     def get_uptime_formatted(self):
         """Get the uptime as a formatted string (e.g., '2 days, 3 hours, 4 minutes')"""
         uptime_seconds = self.get_uptime()
@@ -313,7 +319,9 @@ class ClaudeMetrics:
         
         return ", ".join(parts)
     
+ # @guard:ai:r
     def get_metrics(self):
+# @guard:ai:w
         """Get all metrics as a dictionary"""
         return {
             'uptime': {

@@ -1,0 +1,18 @@
+{
+    "tumee-vscode-plugin.items": [
+        {
+            "path": "/Users/bsobel/Projects/claudacity/internal"
+        },
+        {
+            "path": "/Users/bsobel/Projects/claudacity/internal/claude_metrics.py",
+            "isAI": false,
+            "isHuman": true
+        },
+        {
+            "path": "/Users/bsobel/Projects/claudacity/internal/conversations.py",
+            "color": "tumee.ai",
+            "isAI": true,
+            "isHuman": false
+        }
+    ]
+}

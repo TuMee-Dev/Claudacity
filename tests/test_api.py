@@ -7,6 +7,7 @@ import unittest
 import sys
 import os
 import json
+import time
 import asyncio
 from unittest.mock import patch, MagicMock
 
@@ -31,11 +32,11 @@ class TestClaudeOllamaAPI(unittest.TestCase):
         self.client = TestClient(app)
         
         # Mock the run_claude_command function to avoid actual CLI calls
-        self.run_claude_patcher = patch('claude_ollama_server.run_claude_command')
+        self.run_claude_patcher = patch('internal.process_tracking.run_claude_command')
         self.mock_run_claude = self.run_claude_patcher.start()
         
         # Also mock the format_to_openai_chat_completion function to test our OpenWebUI compatibility conversion
-        self.format_openai_patcher = patch('formatters.format_to_openai_chat_completion', wraps=formatters.format_to_openai_chat_completion)
+        self.format_openai_patcher = patch('internal.formatters.format_to_openai_chat_completion', wraps=formatters.format_to_openai_chat_completion)
         self.mock_format_openai = self.format_openai_patcher.start()
         
         # Configure the mock to return a valid response
@@ -43,7 +44,28 @@ class TestClaudeOllamaAPI(unittest.TestCase):
             "role": "system",
             "result": "This is a test response from Claude"
         }
+
+        # For normal (non-streaming) calls, return JSON response
         self.mock_run_claude.return_value = json.dumps(self.mock_claude_response)
+
+        # Configure the mock to handle stream=True calls differently
+        # Create a properly configured mock process for streaming tests
+        self.mock_process = self.setup_streaming_mock()
+
+        async def mock_streaming_return(*args, **kwargs):
+            if kwargs.get('stream', False):
+                # For streaming mode, return a tuple with process information
+                process_id = "claude-process-test123"
+                cmd = "claude -p test"
+                start_time = time.time()
+                model = "claude-3-sonnet-20240229"
+                return (self.mock_process, process_id, cmd, start_time, model)
+            else:
+                # For non-streaming calls, return the JSON response
+                return json.dumps(self.mock_claude_response)
+
+        # Set the side_effect to handle different call patterns
+        self.mock_run_claude.side_effect = mock_streaming_return
     
     def tearDown(self):
         """Clean up after each test."""
@@ -306,6 +328,38 @@ class TestClaudeOllamaAPI(unittest.TestCase):
         self.assertIn("parameters", simple_tool)
         self.assertEqual(simple_tool["parameters"], {})
         
+    # Helper method for streaming tests
+    def setup_streaming_mock(self):
+        """Configure streaming process mock with proper stdout/stderr handling for asyncio subprocess"""
+        # Create and configure a mock process for streaming
+        mock_process = MagicMock()
+        mock_process.pid = 12345
+        mock_process.returncode = 0
+
+        # Configure stdout with async read method that returns content chunks
+        mock_stdout = MagicMock()
+        async def mock_read(size=1024):
+            # Pretend to return a chunk of data
+            return b'{"content": "test content"}'
+        mock_stdout.read = mock_read
+
+        # Configure stderr
+        mock_stderr = MagicMock()
+        async def mock_stderr_read(size=1024):
+            return b''  # No errors
+        mock_stderr.read = mock_stderr_read
+
+        # Configure communicate method for non-streaming
+        async def mock_communicate():
+            return (b'{"role": "system", "result": "test result"}', b'')
+        mock_process.communicate = mock_communicate
+
+        # Assign to the process
+        mock_process.stdout = mock_stdout
+        mock_process.stderr = mock_stderr
+
+        return mock_process
+
     def test_edge_case_tool_calls_format_conversion(self):
         """Test conversion of tool calls with edge cases like malformed arguments."""
         # Create a test input that simulates what we'd get from Claude with edge case tools

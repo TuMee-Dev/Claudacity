@@ -601,105 +601,32 @@ async def stream_claude_output(metrics, claude_cmd:str, prompt: str, conversatio
     Run Claude with streaming JSON output and extract the content.
     Processes multiline JSON objects in the stream.
     """
-    # Start building the base command
-    base_cmd = f"{claude_cmd}"
-    
-    # We don't need to extract model - Claude command only takes -p and --output-format
     logger.info(f"[TOOLS] Preparing to run Claude in streaming mode with prompt length: {len(prompt)}")
 
-    # Log if tools are present for debugging purposes only
-    if original_request and isinstance(original_request, dict) and original_request.get('tools'):
-        logger.info(f"[TOOLS] Detected tools in original_request for streaming conversation: {conversation_id}")
-        logger.info(f"[TOOLS] Tools are detected but will NOT be passed to Claude directly for streaming")
-            
-    # Always use the conversation ID if provided (regardless of tools or message count)
-    if conversation_id:
-        logger.info(f"[TOOLS] Using conversation ID for streaming: {conversation_id}")
-        base_cmd += f" -r {conversation_id}"
-        
-        # Check if we're in test mode (only create temp dirs in production)
-        is_test = 'unittest' in sys.modules or os.environ.get('TESTING') == '1'
-        
-        if not is_test:
-            # Create or get a temporary directory for this conversation
-            temp_dir = models.get_conversation_temp_dir(conversation_id)
-            
-            # Set the current working directory for this conversation
-            os.environ["CLAUDE_CWD"] = temp_dir
-    else:
-        logger.info(f"[TOOLS] No conversation ID provided for streaming (session state not maintained by Claude)") 
-
-    # Add the -p flag AFTER the conversation flag
-    # The prompt needs to be directly after -p, not piped via stdin
-    quoted_prompt = shlex.quote(prompt)
-    cmd = f"{base_cmd} --allowedTools '*' -p {quoted_prompt} --output-format stream-json"
-
-    logger.debug(f"Running command for streaming: {cmd}")
-    
-    # Generate a unique process ID for tracking
-    process_id = f"claude-process-{uuid.uuid4().hex[:8]}"
-    start_time = time.time()
-    model = models.DEFAULT_MODEL
-    
-    # Record the Claude process start in metrics
-    await metrics.record_claude_start(process_id, model, conversation_id)
-    
-    # Track this process with the original request data
-    process_tracking.proxy_launched_processes[process_id] = {
-        "command": cmd,
-        "start_time": time.time(),
-        "current_request": original_request,
-        "status": "running"  # Explicitly mark as running
-    }
-    
-    # Log whether we have original_request data to help with debugging
-    if original_request:
-        logger.info(f"Tracking streaming Claude process {process_id} WITH original request data")
-    else:
-        logger.warning(f"Tracking streaming Claude process {process_id} WITHOUT original request data")
-        
-    logger.info(f"Tracking new Claude process with PID {process_id}")
-
-    logger.debug(f"[TOOLS] About to start Claude process with command: {cmd}")
+    # Use process_tracking's run_claude_command with stream=True
+    # This will launch the process with streaming output format and handle common initialization
     try:
-        # Set appropriate timeout parameters based on prompt complexity
-        # The longer/more complex the prompt, the more time Claude might need
-        current_chunk_timeout = CLAUDE_STREAM_CHUNK_TIMEOUT
-        current_max_silence = CLAUDE_STREAM_MAX_SILENCE
-        
-        # Store these in the process info for reference during streaming
-        process_info = process_tracking.proxy_launched_processes.get(process_id, {})
-        if process_info:
-            process_info['chunk_timeout'] = current_chunk_timeout
-            process_info['max_silence'] = current_max_silence
-        
-        process = await asyncio.create_subprocess_shell(
-            cmd,
-            stdin=None,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
+        process_result = await process_tracking.run_claude_command(
+            claude_cmd=claude_cmd,
+            prompt=prompt,
+            conversation_id=conversation_id,
+            original_request=original_request,
+            timeout=CLAUDE_STREAM_MAX_SILENCE,
+            stream=True,  # Enable streaming mode
+            metrics=metrics
         )
-        if process and process.pid:
-            logger.info(f"[TOOLS] Successfully started Claude process with PID: {process.pid}")
-        else:
-            logger.error(f"[TOOLS] Failed to start Claude process, no PID assigned")
-    except Exception as e:
-        logger.error(f"[TOOLS] Exception while starting Claude process: {str(e)}")
-        raise
-    
-    # Track this process
-    if process and process.pid:
-        # Transfer the original request from our process ID to the actual process ID
-        if original_request and process_id in process_tracking.proxy_launched_processes:
-            original_request_data = process_tracking.proxy_launched_processes[process_id].get("current_request")
-        else:
-            original_request_data = original_request
-            
-        process_tracking.track_claude_process(process.pid, cmd, original_request_data)
 
-    # No need to write to stdin - the prompt is in the command line
-    # Just log that we're ready to process
+        # For streaming mode, run_claude_command returns a tuple: (process, process_id, cmd, start_time, model)
+        process, process_id, cmd, start_time, model = process_result
+
+        logger.info(f"Successfully launched Claude process for streaming: {process_id}")
+    except Exception as e:
+        logger.error(f"Error launching Claude process for streaming: {str(e)}")
+        raise
+
     logger.debug("Claude process started with prompt in command line, ready to read output")
+
+    # Now continue with the streaming-specific handling of the process
 
     # Check for any auth errors in stderr first
     stderr_data = b""
@@ -827,21 +754,29 @@ async def stream_claude_output(metrics, claude_cmd:str, prompt: str, conversatio
                                     elif "cost_usd" in json_obj or "duration_ms" in json_obj:
                                         # Extract execution duration if available
                                         duration_ms = json_obj.get("duration_ms", (time.time() - start_time) * 1000)
+
+                                        # For system messages, extract the result as content
+                                        if "result" in json_obj and isinstance(json_obj["result"], str):
+                                            content = json_obj["result"]
+                                            logger.info(f"Extracted result from system message: {content[:50]}...")
+                                            yield {"content": content}
+
+                                        # Mark as complete
                                         streaming_complete = True
-                                        
+
                                         # Record completion in metrics
                                         await metrics.record_claude_completion(
-                                            process_id, 
-                                            duration_ms, 
+                                            process_id,
+                                            duration_ms,
                                             output_tokens=int(output_tokens),
                                             conversation_id=conversation_id
                                         )
-                                        
-                                        # Immediately send completion signal
+
+                                        # Then send completion signal
                                         logger.info("Received system message with completion info from Claude")
                                         # Return plain dict object, let the higher-level formatters handle it
                                         yield {"done": True}
-                                        
+
                                         # Break out of the main loop after completion
                                         break
                                 
@@ -910,7 +845,7 @@ async def stream_claude_output(metrics, claude_cmd:str, prompt: str, conversatio
             try:
                 json_obj = json.loads(buffer)
                 logger.debug(f"Parsed final JSON object from buffer: {str(json_obj)[:200]}...")
-                
+
                 if "type" in json_obj and json_obj["type"] == "message":
                     if "content" in json_obj and isinstance(json_obj["content"], list):
                         for item in json_obj["content"]:
@@ -920,6 +855,13 @@ async def stream_claude_output(metrics, claude_cmd:str, prompt: str, conversatio
                                 output_tokens += len(content.split()) / 0.75  # Rough token count estimate
                                 # Return plain dict object, let the higher-level formatters handle it
                                 yield {"content": content}
+                elif "role" in json_obj and json_obj["role"] == "system" and "result" in json_obj:
+                    # Handle system message with result
+                    content = json_obj["result"]
+                    logger.info(f"Extracted result from final system message: {content[:50]}...")
+                    yield {"content": content}
+                    streaming_complete = True
+                    yield {"done": True}
                 elif "stop_reason" in json_obj:
                     streaming_complete = True
                     # Return plain dict object, let the higher-level formatters handle it
@@ -957,7 +899,7 @@ async def stream_claude_output(metrics, claude_cmd:str, prompt: str, conversatio
                     logger.debug(f"Parsed final JSON object: {str(json_obj)[:200]}...")
                     
                     # Check for content or completion messages
-                    if ("type" in json_obj and json_obj["type"] == "message" and 
+                    if ("type" in json_obj and json_obj["type"] == "message" and
                         "content" in json_obj and isinstance(json_obj["content"], list)):
                         for item in json_obj["content"]:
                             if item.get("type") == "text" and "text" in item:
@@ -965,6 +907,14 @@ async def stream_claude_output(metrics, claude_cmd:str, prompt: str, conversatio
                                 logger.info(f"Extracted final buffered content: {content[:50]}...")
                                 # Return plain dict object, let the higher-level formatters handle it
                                 yield {"content": content}
+                    elif "role" in json_obj and json_obj["role"] == "system" and "result" in json_obj:
+                        # Handle system message with result
+                        content = json_obj["result"]
+                        logger.info(f"Extracted result from final buffered system message: {content[:50]}...")
+                        yield {"content": content}
+                        streaming_complete = True
+                        yield {"done": True}
+                        return
                     elif "stop_reason" in json_obj:
                         streaming_complete = True
                         # Return plain dict object, let the higher-level formatters handle it

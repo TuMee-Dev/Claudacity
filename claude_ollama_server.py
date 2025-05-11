@@ -400,9 +400,15 @@ async def ollama_chat(request: OllamaChatRequest):
             quoted_prompt = shlex.quote(claude_prompt)
             cmd = f"{base_cmd} --allowedTools '*' -p {quoted_prompt} --output-format json"
             logger.debug(f"Non-streaming command: {cmd}")
-            
-            # Actually run the command
-            claude_response = await process_tracking.run_claude_command(claude_prompt, conversation_id=None, original_request=request_dict)
+
+            # Actually run the command with stream=False for non-streaming mode
+            claude_response = await process_tracking.run_claude_command(
+                claude_cmd=CLAUDE_CMD,
+                prompt=claude_prompt,
+                conversation_id=None,
+                original_request=request_dict,
+                stream=False
+            )
             
             # Log the successful response
             logger.info(f"Non-streaming request completed successfully, response type: {type(claude_response)}")
@@ -526,7 +532,13 @@ async def ollama_generate(request: OllamaGenerateRequest):
         )
     else:
         # For non-streaming, get the full response
-        claude_response = await process_tracking.run_claude_command(claude_prompt, conversation_id=None, original_request=request_dict)
+        claude_response = await process_tracking.run_claude_command(
+            claude_cmd=CLAUDE_CMD,
+            prompt=claude_prompt,
+            conversation_id=None,
+            original_request=request_dict,
+            stream=False
+        )
         
         # Format as Ollama response
         ollama_model = models.get_ollama_model_name(model)

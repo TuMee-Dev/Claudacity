@@ -14,7 +14,7 @@ import logging
 import internal.formatters as formatters
 import internal.streaming as streaming
 import traceback
-from typing import Union
+from typing import Union, Dict, Any
 import internal.models as models
 from internal.claude_metrics import ClaudeMetrics
 import internal.claude_metrics as claude_metrics
@@ -70,14 +70,29 @@ def find_claude_command():
         logger.error(f"Error finding claude command: {e}")
         return "claude"  # Fallback to simple command name
 
-async def run_claude_command(claude_cmd: str, prompt: str, conversation_id: str = None, original_request=None, timeout: float = streaming.CLAUDE_STREAM_MAX_SILENCE) -> str:
-    """Run a Claude Code command and return the output."""
+async def run_claude_command(claude_cmd: str, prompt: str, conversation_id: str = None, original_request=None, timeout: float = streaming.CLAUDE_STREAM_MAX_SILENCE, stream: bool = False, metrics=None) -> Union[Dict[str, Any], str, tuple]:
+    """Run a Claude Code command and return the output.
+
+    Args:
+        claude_cmd: The Claude CLI command to run
+        prompt: The prompt to send to Claude
+        conversation_id: Optional conversation ID for continued conversations
+        original_request: The original client request data for tracking
+        timeout: Maximum time to wait for a response
+        stream: Whether to use streaming mode
+        metrics: Optional metrics tracker instance
+
+    Returns:
+        For non-streaming mode: Dict, str, or JSON string with Claude's response
+        For streaming mode: Tuple of (process, process_id, cmd, start_time, model)
+    """
     # Log the request details for debugging
     logger.debug(f"run_claude_command called with:")
     logger.debug(f"  - prompt length: {len(prompt)}")
     logger.debug(f"  - conversation_id: {conversation_id}")
     logger.debug(f"  - timeout: {timeout}s")
-    
+    logger.debug(f"  - stream: {stream}")
+
     # Start building the base command
     base_cmd = f"{claude_cmd}"
 
@@ -85,19 +100,19 @@ async def run_claude_command(claude_cmd: str, prompt: str, conversation_id: str 
     if original_request and isinstance(original_request, dict) and original_request.get('tools'):
         logger.debug(f"[TOOLS] Detected tools in original_request for conversation: {conversation_id}")
         logger.debug(f"[TOOLS] Tools are detected but will NOT be passed to Claude directly")
-    
+
     # Always use conversation ID if provided (regardless of tools or message count)
     if conversation_id:
         logger.debug(f"[TOOLS] Using conversation ID: {conversation_id}")
         base_cmd += f" -r {conversation_id}"
-        
+
         # Check if we're in test mode (only create temp dirs in production)
         is_test = 'unittest' in sys.modules or os.environ.get('TESTING') == '1'
-        
+
         if not is_test:
             # Create or get a temporary directory for this conversation
             temp_dir = models.get_conversation_temp_dir(conversation_id)
-            
+
             # Set the current working directory for this conversation
             # We'll use environment variable to pass it to the Claude CLI
             os.environ["CLAUDE_CWD"] = temp_dir
@@ -110,14 +125,15 @@ async def run_claude_command(claude_cmd: str, prompt: str, conversation_id: str 
     cmd = f"{base_cmd} --allowedTools '*' -p {quoted_prompt} --output-format json"
 
     logger.debug(f"Running command: {cmd}")
-    
+
     # Generate a unique process ID for tracking
     process_id = f"claude-process-{uuid.uuid4().hex[:8]}"
     start_time = time.time()
     model = models.DEFAULT_MODEL
-    
+
     # Record the Claude process start in metrics
-    await claude_metrics.global_metrics.record_claude_start(process_id, model, conversation_id)
+    metrics_instance = metrics or claude_metrics.global_metrics
+    await metrics_instance.record_claude_start(process_id, model, conversation_id)
 
     # Track this process with the original request data
     proxy_launched_processes[process_id] = {
@@ -126,16 +142,16 @@ async def run_claude_command(claude_cmd: str, prompt: str, conversation_id: str 
         "current_request": original_request,
         "status": "running"  # Explicitly mark as running
     }
-    
+
     # Set appropriate timeout parameters based on prompt complexity
     # The longer/more complex the prompt, the more time Claude might need
     current_chunk_timeout = streaming.CLAUDE_STREAM_CHUNK_TIMEOUT
     current_max_silence = streaming.CLAUDE_STREAM_MAX_SILENCE
-    
+
     # Adjust timeout based on prompt length or complexity if needed
     proxy_launched_processes[process_id]['chunk_timeout'] = current_chunk_timeout
     proxy_launched_processes[process_id]['max_silence'] = current_max_silence
-    
+
     logger.info(f"Tracking new Claude process with PID {process_id}")
 
     process = None
@@ -156,7 +172,7 @@ async def run_claude_command(claude_cmd: str, prompt: str, conversation_id: str 
         except Exception as e:
             logger.error(f"[TOOLS] Exception while starting Claude process: {str(e)}")
             raise
-        
+
         # Track this process
         if process and process.pid:
             # Transfer the original request from our process ID to the actual process ID
@@ -164,9 +180,17 @@ async def run_claude_command(claude_cmd: str, prompt: str, conversation_id: str 
                 original_request_data = proxy_launched_processes[process_id].get("current_request")
             else:
                 original_request_data = original_request
-                
+
             track_claude_process(process.pid, cmd, original_request_data)
-        
+
+        # For streaming mode, we return the process and let the caller handle it
+        if stream:
+            logger.info(f"Returning process for streaming mode with process_id: {process_id}")
+            # Return the process and related information as a tuple
+            # The streaming.py module will handle reading from the process
+            return (process, process_id, cmd, start_time, model)
+
+        # For non-streaming mode, handle the process here
         # Wait for Claude to process the command (prompt is already in the command line)
         # Add timeout handling for non-streaming mode
         try:
@@ -175,7 +199,7 @@ async def run_claude_command(claude_cmd: str, prompt: str, conversation_id: str 
             max_silence = process_info.get('max_silence', timeout)
             logger.info(f"Using timeout of {max_silence} seconds for non-streaming request")
             logger.debug(f"Process ID: {process.pid}, Command: {cmd}")
-            
+
             # Use asyncio.wait_for to add a timeout to communicate()
             logger.info(f"Starting process.communicate() with timeout={max_silence}s")
             try:
@@ -186,13 +210,13 @@ async def run_claude_command(claude_cmd: str, prompt: str, conversation_id: str 
                 logger.error(f"Error in process.communicate(): {comm_error}")
                 logger.error(f"Traceback: {traceback.format_exc()}")
                 raise
-            
+
             # Log any stderr output for debugging
             if stderr:
                 stderr_text = stderr.decode() if stderr else ""
                 if stderr_text:
                     logger.error(f"[TOOLS] Claude process stderr output: {stderr_text}")
-                    
+
                     # Check for authentication issues in stderr
                     if "log in" in stderr_text.lower() or "authenticate" in stderr_text.lower() or "not authenticated" in stderr_text.lower() or "login" in stderr_text.lower() or "session expired" in stderr_text.lower():
                         logger.warning("Authentication issue detected in Claude CLI")
@@ -203,14 +227,14 @@ async def run_claude_command(claude_cmd: str, prompt: str, conversation_id: str 
                         return json.dumps(auth_error)
             else:
                 logger.info("No stderr output from Claude process")
-                
+
             if stdout:
                 stdout_text = stdout.decode() if stdout else ""
                 logger.info(f"stdout length: {len(stdout_text)} bytes")
                 logger.debug(f"stdout preview: {stdout_text[:100]}...")
             else:
                 logger.warning("No stdout output from Claude process!")
-                
+
         except asyncio.TimeoutError:
             # Process is taking too long - likely hung
             logger.warning(f"Non-streaming Claude process {process.pid} timed out after {max_silence} seconds")
@@ -224,7 +248,7 @@ async def run_claude_command(claude_cmd: str, prompt: str, conversation_id: str 
                 logger.warning(f"Process CPU times: {p.cpu_times()}")
             except Exception as psutil_error:
                 logger.warning(f"Could not get psutil info for process: {psutil_error}")
-            
+
             # Try to terminate the process
             try:
                 logger.warning(f"Attempting to terminate hung Claude process {process.pid}")
@@ -234,17 +258,17 @@ async def run_claude_command(claude_cmd: str, prompt: str, conversation_id: str 
                 untrack_claude_process(process_id)
             except Exception as kill_error:
                 logger.error(f"Failed to kill hung process: {kill_error}")
-            
+
             # Record timeout error in metrics
             duration_ms = (time.time() - start_time) * 1000
-            await claude_metrics.global_metrics.record_claude_completion(process_id, duration_ms, error="Process timeout", conversation_id=conversation_id)
-            
+            await metrics_instance.record_claude_completion(process_id, duration_ms, error="Process timeout", conversation_id=conversation_id)
+
             # Raise a specific timeout exception
             raise Exception(f"Claude command timed out after {timeout} seconds")
-        
+
         # Calculate execution duration
         duration_ms = (time.time() - start_time) * 1000
-        
+
         # Store the process output before untracking
         if process and process.pid:
             try:
@@ -257,19 +281,19 @@ async def run_claude_command(claude_cmd: str, prompt: str, conversation_id: str 
                         response_obj = json.loads(stdout_text)
                 except json.JSONDecodeError:
                     response_obj = stdout_text
-                
+
                 # Convert to OpenAI format
                 openai_response = None
                 try:
                     openai_response = formatters.format_to_openai_chat_completion(response_obj or stdout_text, model)
                 except Exception as e:
                     logger.error(f"Failed to convert to OpenAI format: {e}")
-                
+
                 # Get the original request for storing
                 original_request = None
                 if "current_request" in proxy_launched_processes.get(str(process.pid), {}):
                     original_request = proxy_launched_processes[str(process.pid)]["current_request"]
-                
+
                 store_process_output(
                     str(process.pid),
                     stdout_text,
@@ -283,15 +307,15 @@ async def run_claude_command(claude_cmd: str, prompt: str, conversation_id: str 
                 )
             except Exception as e:
                 logger.error(f"Error storing process output: {e}")
-            
+
             # Now untrack the process
             untrack_claude_process(process.pid)
             untrack_claude_process(process_id)
-        
+
         if process.returncode != 0:
             stderr_text = stderr.decode() if stderr else ""
             stdout_text = stdout.decode() if stdout else ""
-            
+
             # Check if we have an API error in stdout (this can happen with certain Claude CLI errors)
             if stdout_text and "API Error:" in stdout_text:
                 error_msg = stdout_text
@@ -299,50 +323,50 @@ async def run_claude_command(claude_cmd: str, prompt: str, conversation_id: str 
                 error_msg = stderr_text
             else:
                 error_msg = "Unknown error"
-                
+
             # Log the detailed error
             logger.error(f"Claude command failed with return code {process.returncode}: {error_msg}")
-            
+
             # Record completion with error
-            await claude_metrics.global_metrics.record_claude_completion(process_id, duration_ms, error=error_msg, memory_mb=0, conversation_id=conversation_id)
-            
+            await metrics_instance.record_claude_completion(process_id, duration_ms, error=error_msg, memory_mb=0, conversation_id=conversation_id)
+
             raise Exception(f"Claude command failed: {error_msg}")
-        
+
         output = stdout.decode()
         logger.debug(f"Raw Claude response: {output}")
-        
+
         # Parse JSON response
         try:
             response = json.loads(output)
             logger.debug(f"Parsed Claude response: {response}")
-            
+
             # Check for authentication error in the exact format provided
-            if (isinstance(response, dict) and 
-                response.get("role") == "system" and 
-                "result" in response and 
-                isinstance(response["result"], str) and 
-                ("Invalid API key" in response["result"] or 
+            if (isinstance(response, dict) and
+                response.get("role") == "system" and
+                "result" in response and
+                isinstance(response["result"], str) and
+                ("Invalid API key" in response["result"] or
                  "Please run /login" in response["result"])):
-                
+
                 logger.warning(f"Authentication error detected in Claude response: {response['result']}")
                 # Create an auth error response that can be propagated back to the client
                 auth_error = models.create_auth_error_response(response["result"])
                 # Untrack the temporary process ID before returning
                 untrack_claude_process(process_id)
                 return json.dumps(auth_error)
-            
+
             # Extract token count if available
             output_tokens = None
             if isinstance(response, dict) and "usage" in response:
                 output_tokens = response["usage"].get("completion_tokens", None)
-            
+
             # If we have a system response with a result, use that content
             if isinstance(response, dict) and "role" in response and response["role"] == "system" and "result" in response:
                 # Use duration from response if available, otherwise use our calculated duration
                 response_duration_ms = response.get("duration_ms", duration_ms)
                 cost_usd = response.get("cost_usd", 0)
                 result = response["result"]
-                
+
                 # Record completion metrics with memory usage
                 try:
                     memory_mb = 0
@@ -351,12 +375,12 @@ async def run_claude_command(claude_cmd: str, prompt: str, conversation_id: str 
                         proc = psutil.Process(process.pid)
                         memory_info = proc.memory_info()
                         memory_mb = memory_info.rss / (1024 * 1024)  # Convert to MB
-                    await claude_metrics.global_metrics.record_claude_completion(process_id, response_duration_ms, output_tokens, memory_mb=memory_mb, conversation_id=conversation_id)
+                    await metrics_instance.record_claude_completion(process_id, response_duration_ms, output_tokens, memory_mb=memory_mb, conversation_id=conversation_id)
                 except Exception as e:
                     # If we can't get memory, just record the standard metrics
                     logger.error(f"Error getting memory usage for completion: {e}")
-                    await claude_metrics.global_metrics.record_claude_completion(process_id, response_duration_ms, output_tokens, conversation_id=conversation_id)
-                
+                    await metrics_instance.record_claude_completion(process_id, response_duration_ms, output_tokens, conversation_id=conversation_id)
+
                 # Try to parse as JSON if it looks like JSON
                 try:
                     if isinstance(result, str) and result.strip().startswith('{') and result.strip().endswith('}'):
@@ -376,7 +400,7 @@ async def run_claude_command(claude_cmd: str, prompt: str, conversation_id: str 
                 except json.JSONDecodeError:
                     # Not valid JSON, continue with the original result
                     pass
-                
+
                 # Return a structured response with properly extracted content
                 # Untrack the temporary process ID before returning
                 untrack_claude_process(process_id)
@@ -388,7 +412,7 @@ async def run_claude_command(claude_cmd: str, prompt: str, conversation_id: str 
                     "duration_ms": response_duration_ms,
                     "cost_usd": cost_usd
                 }
-            
+
             # Record completion metrics using our calculated duration - with memory usage
             try:
                 memory_mb = 0
@@ -397,20 +421,20 @@ async def run_claude_command(claude_cmd: str, prompt: str, conversation_id: str 
                     proc = psutil.Process(process.pid)
                     memory_info = proc.memory_info()
                     memory_mb = memory_info.rss / (1024 * 1024)  # Convert to MB
-                await claude_metrics.global_metrics.record_claude_completion(process_id, duration_ms, output_tokens, memory_mb=memory_mb, conversation_id=conversation_id)
+                await metrics_instance.record_claude_completion(process_id, duration_ms, output_tokens, memory_mb=memory_mb, conversation_id=conversation_id)
             except Exception as e:
                 # If we can't get memory, just record the standard metrics
                 logger.error(f"Error getting memory usage for completion: {e}")
-                await claude_metrics.global_metrics.record_claude_completion(process_id, duration_ms, output_tokens, conversation_id=conversation_id)
-            
+                await metrics_instance.record_claude_completion(process_id, duration_ms, output_tokens, conversation_id=conversation_id)
+
             # Return the response as-is if it doesn't match expected format
             # Untrack the temporary process ID before returning
             untrack_claude_process(process_id)
             return response
-            
+
         except json.JSONDecodeError:
             logger.warning("Failed to parse JSON response, returning raw output")
-            
+
             # Record completion metrics with memory usage
             try:
                 memory_mb = 0
@@ -419,16 +443,16 @@ async def run_claude_command(claude_cmd: str, prompt: str, conversation_id: str 
                     proc = psutil.Process(process.pid)
                     memory_info = proc.memory_info()
                     memory_mb = memory_info.rss / (1024 * 1024)  # Convert to MB
-                await claude_metrics.global_metrics.record_claude_completion(process_id, duration_ms, None, memory_mb=memory_mb, conversation_id=conversation_id)
+                await metrics_instance.record_claude_completion(process_id, duration_ms, None, memory_mb=memory_mb, conversation_id=conversation_id)
             except Exception as e:
                 # If we can't get memory, just record the standard metrics
                 logger.error(f"Error getting memory usage for completion: {e}")
-                await claude_metrics.global_metrics.record_claude_completion(process_id, duration_ms, None, conversation_id=conversation_id)
-            
+                await metrics_instance.record_claude_completion(process_id, duration_ms, None, conversation_id=conversation_id)
+
             # Untrack the temporary process ID before returning
             untrack_claude_process(process_id)
             return output
-            
+
     except Exception as e:
         # Record error in metrics with memory info if possible
         duration_ms = (time.time() - start_time) * 1000
@@ -436,17 +460,17 @@ async def run_claude_command(claude_cmd: str, prompt: str, conversation_id: str 
             memory_mb = 0
             # Try to get system memory instead since process may have failed
             memory_mb = psutil.virtual_memory().used / (1024 * 1024)  # Convert to MB
-            await claude_metrics.global_metrics.record_claude_completion(process_id, duration_ms, None, memory_mb=memory_mb, error=e, conversation_id=conversation_id)
+            await metrics_instance.record_claude_completion(process_id, duration_ms, None, memory_mb=memory_mb, error=e, conversation_id=conversation_id)
         except Exception as mem_error:
             # If we can't get memory, just record the standard metrics
             logger.error(f"Error getting memory usage for error completion: {mem_error}")
-            await claude_metrics.global_metrics.record_claude_completion(process_id, duration_ms, error=e, conversation_id=conversation_id)
-        
+            await metrics_instance.record_claude_completion(process_id, duration_ms, error=e, conversation_id=conversation_id)
+
         # Untrack the process if it's still tracked
         if process and process.pid:
             untrack_claude_process(process.pid)
         untrack_claude_process(process_id)
-            
+
         logger.error(f"Error running Claude command: {str(e)}")
         raise
 
