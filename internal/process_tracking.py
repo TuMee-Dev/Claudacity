@@ -107,7 +107,7 @@ async def run_claude_command(claude_cmd: str, prompt: str, conversation_id: str 
     # Add the -p flag AFTER the conversation flag
     # The prompt needs to be directly after -p, not piped via stdin
     quoted_prompt = shlex.quote(prompt)
-    cmd = f"{base_cmd} -p {quoted_prompt} --output-format json"
+    cmd = f"{base_cmd} --allowedTools '*' -p {quoted_prompt} --output-format json"
 
     logger.debug(f"Running command: {cmd}")
     

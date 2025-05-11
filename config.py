@@ -17,7 +17,7 @@ AVAILABLE_MODELS = [
             "format": "api",
             "family": "anthropic",
             "families": ["anthropic", "claude"],
-            "parameter_size": "13B",
+            "parameter_size": "128B",
             "quantization_level": "none"
         }
     }

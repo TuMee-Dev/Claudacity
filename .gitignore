@@ -1,4 +1,4 @@
 **/.claude/settings.local.json
 /logs/
-tests/test_results/*.txt
+/test_results/*.txt
 .DS_Store

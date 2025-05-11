@@ -12,6 +12,7 @@ Usage:
   python claude_service.py --restart  # Restart the service
   python claude_service.py --status   # Check service status
   python claude_service.py --uninstall # Uninstall the service
+  python claude_service.py --workdir=PATH # Specify a working directory
   python claude_service.py            # Run directly (not as a service)
 """
 
@@ -24,8 +25,8 @@ from pathlib import Path
 # Get the directory of the current script
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# Add the cross_service.py to the path if it's in the same directory
-if os.path.exists(os.path.join(SCRIPT_DIR, "cross_service.py")):
+# Add the script directory to the path if it's not already
+if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
 
 # Configure logging
@@ -35,6 +36,9 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 logger = logging.getLogger("claude_service")
+
+# Import sys_log_dir from logging_config
+from internal.logging_config import get_system_log_dir
 
 def install_dependencies():
     """Install required dependencies if not already installed."""
@@ -58,15 +62,29 @@ def install_dependencies():
 # Try to install dependencies
 install_dependencies()
 
-# Import the cross_service module
+# Import the helper modules
 try:
     import cross_service
-except ImportError:
-    logger.error("cross_service.py not found. Please make sure it's in the same directory.")
+    from internal.service_helper import (
+        parse_service_arguments, 
+        setup_working_dir, 
+        handle_service_commands
+    )
+except ImportError as e:
+    logger.error(f"Required modules not found: {e}")
+    logger.error("Please make sure cross_service.py and internal/service_helper.py exist.")
     sys.exit(1)
 
 def run_server():
     """Run the API server as a standalone process."""
+    # Parse arguments and set up working directory
+    args = parse_service_arguments("Claude Ollama API Server")
+    working_dir = setup_working_dir(args)
+    
+    # Change to the working directory
+    os.chdir(working_dir)
+    logger.info(f"Changed working directory to: {working_dir}")
+    
     # Import the actual server code here
     server_module_path = os.path.join(SCRIPT_DIR, "claude_ollama_server.py")
     
@@ -96,66 +114,27 @@ def run_server():
 
 def main():
     """Main entry point."""
+    # Parse arguments and set up working directory
+    args = parse_service_arguments("Claude Ollama API Server")
+    working_dir = setup_working_dir(args)
+    
     # Create the service manager
+    # Get system log directory
+    system_log_dir = get_system_log_dir()
+    os.makedirs(system_log_dir, exist_ok=True)
+
     service_manager = cross_service.ServiceManager(
         service_name="claude_ollama_api",
         description="Claude-compatible Ollama API Server",
         exe_path=sys.executable,
-        args=[os.path.abspath(__file__), "--run"],
-        working_dir=SCRIPT_DIR,
-        log_dir=os.path.join(SCRIPT_DIR, "logs")
+        args=[os.path.abspath(__file__), "--run", f"--workdir={working_dir}"],
+        working_dir=working_dir,
+        log_dir=system_log_dir
     )
     
-    # If --run is specified, run the server as a service
-    if len(sys.argv) > 1 and sys.argv[1] == "--run":
-        logger.info("Running as a service...")
-        service_manager.run_as_service(run_server)
+    # Handle service commands
+    if handle_service_commands(service_manager, args, run_server):
         return
-    
-    # Otherwise, handle command-line arguments
-    if len(sys.argv) > 1:
-        if sys.argv[1] == "--install":
-            logger.info("Installing service...")
-            service_manager.install()
-            logger.info("Service installed. You can now start it with --start")
-        elif sys.argv[1] == "--uninstall":
-            logger.info("Uninstalling service...")
-            service_manager.uninstall()
-            logger.info("Service uninstalled.")
-        elif sys.argv[1] == "--start":
-            logger.info("Starting service...")
-            service_manager.start()
-            logger.info("Service started.")
-        elif sys.argv[1] == "--stop":
-            logger.info("Stopping service...")
-            service_manager.stop()
-            logger.info("Service stopped.")
-        elif sys.argv[1] == "--restart":
-            logger.info("Restarting service...")
-            service_manager.stop()
-            logger.info("Service stopped. Waiting for full shutdown...")
-            # Wait a moment to ensure the service has fully stopped
-            import time
-            time.sleep(2)
-            service_manager.start()
-            logger.info("Service restarted.")
-        elif sys.argv[1] == "--status":
-            status = service_manager.status()
-            logger.info(f"Service status: {status}")
-        else:
-            logger.error(f"Unknown command: {sys.argv[1]}")
-            print("Usage:")
-            print("  --install   : Install the service")
-            print("  --uninstall : Uninstall the service")
-            print("  --start     : Start the service")
-            print("  --stop      : Stop the service")
-            print("  --restart   : Restart the service")
-            print("  --status    : Check service status")
-            print("  --run       : Run as a service (internal use)")
-            print("  (no args)   : Run directly (not as a service)")
-    else:
-        # Run the server directly (not as a service)
-        run_server()
 
 if __name__ == "__main__":
     main()

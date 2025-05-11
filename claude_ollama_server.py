@@ -264,7 +264,7 @@ async def get_tags():
         ollama_model_name = models.get_ollama_model_name(model_name)
         
         model_entry = {
-            "name": ollama_model_name,  # Use name with appropriate tag
+            "name": "Claudacity " + model_name,  # Use name with appropriate tag
             "model": ollama_model_name,  # Adding "model" field at root level to match Ollama format
             "modified_at": model.get("modified_at", datetime.datetime.now().isoformat()),
             "size": model.get("size", 0),
@@ -398,7 +398,7 @@ async def ollama_chat(request: OllamaChatRequest):
             if model:
                 base_cmd += f" --model {model}"
             quoted_prompt = shlex.quote(claude_prompt)
-            cmd = f"{base_cmd} -p {quoted_prompt} --output-format json"
+            cmd = f"{base_cmd} --allowedTools '*' -p {quoted_prompt} --output-format json"
             logger.debug(f"Non-streaming command: {cmd}")
             
             # Actually run the command
