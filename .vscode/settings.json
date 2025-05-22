@@ -9,8 +9,7 @@
             "isHuman": true
         },
         {
-            "path": "/Users/bsobel/Projects/claudacity/internal/conversations.py",
-            "color": "tumee.ai",
+            "path": "/Users/bsobel/Projects/claudacity/internal/dashboard.py",
             "isAI": true,
             "isHuman": false
         }

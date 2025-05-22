@@ -9,12 +9,12 @@ logger = logging.getLogger(__name__)
 
 METRICS_HISTORY_SIZE = 1000  # Number of requests to keep for metrics calculations
 
-class ClaudeMetrics:
+class ClaudeMetrics: # @guard:ai:r.0
     """
     Tracks metrics for Claude CLI process invocations.
     Collects data on Claude usage patterns, run times, and resource usage.
     """
-    def __init__(self, history_size=METRICS_HISTORY_SIZE):
+    def __init__(self, history_size=METRICS_HISTORY_SIZE): # @guard:ai:r.0
         # Claude invocation timestamps (ISO format)
         self.first_invocation_time = None
         self.last_invocation_time = None
@@ -66,8 +66,7 @@ class ClaudeMetrics:
         # Synchronization lock for updating concurrent process count
         self._lock = asyncio.Lock() if 'asyncio' in globals() else None
 
-# @guard:ai:r.1
-    async def record_claude_start(self, process_id, model=None, conversation_id=None, memory_mb=None, cpu_percent=None):
+    async def record_claude_start(self, process_id, model=None, conversation_id=None, memory_mb=None, cpu_percent=None): # @guard:ai:r.0
         """Record a new Claude CLI process start"""
         now = datetime.datetime.now()
         iso_now = now.isoformat()
@@ -131,8 +130,7 @@ class ClaudeMetrics:
             if self.current_processes > self.max_concurrent_processes:
                 self.max_concurrent_processes = self.current_processes
 
-# @guard:ai:r.1
-    async def record_claude_completion(self, process_id, duration_ms, output_tokens=None, memory_mb=None, error=None, conversation_id=None):
+    async def record_claude_completion(self, process_id, duration_ms, output_tokens=None, memory_mb=None, error=None, conversation_id=None): # @guard:ai:r.0
 
         """Record completion of a Claude CLI process"""
         now = datetime.datetime.now()
@@ -180,7 +178,7 @@ class ClaudeMetrics:
         # a conversation can have multiple processes. Instead, we have
         # a separate pruning mechanism that removes old conversations.
     
-    def prune_old_data(self):
+    def prune_old_data(self): # @guard:ai:r.0
         """Remove old data from time-based metrics to prevent memory leaks"""
         now = datetime.datetime.now()
         
@@ -243,19 +241,19 @@ class ClaudeMetrics:
         # Log cleanup metrics
         logger.debug(f"Pruned {len(inactive_conversations)} inactive conversations, {len(self.active_conversations)} remain active")
     
-    def get_avg_execution_time(self):
+    def get_avg_execution_time(self): # @guard:ai:r.0
         """Get the average execution time in milliseconds"""
         if not self.execution_durations:
             return 0
         return statistics.mean(self.execution_durations)
     
-    def get_median_execution_time(self):
+    def get_median_execution_time(self): # @guard:ai:r.0
         """Get the median execution time in milliseconds"""
         if not self.execution_durations:
             return 0
         return statistics.median(self.execution_durations)
     
-    def get_invocations_per_minute(self, minutes=5):
+    def get_invocations_per_minute(self, minutes=5): # @guard:ai:r.0
         """Get the average invocations per minute over the last N minutes"""
         now = datetime.datetime.now()
         count = 0
@@ -271,35 +269,33 @@ class ClaudeMetrics:
         
         return count / minutes
     
-    def get_invocations_per_hour(self):
+    def get_invocations_per_hour(self): # @guard:ai:r.0
         """Get the average invocations per hour over the last hour"""
         return self.get_invocations_per_minute(60)
    
-    def get_avg_memory_usage(self):
+    def get_avg_memory_usage(self): # @guard:ai:r.0
         """Get the average memory usage in MB"""
         if not self.memory_usage:
             return 0
         return statistics.mean(self.memory_usage)
     
-    def get_peak_memory_usage(self):
+    def get_peak_memory_usage(self): # @guard:ai:r.0
         """Get the peak memory usage in MB"""
         if not self.memory_usage:
             return 0
         return max(self.memory_usage)
-    
-   
-    def get_avg_cpu_usage(self):
+      
+    def get_avg_cpu_usage(self): # @guard:ai:r.0
         """Get the average CPU usage percentage"""
         if not self.cpu_usage:
             return 0
         return statistics.mean(self.cpu_usage)
     
-    def get_uptime(self):
+    def get_uptime(self): # @guard:ai:r.0
         """Get the uptime in seconds"""
         return (datetime.datetime.now() - self.start_time).total_seconds()
-    
-   
-    def get_uptime_formatted(self):
+       
+    def get_uptime_formatted(self): # @guard:ai:r.0
         """Get the uptime as a formatted string (e.g., '2 days, 3 hours, 4 minutes')"""
         uptime_seconds = self.get_uptime()
         
@@ -319,9 +315,7 @@ class ClaudeMetrics:
         
         return ", ".join(parts)
     
- # @guard:ai:r
-    def get_metrics(self):
-# @guard:ai:w
+    def get_metrics(self): # @guard:ai:r.0
         """Get all metrics as a dictionary"""
         return {
             'uptime': {
@@ -367,4 +361,4 @@ class ClaudeMetrics:
             }
         }
     
-global_metrics = ClaudeMetrics()
+global_metrics = ClaudeMetrics() # @guard:ai:r.0
